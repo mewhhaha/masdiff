@@ -1,8 +1,13 @@
 cabal-version:      3.14
 name:               masdiff
 version:            0.1.0.0
--- synopsis:
--- description:
+synopsis:           Pure Haskell MSDF generator for TrueType fonts
+description:
+    Pure Haskell MSDF generator that parses TrueType fonts (glyf/loca/cmap)
+    and produces per-glyph MSDF bitmaps with metrics and kerning (kern + GPOS).
+    .
+    Limitations: TrueType outlines only (no CFF), default variable-font axis
+    values, and partial GPOS support (pair adjustments).
 license:            MIT
 license-file:       LICENSE
 author:             mewhhaha
@@ -11,7 +16,15 @@ maintainer:         kopatheonlyone@hotmail.com
 category:           Graphics
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
--- extra-source-files:
+                  , README.md
+extra-source-files:
+    assets/Inter/README.txt
+  , assets/Inter/OFL.txt
+data-files:
+    "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
+  , assets/Inter/README.txt
+  , assets/Inter/OFL.txt
+tested-with:        GHC ==9.12.2
 
 common warnings
     ghc-options: -Wall
@@ -29,7 +42,7 @@ library
     -- other-modules:
     -- other-extensions:
     build-depends:    base ^>=4.21.0.0
-                    , array
+                    , array ^>=0.5.8.0
     hs-source-dirs:   lib
     default-language: GHC2024
 
@@ -38,7 +51,9 @@ test-suite msdf-tests
     type:             exitcode-stdio-1.0
     hs-source-dirs:   tests
     main-is:          MSDFTests.hs
+    other-modules:    Paths_masdiff
+    autogen-modules:  Paths_masdiff
     build-depends:    base ^>=4.21.0.0
-                    , array
+                    , array ^>=0.5.8.0
                     , masdiff
     default-language: GHC2024

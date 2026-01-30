@@ -11,15 +11,17 @@ import MSDF.Generated (generateMSDFWithConfig)
 import MSDF.MSDF (MSDFConfig(..), defaultMSDFConfig, renderGlyphMSDF, glyphMetricsOnly, GlyphSet(..))
 import MSDF.TTF.Parser
 import MSDF.Types
+import Paths_masdiff (getDataFileName)
 
-ttfPath :: FilePath
-ttfPath = "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
+ttfPath :: IO FilePath
+ttfPath = getDataFileName "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
 
 main :: IO ()
 main = do
-  ttf <- parseTTF ttfPath
+  fontPath <- ttfPath
+  ttf <- parseTTF fontPath
   let cfgSmall = defaultMSDFConfig { cfgPixelSize = 16 }
-  subsetAtlas <- generateMSDFWithConfig (cfgSmall { cfgGlyphSet = GlyphSetCodepoints [65, 66] }) ttfPath
+  subsetAtlas <- generateMSDFWithConfig (cfgSmall { cfgGlyphSet = GlyphSetCodepoints [65, 66] }) fontPath
   results <- sequence
     [ runTest "parseTTF basic" (testParseTTF ttf)
     , runTest "cmap includes" (testCmap ttf)
