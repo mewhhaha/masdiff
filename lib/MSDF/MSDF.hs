@@ -6,13 +6,13 @@ module MSDF.MSDF
   , glyphMetricsOnly
   ) where
 
-import Data.Array ( (!) )
+import Data.Array (Array, bounds, (!) )
 import Data.Array.Unboxed (UArray, listArray)
 import Data.List (sort)
 import Data.Word (Word8)
 import MSDF.Outline
 import MSDF.TTF.Parser
-import MSDF.TTF.Variations (applyGvarToContours)
+import MSDF.TTF.Variations (applyGvarToContours, hvarDeltas)
 import MSDF.Types
 
 -- | Configuration for MSDF generation.
@@ -104,15 +104,16 @@ glyphMetricsOnlyAt :: Maybe VariationLocation -> MSDFConfig -> TTF -> Int -> Gly
 glyphMetricsOnlyAt loc cfg ttf glyphIndex =
   let (xMin, yMin, xMax, yMax) = glyphBBoxRawAt loc ttf glyphIndex
       metricsGlyph = case compositeMetricsGlyph ttf glyphIndex of
-                       Just g -> g
-                       Nothing -> glyphIndex
+                       Just g | inBounds (ttf.hmtx.advances) g -> g
+                       _ -> glyphIndex
       unitsPerEm = ttf.head.unitsPerEm
       scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
-      baseAdvance = fromIntegral (ttf.hmtx.advances ! metricsGlyph)
-      baseLsb = fromIntegral (ttf.hmtx.lsb ! metricsGlyph)
+      baseAdvance = fromIntegral (safeIndex ttf.hmtx.advances metricsGlyph)
+      baseLsb = fromIntegral (safeIndex ttf.hmtx.lsb metricsGlyph)
       (deltaL, deltaR) = phantomDeltas loc ttf metricsGlyph
-      advance = (baseAdvance + (deltaR - deltaL)) * scale
-      lsb = (baseLsb + deltaL) * scale
+      (hAdv, hLsb, _) = hvarAdjust loc ttf metricsGlyph
+      advance = (baseAdvance + hAdv + (deltaR - deltaL)) * scale
+      lsb = (baseLsb + hLsb + deltaL) * scale
       bearingY = fromIntegral yMax * scale
       bbox = BBox
         { xMin = fromIntegral xMin * scale
@@ -142,6 +143,15 @@ phantomDeltas loc ttf glyphIndex =
         Nothing -> (0, 0)
     _ -> (0, 0)
 
+hvarAdjust :: Maybe VariationLocation -> TTF -> Int -> (Double, Double, Double)
+hvarAdjust loc ttf glyphIndex =
+  case (loc, ttf.variations) of
+    (Just loc', Just vars) ->
+      case vars.hvar of
+        Just hv -> hvarDeltas hv loc' glyphIndex
+        Nothing -> (0, 0, 0)
+    _ -> (0, 0, 0)
+
 emptyBitmap :: MSDFBitmap
 emptyBitmap = MSDFBitmap
   { width = 0
@@ -150,6 +160,16 @@ emptyBitmap = MSDFBitmap
   , offsetY = 0
   , pixels = listArray (0, -1) []
   }
+
+safeIndex :: Array Int Int -> Int -> Int
+safeIndex arr i =
+  let (lo, hi) = bounds arr
+  in if i < lo || i > hi then 0 else arr ! i
+
+inBounds :: Array Int Int -> Int -> Bool
+inBounds arr i =
+  let (lo, hi) = bounds arr
+  in i >= lo && i <= hi
 
 scaleEdge :: Double -> Edge -> Edge
 scaleEdge s (EdgeLine (x0, y0) (x1, y1)) = EdgeLine (x0 * s, y0 * s) (x1 * s, y1 * s)

@@ -5,8 +5,8 @@ This document tracks known gaps vs. the TrueType/OpenType specs.
 ## TrueType tables
 
 - CFF/OTF outlines are not supported (glyf only).
-- Variable fonts (glyf) are supported via fvar/avar/gvar. Metrics variation from HVAR/MVAR
-  is not implemented (phantom point deltas are applied for advance/LSB only).
+- Variable fonts (glyf) are supported via fvar/avar/gvar, plus HVAR/MVAR for horizontal metrics
+  (advance/LSB/RSB and hhea ascent/descent/lineGap). Other MVAR tags and VVAR are not implemented.
 - Hinting instructions are ignored.
 
 ## Composite glyphs

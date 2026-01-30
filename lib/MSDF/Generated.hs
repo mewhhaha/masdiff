@@ -6,10 +6,11 @@ module MSDF.Generated
 
 import Control.Parallel.Strategies (parListChunk, rdeepseq, withStrategy)
 import Data.Array (Array, array, listArray, accumArray, bounds, (!))
-import Data.List (sortOn, sort)
+import Data.List (groupBy, sortOn, sort)
 import MSDF.MSDF
 import MSDF.TTF.GPOS (KerningPairRaw(..))
 import MSDF.TTF.Parser
+import MSDF.TTF.Variations (mvarHheaDeltas)
 import MSDF.Types
 
 -- | Generate an MSDF atlas from a TTF file with default config.
@@ -36,9 +37,13 @@ buildAtlas cfg ttf =
   let numGlyphs = ttf.maxp.numGlyphs
       unitsPerEm = ttf.head.unitsPerEm
       scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
+      loc = case ttf.variations of
+        Nothing -> Nothing
+        Just vars -> Just (normalizeLocation vars.fvar vars.avar cfg.variations)
       mappings = ttf.cmap.mappings
+      mappingsUnique = dedupeMappings mappings
       codepointArr = accumCodepoints numGlyphs mappings
-      codepointEntries = map (uncurry CodepointMapEntry) (sortOn fst mappings)
+      codepointEntries = map (uncurry CodepointMapEntry) mappingsUnique
       codepointIndex = arrayFromList codepointEntries
       selector = glyphSelector cfg.glyphSet mappings
       glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
@@ -46,9 +51,19 @@ buildAtlas cfg ttf =
       kernPairs = buildKerning scale ttf.gpos ttf.kern
       kernArray = arrayFromList kernPairs
       fontName = buildFontName ttf.name
-      ascent = round (fromIntegral ttf.hhea.ascent * scale)
-      descent = round (fromIntegral ttf.hhea.descent * scale)
-      lineGap = round (fromIntegral ttf.hhea.lineGap * scale)
+      baseAscent = fromIntegral ttf.hhea.ascent
+      baseDescent = fromIntegral ttf.hhea.descent
+      baseLineGap = fromIntegral ttf.hhea.lineGap
+      (deltaAscent, deltaDescent, deltaLineGap) =
+        case (loc, ttf.variations) of
+          (Just loc', Just vars) ->
+            case vars.mvar of
+              Just mv -> mvarHheaDeltas mv loc'
+              Nothing -> (0, 0, 0)
+          _ -> (0, 0, 0)
+      ascent = round ((baseAscent + deltaAscent) * scale)
+      descent = round ((baseDescent + deltaDescent) * scale)
+      lineGap = round ((baseLineGap + deltaLineGap) * scale)
   in MSDFAtlas
        { fontName = fontName
        , unitsPerEm = unitsPerEm
@@ -74,13 +89,26 @@ buildGlyph ttf cfg codepointArr shouldRender glyphIndex =
 accumCodepoints :: Int -> [(Int, Int)] -> Array Int [Int]
 accumCodepoints numGlyphs mappings =
   let pairs = [ (g, c) | (c, g) <- mappings, g >= 0, g < numGlyphs ]
-  in accumArray (flip (:)) [] (0, numGlyphs - 1) pairs
+      arr = accumArray (flip (:)) [] (0, numGlyphs - 1) pairs
+  in fmap uniqueSorted arr
 
 arrayFromList :: [a] -> Array Int a
 arrayFromList xs =
   if null xs
   then array (0, -1) []
   else listArray (0, length xs - 1) xs
+
+dedupeMappings :: [(Int, Int)] -> [(Int, Int)]
+dedupeMappings mappings =
+  let sorted = sortOn fst mappings
+      groups = groupBy (\(c, _) (c', _) -> c == c') sorted
+      pick grp =
+        case grp of
+          [] -> Nothing
+          ((cp, _):_) ->
+            let gid = minimum (map snd grp)
+            in Just (cp, gid)
+  in [ x | Just x <- map pick groups ]
 
 kernKey :: KerningPair -> (Int, Int)
 kernKey k = (k.left, k.right)

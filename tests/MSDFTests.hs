@@ -1,14 +1,15 @@
 module Main (main) where
 
 import Control.Exception (SomeException, try, evaluate)
-import Data.Array (elems, (!))
+import Data.Array (Array, elems, (!))
 import Data.Array.IArray (bounds, rangeSize)
+import qualified Data.Array.Unboxed as UA
 import Data.Bits (testBit, (.&.))
 import Data.List (find)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word16)
 import System.Exit (exitFailure)
-import System.IO (hPutStrLn, stderr)
+import System.IO (hFlush, hPutStrLn, stdout, stderr)
 
 import MSDF.Generated (generateMSDFWithConfig)
 import MSDF.MSDF (MSDFConfig(..), defaultMSDFConfig, renderGlyphMSDF, glyphMetricsOnly, GlyphSet(..))
@@ -16,7 +17,7 @@ import qualified MSDF.MSDF as MSDF
 import MSDF.Binary (ByteBuffer, readS16BE, readU16BE, slice)
 import MSDF.Outline (Point(..))
 import MSDF.TTF.Parser
-import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..))
+import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), applyGvarToContours, hvarDeltas, mvarHheaDeltas)
 import MSDF.Types
 import Paths_masdiff (getDataFileName)
 
@@ -29,7 +30,9 @@ main = do
   ttf <- requireRight "parseTTF" =<< parseTTF fontPath
   let cfgSmall :: MSDFConfig
       cfgSmall = defaultMSDFConfig { MSDF.pixelSize = 16 }
-  subsetAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig (cfgSmall { MSDF.glyphSet = GlyphSetCodepoints [65, 66] }) fontPath
+      cfgSubset = cfgSmall { MSDF.glyphSet = GlyphSetCodepoints [65, 66] }
+  subsetAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig cfgSubset fontPath
+  parallelAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig (cfgSubset { MSDF.parallelism = 16 }) fontPath
   results <- sequence
     [ runTest "parseTTF basic" (testParseTTF ttf)
     , runTest "cmap includes" (testCmap ttf)
@@ -37,8 +40,12 @@ main = do
     , runTest "composite glyph" (testCompositeGlyph ttf)
     , runTest "render glyph MSDF" (testRenderGlyph ttf cfgSmall)
     , runTest "variable font axes" (testVariableFont ttf)
+    , runTest "gvar default safe" (testGvarDefaultSafe ttf)
     , runTest "subset atlas" (testGenerateSubset subsetAtlas)
     , runTest "kerning sorted" (testKerningSorted subsetAtlas)
+    , runTest "codepoint index sorted" (testCodepointIndexSorted subsetAtlas)
+    , runTest "lookup codepoint" (testLookupCodepoint subsetAtlas ttf)
+    , runTest "parallelism deterministic" (testParallelismDeterministic ttf subsetAtlas parallelAtlas)
     , runTest "metrics only" (testMetricsOnly ttf cfgSmall)
     , runTest "composite point match" (testCompositePointMatch ttf)
     ]
@@ -49,6 +56,7 @@ main = do
 runTest :: String -> IO () -> IO Bool
 runTest name action = do
   putStrLn ("[test] " ++ name)
+  hFlush stdout
   result <- try action
   case result of
     Left (e :: SomeException) -> do
@@ -136,14 +144,14 @@ testVariableFont ttf = do
   assert (gA >= 0) "glyph index for A not found"
   case ttf.variations of
     Nothing -> assert False "font has no variation tables"
-    Just (Variations fvar avar gvar) -> do
-      let Fvar axes _ = fvar
+    Just vars -> do
+      let Fvar axes _ = vars.fvar
       assert (not (null axes)) "fvar has no axes"
       case find (\a -> case a of FvarAxis t _ _ _ _ -> t == "wght") axes of
         Nothing -> assert False "wght axis missing"
         Just (FvarAxis _ minV defV maxV _) ->
           assert (minV < defV && defV < maxV) "wght axis values invalid"
-      let loc@(VariationLocation locCoords) = normalizeLocation fvar avar [("wght", 900)]
+      let loc@(VariationLocation locCoords) = normalizeLocation vars.fvar vars.avar [("wght", 900)]
       assert (not (null locCoords)) "normalized variation coords are empty"
       let tags = [ t | FvarAxis t _ _ _ _ <- axes ]
           wghtIndex = fromMaybe (-1) (lookup "wght" (zip tags [0..]))
@@ -156,7 +164,7 @@ testVariableFont ttf = do
                          else (900 - defV) / (maxV - defV)
           assert (expected /= 0) "expected normalized value is zero"
           assert (locCoords !! wghtIndex /= 0) "normalized variation coords are all zero"
-      case gvar of
+      case vars.gvar of
         Nothing -> assert False "gvar table missing"
         Just (Gvar _ _ offsets dataOffset _ buffer) ->
           let (lo, hi) = bounds offsets
@@ -169,6 +177,16 @@ testVariableFont ttf = do
                let bb = slice buffer (dataOffset + off) (off' - off)
                    tupleCount = readU16BE bb 0 .&. 0x0FFF
                assert (tupleCount > 0) "gvar has zero tuple variations for glyph A"
+      case vars.hvar of
+        Nothing -> pure ()
+        Just hv -> do
+          let (advDelta, lsbDelta, rsbDelta) = hvarDeltas hv loc gA
+          assert (all isFinite [advDelta, lsbDelta, rsbDelta]) "HVAR deltas must be finite"
+      case vars.mvar of
+        Nothing -> pure ()
+        Just mv -> do
+          let (dAsc, dDesc, dGap) = mvarHheaDeltas mv loc
+          assert (all isFinite [dAsc, dDesc, dGap]) "MVAR deltas must be finite"
       let maxGlyph = min (ttf.maxp.numGlyphs - 1) 200
       varies <- anyM (glyphVaries ttf loc) [0 .. maxGlyph]
       assert varies "variable font should alter at least one glyph outline"
@@ -180,6 +198,33 @@ testVariableFont ttf = do
       _glyphDefault = renderGlyphMSDF cfgDefault ttf gA
       _glyphVar = renderGlyphMSDF cfgVar ttf gA
   pure ()
+
+testGvarDefaultSafe :: TTF -> IO ()
+testGvarDefaultSafe ttf = do
+  case ttf.variations of
+    Nothing -> pure ()
+    Just vars ->
+      case vars.gvar of
+        Nothing -> pure ()
+        Just gv -> do
+          let loc = normalizeLocation vars.fvar vars.avar []
+              offsets = gv.offsets
+              (lo, hi) = bounds offsets
+              maxIdx = min (ttf.maxp.numGlyphs - 1) (hi - 1)
+              candidates =
+                [ i
+                | i <- [lo .. maxIdx]
+                , let off = offsets ! i
+                      off' = offsets ! (i + 1)
+                , off' > off
+                ]
+          case candidates of
+            [] -> pure ()
+            (i:_) -> do
+              let baseContours = glyphOutlineAt Nothing ttf i
+                  (contours', (dL, dR, dT, dB)) = applyGvarToContours gv loc i baseContours
+              _ <- evaluate (contourHash contours')
+              assert (all isFinite [dL, dR, dT, dB]) "gvar deltas non-finite at default location"
 
 
 testGenerateSubset :: MSDFAtlas -> IO ()
@@ -213,6 +258,48 @@ testKerningSorted atlas = do
   where
     kernKey k = (k.left, k.right)
 
+testCodepointIndexSorted :: MSDFAtlas -> IO ()
+testCodepointIndexSorted atlas = do
+  let entries = elems (atlas.codepointIndex)
+  assert (isSortedBy (\e -> e.codepoint) entries) "codepoint index not sorted"
+  assert (isStrictlyIncreasing (map (\e -> e.codepoint) entries)) "codepoint index has duplicates"
+
+testLookupCodepoint :: MSDFAtlas -> TTF -> IO ()
+testLookupCodepoint atlas ttf = do
+  let mappings = ttf.cmap.mappings
+      cpSpace = 32
+      cpA = 65
+      glyphsFor cp = [ g | (c, g) <- mappings, c == cp ]
+  case glyphsFor cpSpace of
+    [] -> pure ()
+    gs ->
+      assert (lookupCodepoint atlas cpSpace == Just (minimum gs)) "lookupCodepoint mismatch for space"
+  case glyphsFor cpA of
+    [] -> pure ()
+    gs ->
+      assert (lookupCodepoint atlas cpA == Just (minimum gs)) "lookupCodepoint mismatch for A"
+
+testParallelismDeterministic :: TTF -> MSDFAtlas -> MSDFAtlas -> IO ()
+testParallelismDeterministic ttf atlasSeq atlasPar = do
+  let mappings = ttf.cmap.mappings
+      mA = lookupCodepointList 65 mappings
+      mB = lookupCodepointList 66 mappings
+  assert (mA /= Nothing && mB /= Nothing) "missing A/B in cmap"
+  let gA = fromMaybe (-1) mA
+      gB = fromMaybe (-1) mB
+      glyphsSeq = atlasSeq.glyphs
+      glyphsPar = atlasPar.glyphs
+  gASeq <- safeIndex "seq A" glyphsSeq gA
+  gAPar <- safeIndex "par A" glyphsPar gA
+  gBSeq <- safeIndex "seq B" glyphsSeq gB
+  gBPar <- safeIndex "par B" glyphsPar gB
+  sigASeq <- glyphSignatureSafe "seq A" gASeq
+  sigAPar <- glyphSignatureSafe "par A" gAPar
+  sigBSeq <- glyphSignatureSafe "seq B" gBSeq
+  sigBPar <- glyphSignatureSafe "par B" gBPar
+  assertEq "compare A" sigASeq sigAPar "parallelism changed glyph A"
+  assertEq "compare B" sigBSeq sigBPar "parallelism changed glyph B"
+
 
 testMetricsOnly :: TTF -> MSDFConfig -> IO ()
 testMetricsOnly ttf cfg = do
@@ -233,6 +320,56 @@ isSortedBy key (x:xs) = go (key x) xs
     go prev (y:ys) =
       let k = key y
       in if prev <= k then go k ys else False
+
+isStrictlyIncreasing :: Ord a => [a] -> Bool
+isStrictlyIncreasing [] = True
+isStrictlyIncreasing (x:xs) = go x xs
+  where
+    go _ [] = True
+    go prev (y:ys) =
+      if prev < y then go y ys else False
+
+safeIndex :: String -> Array Int a -> Int -> IO a
+safeIndex label arr idx = do
+  arrResult <- tryAny (evaluate arr)
+  case arrResult of
+    Left e -> error (label ++ ": array thunk " ++ show e)
+    Right arr' -> do
+      let (lo, hi) = bounds arr'
+      assert (idx >= lo && idx <= hi) (label ++ ": index out of bounds")
+      result <- tryAny (evaluate (arr' ! idx))
+      case result of
+        Left e -> error (label ++ ": " ++ show e)
+        Right v -> pure v
+
+tryAny :: IO a -> IO (Either SomeException a)
+tryAny = try
+
+assertEq :: (Eq a, Show a) => String -> a -> a -> String -> IO ()
+assertEq label a b msg = do
+  result <- tryAny (evaluate (a == b))
+  case result of
+    Left e -> error (label ++ ": " ++ show e)
+    Right ok -> assert ok msg
+
+glyphSignatureSafe :: String -> GlyphMSDF -> IO (Double, Double, Double, BBox, Int, Int, Int)
+glyphSignatureSafe label glyph = do
+  result <- tryAny (evaluate (forceSignature (glyphSignature glyph)))
+  case result of
+    Left e -> error (label ++ ": " ++ show e)
+    Right sig -> pure sig
+
+forceSignature :: (Double, Double, Double, BBox, Int, Int, Int)
+               -> (Double, Double, Double, BBox, Int, Int, Int)
+forceSignature sig@(adv, bx, by, bb, w, h, sumPx) =
+  adv `seq` bx `seq` by `seq` w `seq` h `seq` sumPx `seq`
+  bb.xMin `seq` bb.yMin `seq` bb.xMax `seq` bb.yMax `seq` sig
+
+glyphSignature :: GlyphMSDF -> (Double, Double, Double, BBox, Int, Int, Int)
+glyphSignature glyph =
+  let bmp = glyph.bitmap
+      pixelsSum = foldl' (\acc w -> acc + fromIntegral w) 0 (UA.elems bmp.pixels)
+  in (glyph.advance, glyph.bearingX, glyph.bearingY, glyph.bbox, bmp.width, bmp.height, pixelsSum)
 
 findCompositePointMatchGlyph :: TTF -> Maybe Int
 findCompositePointMatchGlyph ttf = go 0
@@ -304,3 +441,6 @@ glyphVaries ttf loc glyphIndex = do
 contourHash :: [[Point]] -> Double
 contourHash contours =
   foldl' (\acc (Point px py _) -> acc + px * 0.7 + py * 0.3) 0 [ p | c <- contours, p <- c ]
+
+isFinite :: Double -> Bool
+isFinite x = not (isNaN x || isInfinite x)

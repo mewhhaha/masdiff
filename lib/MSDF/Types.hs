@@ -127,7 +127,14 @@ lookupCodepoint :: MSDFAtlas -> Int -> Maybe Int
 lookupCodepoint atlas cp =
   let arr = atlas.codepointIndex
       (lo, hi) = boundsSafe arr
-  in if lo > hi then Nothing else binarySearchCodepoint arr cp lo hi
+  in if lo > hi
+     then Nothing
+     else
+       case binarySearchCodepoint arr cp lo hi of
+         Nothing -> Nothing
+         Just gid ->
+           let (glo, ghi) = boundsSafe atlas.glyphs
+           in if gid < glo || gid > ghi then Nothing else Just gid
 
 lookupKerning :: MSDFAtlas -> Int -> Int -> Double
 lookupKerning atlas l r =

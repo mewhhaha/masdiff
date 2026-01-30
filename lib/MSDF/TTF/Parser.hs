@@ -22,7 +22,7 @@ module MSDF.TTF.Parser
   ) where
 
 import Control.Exception (SomeException, try)
-import Data.Array (Array, array, (!))
+import Data.Array (Array, array, bounds, (!))
 import Data.Bits (testBit, shiftL, (.|.), (.&.))
 import Data.Char (chr)
 import Data.Int (Int16)
@@ -134,6 +134,8 @@ parseTTFUnsafe path = do
       fvarTbl = optionalTable "fvar" tables bb
       avarTbl = optionalTable "avar" tables bb
       gvarTbl = optionalTable "gvar" tables bb
+      hvarTbl = optionalTable "HVAR" tables bb
+      mvarTbl = optionalTable "MVAR" tables bb
       headInfo = parseHead headTbl
       hhea = parseHhea hheaTbl
       maxp = parseMaxp maxpTbl
@@ -150,7 +152,9 @@ parseTTFUnsafe path = do
             let fvar = parseFvar fvarTable
                 avar = fmap parseAvar avarTbl
                 gvar = fmap (parseGvar maxp.numGlyphs) gvarTbl
-            in Just (Variations fvar avar gvar)
+                hvar = hvarTbl >>= parseHvar
+                mvar = mvarTbl >>= parseMvar
+            in Just (Variations fvar avar gvar hvar mvar)
   pure TTF
     { head = headInfo
     , hhea = hhea
@@ -223,16 +227,21 @@ parseMaxp bb =
 
 parseHmtx :: ByteBuffer -> Int -> Int -> Hmtx
 parseHmtx bb numberOfHMetrics numGlyphs =
-  let metrics = [ (fromIntegral (readU16BE bb (i * 4)), fromIntegral (readS16BE bb (i * 4 + 2)))
-                | i <- [0 .. numberOfHMetrics - 1] ]
+  let metricsCount0 = min numberOfHMetrics numGlyphs
+      maxMetrics = min metricsCount0 (bb.len `div` 4)
+      metrics = [ (fromIntegral (readU16BE bb (i * 4)), fromIntegral (readS16BE bb (i * 4 + 2)))
+                | i <- [0 .. maxMetrics - 1] ]
       advances = map fst metrics
       lsbs = map snd metrics
       lastAdvance = if null advances then 0 else last advances
-      remaining = numGlyphs - numberOfHMetrics
-      extraLsbs = [ fromIntegral (readS16BE bb (numberOfHMetrics * 4 + i * 2))
-                  | i <- [0 .. remaining - 1] ]
+      remaining = max 0 (numGlyphs - maxMetrics)
+      extraOff = maxMetrics * 4
+      maxExtra = if extraOff >= bb.len then 0 else min remaining ((bb.len - extraOff) `div` 2)
+      extraLsbs = [ fromIntegral (readS16BE bb (extraOff + i * 2))
+                  | i <- [0 .. maxExtra - 1] ]
+      extraLsbsAll = extraLsbs ++ replicate (remaining - maxExtra) 0
       advancesAll = advances ++ replicate remaining lastAdvance
-      lsbAll = lsbs ++ extraLsbs
+      lsbAll = lsbs ++ extraLsbsAll
   in Hmtx
      { advances = array (0, numGlyphs - 1) (zip [0..] advancesAll)
      , lsb = array (0, numGlyphs - 1) (zip [0..] lsbAll)
@@ -491,7 +500,9 @@ glyphContoursAtVar loc ttf glyphIndex depth =
       glyf = ttf.glyf
       loca = ttf.loca
       offsets = loca.offsets
+      (offLo, offHi) = bounds offsets
   in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
+        || glyphIndex < offLo || glyphIndex + 1 > offHi
      then ([], (0,0,0,0))
      else
        let start = offsets ! glyphIndex
@@ -518,7 +529,9 @@ glyphBBoxRawAt loc ttf glyphIndex =
       glyf = ttf.glyf
       loca = ttf.loca
       offsets = loca.offsets
+      (offLo, offHi) = bounds offsets
   in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
+        || glyphIndex < offLo || glyphIndex + 1 > offHi
      then (0,0,0,0)
      else
        let start = offsets ! glyphIndex
@@ -738,7 +751,9 @@ compositeMetricsGlyph ttf glyphIndex =
   let numGlyphs = ttf.maxp.numGlyphs
       glyf = ttf.glyf
       offsets = ttf.loca.offsets
+      (offLo, offHi) = bounds offsets
   in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
+        || glyphIndex < offLo || glyphIndex + 1 > offHi
      then Nothing
      else
        let start = offsets ! glyphIndex

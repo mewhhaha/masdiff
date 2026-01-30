@@ -8,6 +8,7 @@ Pure Haskell MSDF generator for TrueType fonts. It parses `glyf/loca/cmap` outli
 - TrueType outline parsing (simple + composite glyphs).
 - MSDF raster generation per glyph (packed RGB bytes).
 - Kerning support via `kern` and GPOS pair adjustment (lookup type 2).
+- Variable font support (fvar/avar/gvar + HVAR/MVAR for horizontal metrics).
 
 ## Usage
 
@@ -55,6 +56,11 @@ main = do
 ```sh
 cabal test msdf-tests
 ```
+
+## API overview
+
+See `docs/api.md` for a concise overview of the public modules, data ordering
+invariants, and determinism guarantees.
 
 ## Pseudocode: rendering MSDF glyphs
 
@@ -168,7 +174,8 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 ## Limitations
 
 - TrueType outlines only (no CFF).
-- Variable fonts use default axis values.
+- Variable fonts support glyf variations and horizontal metrics (HVAR/MVAR).
+  VVAR and most other MVAR tags are not implemented.
 - GPOS support is limited to Pair Adjustment lookups (format 1/2).
 
 Glyph selection:

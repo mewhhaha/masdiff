@@ -5,18 +5,26 @@ module MSDF.TTF.Variations
   , Avar(..)
   , AxisMap
   , Gvar(..)
+  , Hvar(..)
+  , Mvar(..)
+  , VariationIndex(..)
   , Variations(..)
   , VariationLocation(..)
   , parseFvar
   , parseAvar
   , parseGvar
+  , parseHvar
+  , parseMvar
   , defaultLocation
   , normalizeLocation
   , applyGvarToContours
+  , hvarDeltas
+  , mvarDelta
+  , mvarHheaDeltas
   ) where
 
 import Data.Array (Array, array, accumArray, bounds, inRange, (!))
-import Data.Bits ((.&.), (.|.), shiftL, testBit)
+import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
 import Data.Int (Int8, Int16, Int32)
 import Data.List (zipWith4)
 import Data.Ix (Ix)
@@ -57,14 +65,55 @@ data Gvar = Gvar
   , buffer :: ByteBuffer
   }
 
+data Hvar = Hvar
+  { store :: ItemVariationStore
+  , advanceMap :: DeltaSetIndexMap
+  , lsbMap :: Maybe DeltaSetIndexMap
+  , rsbMap :: Maybe DeltaSetIndexMap
+  }
+
+data Mvar = Mvar
+  { store :: ItemVariationStore
+  , records :: [(String, VariationIndex)]
+  }
+
 data Variations = Variations
   { fvar :: Fvar
   , avar :: Maybe Avar
   , gvar :: Maybe Gvar
+  , hvar :: Maybe Hvar
+  , mvar :: Maybe Mvar
   }
 
 newtype VariationLocation = VariationLocation
   { coords :: [Double]
+  } deriving (Eq, Show)
+
+data VariationIndex = VariationIndex
+  { outer :: Int
+  , inner :: Int
+  } deriving (Eq, Show)
+
+data RegionAxis = RegionAxis
+  { start :: Double
+  , peak :: Double
+  , end :: Double
+  } deriving (Eq, Show)
+
+data ItemVariationStore = ItemVariationStore
+  { axisCount :: Int
+  , regions :: [[RegionAxis]]
+  , dataTables :: [ItemVariationData]
+  } deriving (Eq, Show)
+
+data ItemVariationData = ItemVariationData
+  { regionIndices :: [Int]
+  , deltaSets :: [[Int]]
+  } deriving (Eq, Show)
+
+data DeltaSetIndexMap = DeltaSetIndexMap
+  { mapCount :: Int
+  , mapEntries :: Array Int VariationIndex
   } deriving (Eq, Show)
 
 parseFvar :: ByteBuffer -> Fvar
@@ -153,6 +202,51 @@ parseGvar glyphCount bb =
                      else array (0, length offsetsList - 1) (zip [0..] offsetsList)
         sharedTuples' = readSharedTuples bb sharedTupleOffset axisCount' sharedTupleCount
     in Gvar axisCount' sharedTuples' offsetsArr dataOffset' flags' bb
+
+parseHvar :: ByteBuffer -> Maybe Hvar
+parseHvar bb =
+  if bb.len < 20
+  then Nothing
+  else
+    let storeOff = fromIntegral (readU32BE bb 4)
+        advOff = fromIntegral (readU32BE bb 8)
+        lsbOff = fromIntegral (readU32BE bb 12)
+        rsbOff = fromIntegral (readU32BE bb 16)
+        valid off = off >= 0 && off <= bb.len
+    in if not (valid storeOff && valid advOff && valid lsbOff && valid rsbOff)
+       then Nothing
+       else
+         let store' = parseItemVariationStore (slice bb storeOff (bb.len - storeOff))
+             advMap = parseDeltaSetIndexMap (slice bb advOff (bb.len - advOff))
+             lsbMap' = if lsbOff == 0 then Nothing else Just (parseDeltaSetIndexMap (slice bb lsbOff (bb.len - lsbOff)))
+             rsbMap' = if rsbOff == 0 then Nothing else Just (parseDeltaSetIndexMap (slice bb rsbOff (bb.len - rsbOff)))
+         in Just (Hvar store' advMap lsbMap' rsbMap')
+
+parseMvar :: ByteBuffer -> Maybe Mvar
+parseMvar bb =
+  if bb.len < 12
+  then Nothing
+  else
+    let storeOff = fromIntegral (readU32BE bb 4)
+        valueCount = fromIntegral (readU16BE bb 8) :: Int
+        valueSize = fromIntegral (readU16BE bb 10) :: Int
+        recordsOff = 12
+        maxRecords = if valueSize < 8 || recordsOff >= bb.len
+                     then 0
+                     else min valueCount ((bb.len - recordsOff) `div` valueSize)
+        records' = [ readMvarRecord bb (recordsOff + i * valueSize) | i <- [0 .. maxRecords - 1] ]
+    in if storeOff < 0 || storeOff > bb.len
+       then Nothing
+       else
+         let store' = parseItemVariationStore (slice bb storeOff (bb.len - storeOff))
+         in Just (Mvar store' records')
+
+readMvarRecord :: ByteBuffer -> Int -> (String, VariationIndex)
+readMvarRecord bb off =
+  let tag = readTag bb off
+      outer' = fromIntegral (readU16BE bb (off + 4))
+      inner' = fromIntegral (readU16BE bb (off + 6))
+  in (tag, VariationIndex outer' inner')
 
 readSharedTuples :: ByteBuffer -> Int -> Int -> Int -> [[Double]]
 readSharedTuples bb off axisCount' tupleCount =
@@ -247,7 +341,7 @@ glyphDeltas :: Gvar -> VariationLocation -> Int -> Int -> (Array Int Double, Arr
 glyphDeltas gvar loc glyphIndex pointCount =
   let bounds' = (0, pointCount - 1)
   in case glyphVariationData gvar loc glyphIndex pointCount of
-       Nothing -> (array bounds' [], array bounds' [])
+       Nothing -> (accumArray' (+) 0 bounds' [], accumArray' (+) 0 bounds' [])
        Just tuples ->
          let contribX = concatMap fst tuples
              contribY = concatMap snd tuples
@@ -325,8 +419,11 @@ readTupleHeaders bb off count gvar =
 readTuple :: ByteBuffer -> Int -> Int -> ([Double], Int)
 readTuple bb off count =
   let size = count * 2
-      coords' = [ f2dot14 (readS16BE bb (off + i * 2)) | i <- [0 .. count - 1] ]
-  in (coords', off + size)
+      maxCount = if off >= bb.len then 0 else min count ((bb.len - off) `div` 2)
+      coords' = [ f2dot14 (readS16BE bb (off + i * 2)) | i <- [0 .. maxCount - 1] ]
+      padded = coords' ++ replicate (count - maxCount) 0
+      off' = min bb.len (off + size)
+  in (padded, off')
 
 sharedTuple :: Gvar -> Int -> [Double]
 sharedTuple gvar idx =
@@ -487,7 +584,8 @@ readCount bb off =
 
 accumArray' :: (Ix i) => (e -> e -> e) -> e -> (i, i) -> [(i, e)] -> Array i e
 accumArray' f z bnds xs =
-  if null xs then array bnds [] else accumArray f z bnds xs
+  let (lo, hi) = bnds
+  in if lo > hi then array bnds [] else accumArray f z bnds xs
 
 boundsSafe :: Array Int a -> (Int, Int)
 boundsSafe arr =
@@ -513,3 +611,178 @@ f2dot14 v =
 
 clamp :: Ord a => a -> a -> a -> a
 clamp lo hi v = max lo (min hi v)
+
+parseItemVariationStore :: ByteBuffer -> ItemVariationStore
+parseItemVariationStore bb =
+  if bb.len < 10
+  then ItemVariationStore 0 [] []
+  else
+    let axisCount' = fromIntegral (readU16BE bb 2)
+        regionListOff = fromIntegral (readU32BE bb 4)
+        dataCount = fromIntegral (readU16BE bb 8) :: Int
+        offsetsOff = 10
+        maxData = if offsetsOff >= bb.len then 0 else min dataCount ((bb.len - offsetsOff) `div` 4)
+        dataOffsets = [ fromIntegral (readU32BE bb (offsetsOff + i * 4)) | i <- [0 .. maxData - 1] ]
+        regions' = parseRegionList bb regionListOff axisCount'
+        tables = [ parseItemVariationData (slice bb off (bb.len - off)) | off <- dataOffsets ]
+    in ItemVariationStore axisCount' regions' tables
+
+parseRegionList :: ByteBuffer -> Int -> Int -> [[RegionAxis]]
+parseRegionList bb off axisCount' =
+  if off + 4 > bb.len || axisCount' <= 0
+  then []
+  else
+    let axisCountTable = fromIntegral (readU16BE bb off)
+        regionCount = fromIntegral (readU16BE bb (off + 2)) :: Int
+        axisCount'' = if axisCountTable > 0 then axisCountTable else axisCount'
+        regionSize = axisCount'' * 6
+        base = off + 4
+        maxRegions = if base >= bb.len then 0 else min regionCount ((bb.len - base) `div` regionSize)
+    in [ [ RegionAxis
+             { start = f2dot14 (readS16BE bb (base + r * regionSize + a * 6))
+             , peak = f2dot14 (readS16BE bb (base + r * regionSize + a * 6 + 2))
+             , end = f2dot14 (readS16BE bb (base + r * regionSize + a * 6 + 4))
+             }
+         | a <- [0 .. axisCount'' - 1] ]
+       | r <- [0 .. maxRegions - 1] ]
+
+parseItemVariationData :: ByteBuffer -> ItemVariationData
+parseItemVariationData bb =
+  if bb.len < 6
+  then ItemVariationData [] []
+  else
+    let itemCount = fromIntegral (readU16BE bb 0) :: Int
+        shortDeltaCount = fromIntegral (readU16BE bb 2) :: Int
+        regionIndexCount = fromIntegral (readU16BE bb 4) :: Int
+        regionIndicesOff = 6
+        maxRegions = if regionIndicesOff >= bb.len then 0 else min regionIndexCount ((bb.len - regionIndicesOff) `div` 2)
+        regionIndices' = [ fromIntegral (readU16BE bb (regionIndicesOff + i * 2)) | i <- [0 .. maxRegions - 1] ]
+        deltasOff = regionIndicesOff + maxRegions * 2
+        (deltas', _) = readDeltaSets bb deltasOff itemCount maxRegions shortDeltaCount
+    in ItemVariationData regionIndices' deltas'
+
+readDeltaSets :: ByteBuffer -> Int -> Int -> Int -> Int -> ([[Int]], Int)
+readDeltaSets bb off itemCount regionCount shortDeltaCount =
+  let shortCount = min shortDeltaCount regionCount
+      longCount = max 0 (regionCount - shortCount)
+      itemSize = shortCount * 2 + longCount
+      maxItems = if off >= bb.len then 0 else min itemCount ((bb.len - off) `div` itemSize)
+      readItem i =
+        let base = off + i * itemSize
+            shorts = [ fromIntegral (readS16BE bb (base + j * 2)) | j <- [0 .. shortCount - 1] ]
+            longBase = base + shortCount * 2
+            longs = [ fromIntegral (fromIntegral (readU8 bb (longBase + j)) :: Int8) | j <- [0 .. longCount - 1] ]
+        in shorts ++ longs
+      items = [ readItem i | i <- [0 .. maxItems - 1] ]
+  in (items, off + maxItems * itemSize)
+
+parseDeltaSetIndexMap :: ByteBuffer -> DeltaSetIndexMap
+parseDeltaSetIndexMap bb =
+  if bb.len < 4
+  then DeltaSetIndexMap 0 (array (0, -1) [])
+  else
+    let _format = readU8 bb 0
+        entryFormat = readU8 bb 1
+        mapCount' = fromIntegral (readU16BE bb 2) :: Int
+        entrySize = fromIntegral (entryFormat `shiftR` 4) + 1
+        innerBits = fromIntegral (entryFormat .&. 0x0F) + 1
+        maxEntries = if 4 >= bb.len then 0 else min mapCount' ((bb.len - 4) `div` entrySize)
+        entries = [ readEntry bb (4 + i * entrySize) entrySize innerBits | i <- [0 .. maxEntries - 1] ]
+        arr = if null entries then array (0, -1) [] else array (0, length entries - 1) (zip [0..] entries)
+    in DeltaSetIndexMap maxEntries arr
+
+readEntry :: ByteBuffer -> Int -> Int -> Int -> VariationIndex
+readEntry bb off size innerBits =
+  let word = readBE bb off size
+      innerMask = (1 `shiftL` innerBits) - 1
+      inner' = fromIntegral (word .&. innerMask)
+      outer' = fromIntegral (word `shiftR` innerBits)
+  in VariationIndex outer' inner'
+
+readBE :: ByteBuffer -> Int -> Int -> Int
+readBE bb off size =
+  let go i acc =
+        if i >= size
+        then acc
+        else
+          let byte = fromIntegral (readU8 bb (off + i)) :: Int
+          in go (i + 1) ((acc `shiftL` 8) .|. byte)
+  in if size <= 0 || off + size > bb.len then 0 else go 0 0
+
+variationStoreDelta :: ItemVariationStore -> VariationLocation -> VariationIndex -> Double
+variationStoreDelta store loc idx =
+  let tables = store.dataTables
+      regions' = store.regions
+  in if idx.outer < 0 || idx.outer >= length tables
+     then 0
+     else
+       let table = tables !! idx.outer
+           items = table.deltaSets
+           regionIdx = table.regionIndices
+       in if idx.inner < 0 || idx.inner >= length items
+          then 0
+          else
+            let deltas = items !! idx.inner
+                scalars = map (regionScalar loc store.axisCount regions') regionIdx
+            in sum (zipWith (\s d -> s * fromIntegral d) scalars deltas)
+
+regionScalar :: VariationLocation -> Int -> [[RegionAxis]] -> Int -> Double
+regionScalar loc axisCount' regions' idx =
+  if idx < 0 || idx >= length regions'
+  then 0
+  else
+    let axes = regions' !! idx
+        coords' = coordsFor axisCount' loc.coords
+        scalars = zipWith axisScalar coords' axes
+    in foldl' (*) 1 scalars
+
+coordsFor :: Int -> [Double] -> [Double]
+coordsFor n xs =
+  if length xs >= n then take n xs else xs ++ replicate (n - length xs) 0
+
+axisScalar :: Double -> RegionAxis -> Double
+axisScalar coord axis =
+  let start' = axis.start
+      peak' = axis.peak
+      end' = axis.end
+  in if peak' == 0 && coord == 0
+     then 1
+     else if coord < start' || coord > end'
+          then 0
+          else if coord == peak'
+               then 1
+               else if coord < peak'
+                    then if peak' == start' then 0 else (coord - start') / (peak' - start')
+                    else if end' == peak' then 0 else (end' - coord) / (end' - peak')
+
+deltaForMap :: DeltaSetIndexMap -> Int -> VariationIndex
+deltaForMap m i =
+  let (lo, hi) = boundsSafe m.mapEntries
+  in if lo > hi || i < lo || i > hi
+     then VariationIndex 0 0
+     else m.mapEntries ! i
+
+hvarDeltas :: Hvar -> VariationLocation -> Int -> (Double, Double, Double)
+hvarDeltas hvar loc glyphIndex =
+  let advIdx = deltaForMap hvar.advanceMap glyphIndex
+      adv = variationStoreDelta hvar.store loc advIdx
+      lsb = case hvar.lsbMap of
+        Nothing -> 0
+        Just m -> variationStoreDelta hvar.store loc (deltaForMap m glyphIndex)
+      rsb = case hvar.rsbMap of
+        Nothing -> 0
+        Just m -> variationStoreDelta hvar.store loc (deltaForMap m glyphIndex)
+  in (adv, lsb, rsb)
+
+mvarDelta :: Mvar -> VariationLocation -> String -> Double
+mvarDelta mvar loc tag =
+  case lookup tag mvar.records of
+    Nothing -> 0
+    Just idx -> variationStoreDelta mvar.store loc idx
+
+mvarHheaDeltas :: Mvar -> VariationLocation -> (Double, Double, Double)
+mvarHheaDeltas mvar loc =
+  ( mvarDelta mvar loc "hasc"
+  , mvarDelta mvar loc "hdes"
+  , mvarDelta mvar loc "hlgp"
+  )
