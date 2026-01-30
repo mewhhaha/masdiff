@@ -1,23 +1,37 @@
 module MSDF.Generated
   ( generateMSDF
   , generateMSDFWithConfig
+  , generateMSDFOrThrow
   ) where
 
-import Data.Array (Array, array, listArray, accumArray, (!))
-import Data.List (sortOn)
+import Data.Array (Array, array, listArray, accumArray, bounds, (!))
+import Data.List (sortOn, sort)
 import MSDF.MSDF
 import MSDF.TTF.GPOS (KerningPairRaw(..))
 import MSDF.TTF.Parser
 import MSDF.Types
 
 -- | Generate an MSDF atlas from a TTF file with default config.
-generateMSDF :: FilePath -> IO MSDFAtlas
+generateMSDF :: FilePath -> IO (Either ParseError MSDFAtlas)
 generateMSDF = generateMSDFWithConfig defaultMSDFConfig
 
 -- | Generate an MSDF atlas from a TTF file with a custom config.
-generateMSDFWithConfig :: MSDFConfig -> FilePath -> IO MSDFAtlas
+generateMSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)
 generateMSDFWithConfig cfg path = do
-  ttf <- parseTTF path
+  parsed <- parseTTF path
+  case parsed of
+    Left err -> pure (Left err)
+    Right ttf -> pure (Right (buildAtlas cfg ttf))
+
+generateMSDFOrThrow :: FilePath -> IO MSDFAtlas
+generateMSDFOrThrow path = do
+  result <- generateMSDF path
+  case result of
+    Left err -> error (peContext err ++ ": " ++ peMessage err)
+    Right atlas -> pure atlas
+
+buildAtlas :: MSDFConfig -> TTF -> MSDFAtlas
+buildAtlas cfg ttf =
   let numGlyphs = maxpNumGlyphs (ttfMaxp ttf)
       unitsPerEm = headUnitsPerEm (ttfHead ttf)
       scale = fromIntegral (cfgPixelSize cfg) / fromIntegral unitsPerEm
@@ -29,33 +43,31 @@ generateMSDFWithConfig cfg path = do
       glyphs = [ buildGlyph ttf cfg codepointArr selectedGlyphs i | i <- [0 .. numGlyphs - 1] ]
       glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphs)
       kernPairs = buildKerning scale (ttfGpos ttf) (ttfKern ttf)
-      kernArray = arrayFromList (sortOn kernKey kernPairs)
+      kernArray = arrayFromList kernPairs
       fontName = buildFontName (ttfName ttf)
       ascent = round (fromIntegral (hheaAscent (ttfHhea ttf)) * scale)
       descent = round (fromIntegral (hheaDescent (ttfHhea ttf)) * scale)
       lineGap = round (fromIntegral (hheaLineGap (ttfHhea ttf)) * scale)
-  pure MSDFAtlas
-    { msdfFontName = fontName
-    , msdfUnitsPerEm = unitsPerEm
-    , msdfAscent = ascent
-    , msdfDescent = descent
-    , msdfLineGap = lineGap
-    , msdfPixelSize = cfgPixelSize cfg
-    , msdfRange = cfgRange cfg
-    , msdfScale = scale
-    , msdfGlyphs = glyphArray
-    , msdfCodepointIndex = codepointIndex
-    , msdfKerning = kernArray
-    }
+  in MSDFAtlas
+       { msdfFontName = fontName
+       , msdfUnitsPerEm = unitsPerEm
+       , msdfAscent = ascent
+       , msdfDescent = descent
+       , msdfLineGap = lineGap
+       , msdfPixelSize = cfgPixelSize cfg
+       , msdfRange = cfgRange cfg
+       , msdfScale = scale
+       , msdfGlyphs = glyphArray
+       , msdfCodepointIndex = codepointIndex
+       , msdfKerning = kernArray
+       }
 
 buildGlyph :: TTF -> MSDFConfig -> Array Int [Int] -> [Int] -> Int -> GlyphMSDF
 buildGlyph ttf cfg codepointArr selected glyphIndex =
   let codepoints = reverse (codepointArr ! glyphIndex)
       render = if null selected then True else glyphIndex `elem` selected
       base = if render
-             then case renderGlyphMSDF cfg ttf glyphIndex of
-                    Just g -> g
-                    Nothing -> error "renderGlyphMSDF failed"
+             then renderGlyphMSDF cfg ttf glyphIndex
              else glyphMetricsOnly cfg ttf glyphIndex
   in base { glyphCodepoints = codepoints }
 
@@ -75,12 +87,18 @@ kernKey k = (kernLeft k, kernRight k)
 
 buildKerning :: Double -> [KerningPairRaw] -> [KerningPairRaw] -> [KerningPair]
 buildKerning scale gpos kern =
-  let gposPairs = map (toKerning scale) gpos
-      gposKeys = map kernKey gposPairs
-      kernPairs = [ k' | k <- kern
-                       , let k' = toKerning scale k
-                       , kernKey k' `notElem` gposKeys ]
-  in gposPairs ++ kernPairs
+  let gposPairs = sortOn kernKey (map (toKerning scale) gpos)
+      kernPairs = sortOn kernKey (map (toKerning scale) kern)
+  in mergeKerning gposPairs kernPairs
+
+mergeKerning :: [KerningPair] -> [KerningPair] -> [KerningPair]
+mergeKerning [] ys = ys
+mergeKerning xs [] = xs
+mergeKerning (x:xs) (y:ys) =
+  case compare (kernKey x) (kernKey y) of
+    LT -> x : mergeKerning xs (y:ys)
+    GT -> y : mergeKerning (x:xs) ys
+    EQ -> x : mergeKerning xs ys
 
 toKerning :: Double -> KerningPairRaw -> KerningPair
 toKerning scale kp = KerningPair
@@ -104,13 +122,34 @@ glyphSelection :: MSDFConfig -> [(Int, Int)] -> [Int]
 glyphSelection cfg mappings =
   case cfgGlyphSet cfg of
     GlyphSetAll -> []
-    GlyphSetCodepoints cps -> uniqueSorted [ g | (c, g) <- mappings, c `elem` cps ]
+    GlyphSetCodepoints cps ->
+      let cpsSorted = sort cps
+          cpsArr = if null cpsSorted then Nothing else Just (listArray (0, length cpsSorted - 1) cpsSorted)
+      in uniqueSorted [ g | (c, g) <- mappings, memberSorted cpsArr c ]
+
+memberSorted :: Maybe (Array Int Int) -> Int -> Bool
+memberSorted Nothing _ = False
+memberSorted (Just arr) x = go lo hi
+  where
+    (lo, hi) = bounds arr
+    go l h
+      | l > h = False
+      | otherwise =
+          let mid = (l + h) `div` 2
+              v = arr ! mid
+          in if x == v
+             then True
+             else if x < v
+                  then go l (mid - 1)
+                  else go (mid + 1) h
 
 uniqueSorted :: [Int] -> [Int]
-uniqueSorted = foldl' (\acc x -> if null acc || last acc /= x then acc ++ [x] else acc) [] . sort
+uniqueSorted xs =
+  case sort xs of
+    [] -> []
+    (y:ys) -> y : go y ys
   where
-    sort = foldl' insert []
-    insert [] x = [x]
-    insert (y:ys) x
-      | x <= y = x:y:ys
-      | otherwise = y : insert ys x
+    go _ [] = []
+    go prev (z:zs)
+      | z == prev = go prev zs
+      | otherwise = z : go z zs

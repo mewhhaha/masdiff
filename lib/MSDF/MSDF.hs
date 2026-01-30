@@ -8,6 +8,7 @@ module MSDF.MSDF
 
 import Data.Array ( (!) )
 import Data.Array.Unboxed (UArray, listArray)
+import Data.List (sort)
 import Data.Word (Word8)
 import MSDF.Outline
 import MSDF.TTF.Parser
@@ -35,26 +36,27 @@ defaultMSDFConfig = MSDFConfig
   , cfgGlyphSet = GlyphSetAll
   }
 
-renderGlyphMSDF :: MSDFConfig -> TTF -> Int -> Maybe GlyphMSDF
+renderGlyphMSDF :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 renderGlyphMSDF cfg ttf glyphIndex =
   let contours = glyphOutline ttf glyphIndex
       base = glyphMetricsOnly cfg ttf glyphIndex
       bbox = glyphBBox base
       unitsPerEm = headUnitsPerEm (ttfHead ttf)
       scale = fromIntegral (cfgPixelSize cfg) / fromIntegral unitsPerEm
+      safeRange = max 1 (cfgRange cfg)
   in if null contours
-     then Just base
+     then base
      else
        let coloredEdges = concatMap (colorContourEdges (cfgCornerThreshold cfg)) (splitContoursEdges contours scale)
            allLines = concatMap (flattenEdge 0.25) (map snd coloredEdges)
-           colorLines = splitColoredLines coloredEdges
+           colorEdges = splitColoredEdges coloredEdges
            padding = fromIntegral (cfgRange cfg + 1) :: Double
            width = max 1 (ceiling ((bboxXMax bbox - bboxXMin bbox) + 2 * padding))
            height = max 1 (ceiling ((bboxYMax bbox - bboxYMin bbox) + 2 * padding))
            offsetX = bboxXMin bbox - padding
            offsetY = bboxYMin bbox - padding
-           pixels = renderBitmap width height offsetX offsetY (cfgRange cfg) colorLines allLines
-       in Just GlyphMSDF
+           pixels = renderBitmap width height offsetX offsetY safeRange colorEdges allLines
+       in GlyphMSDF
             { glyphIndex = glyphIndex
             , glyphCodepoints = []
             , glyphAdvance = glyphAdvance base
@@ -73,10 +75,13 @@ renderGlyphMSDF cfg ttf glyphIndex =
 glyphMetricsOnly :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 glyphMetricsOnly cfg ttf glyphIndex =
   let (xMin, yMin, xMax, yMax) = glyphBBoxRaw ttf glyphIndex
+      metricsGlyph = case compositeMetricsGlyph ttf glyphIndex of
+                       Just g -> g
+                       Nothing -> glyphIndex
       unitsPerEm = headUnitsPerEm (ttfHead ttf)
       scale = fromIntegral (cfgPixelSize cfg) / fromIntegral unitsPerEm
-      advance = fromIntegral (hmtxAdvances (ttfHmtx ttf) ! glyphIndex) * scale
-      lsb = fromIntegral (hmtxLSB (ttfHmtx ttf) ! glyphIndex) * scale
+      advance = fromIntegral (hmtxAdvances (ttfHmtx ttf) ! metricsGlyph) * scale
+      lsb = fromIntegral (hmtxLSB (ttfHmtx ttf) ! metricsGlyph) * scale
       bearingY = fromIntegral yMax * scale
       bbox = BBox
         { bboxXMin = fromIntegral xMin * scale
@@ -132,24 +137,26 @@ isCorner :: Edge -> Edge -> Double -> Bool
 isCorner e1 e2 threshold =
   let (x1, y1) = edgeEndDir e1
       (x2, y2) = edgeStartDir e2
-      dot = x1 * x2 + y1 * y2
+      dotp = x1 * x2 + y1 * y2
       len1 = sqrt (x1 * x1 + y1 * y1)
       len2 = sqrt (x2 * x2 + y2 * y2)
   in if len1 == 0 || len2 == 0
      then False
      else
-       let cosang = max (-1) (min 1 (dot / (len1 * len2)))
+       let cosang = max (-1) (min 1 (dotp / (len1 * len2)))
            ang = acos cosang
        in ang < threshold
 
 uniqueSorted :: [Int] -> [Int]
-uniqueSorted = foldl' (\acc x -> if null acc || last acc /= x then acc ++ [x] else acc) [] . sort
+uniqueSorted xs =
+  case sort xs of
+    [] -> []
+    (y:ys) -> y : go y ys
   where
-    sort = foldl' insert []
-    insert [] x = [x]
-    insert (y:ys) x
-      | x <= y = x:y:ys
-      | otherwise = y : insert ys x
+    go _ [] = []
+    go prev (z:zs)
+      | z == prev = go prev zs
+      | otherwise = z : go z zs
 
 buildSegments :: [Edge] -> [Int] -> [[Edge]]
 buildSegments edges starts =
@@ -167,41 +174,39 @@ segmentFrom edges n start next =
   let count = if next >= start then next - start else n - start + next
   in [ edges !! ((start + i) `mod` n) | i <- [0 .. count - 1] ]
 
-splitColoredLines :: [(Int, Edge)] -> ([LineSeg], [LineSeg], [LineSeg])
-splitColoredLines colored =
-  let toLines (c, e) = map (\(a,b) -> (c, a, b)) (flattenEdge 0.25 e)
-      linesAll = concatMap toLines colored
-      linesByColor c = [ (a,b) | (col,a,b) <- linesAll, col == c ]
-  in (linesByColor 0, linesByColor 1, linesByColor 2)
+splitColoredEdges :: [(Int, Edge)] -> ([Edge], [Edge], [Edge])
+splitColoredEdges colored =
+  let edgesByColor c = [ e | (col,e) <- colored, col == c ]
+  in (edgesByColor 0, edgesByColor 1, edgesByColor 2)
 
 -- | Line segment representation.
 type LineSeg = (Vec2, Vec2)
 
-renderBitmap :: Int -> Int -> Double -> Double -> Int -> ([LineSeg], [LineSeg], [LineSeg]) -> [LineSeg] -> UArray Int Word8
-renderBitmap width height offsetX offsetY range (linesR, linesG, linesB) allLines =
+renderBitmap :: Int -> Int -> Double -> Double -> Int -> ([Edge], [Edge], [Edge]) -> [LineSeg] -> UArray Int Word8
+renderBitmap width height offsetX offsetY range (edgesR, edgesG, edgesB) allLines =
   let pixels = [ channelValue
                | y <- [0 .. height - 1]
                , x <- [0 .. width - 1]
                , let p = (offsetX + fromIntegral x + 0.5, offsetY + fromIntegral y + 0.5)
                      inside = windingNumber allLines p /= 0
-                     dR = signedDistance inside linesR p
-                     dG = signedDistance inside linesG p
-                     dB = signedDistance inside linesB p
+                     dR = signedDistance inside edgesR p
+                     dG = signedDistance inside edgesG p
+                     dB = signedDistance inside edgesB p
                , channelValue <- [ distanceToByte range dR
                                  , distanceToByte range dG
                                  , distanceToByte range dB ]
                ]
   in listArray (0, length pixels - 1) pixels
 
-signedDistance :: Bool -> [LineSeg] -> Vec2 -> Double
-signedDistance inside segs p =
-  let dist = minDistance segs p
+signedDistance :: Bool -> [Edge] -> Vec2 -> Double
+signedDistance inside edges p =
+  let dist = minDistance edges p
   in if inside then -dist else dist
 
-minDistance :: [LineSeg] -> Vec2 -> Double
+minDistance :: [Edge] -> Vec2 -> Double
 minDistance [] _ = 1e9
-minDistance segs p =
-  sqrt (foldl' min 1e18 [ distanceSqPointLine p a b | (a,b) <- segs ])
+minDistance edges p =
+  sqrt (foldl' min 1e18 [ edgeDistanceSq p e | e <- edges ])
 
 windingNumber :: [LineSeg] -> Vec2 -> Int
 windingNumber segs (px', py') =
@@ -227,6 +232,101 @@ distanceSqPointLine (px', py') (x0, y0) (x1, y1) =
       ex = px' - cx
       ey = py' - cy
   in ex * ex + ey * ey
+
+edgeDistanceSq :: Vec2 -> Edge -> Double
+edgeDistanceSq p (EdgeLine a b) = distanceSqPointLine p a b
+edgeDistanceSq p (EdgeQuad p0 p1 p2) = distanceSqPointQuad p0 p1 p2 p
+
+distanceSqPointQuad :: Vec2 -> Vec2 -> Vec2 -> Vec2 -> Double
+distanceSqPointQuad p0 p1 p2 p =
+  let a = vecSub (vecAdd p0 p2) (vecScale 2 p1)
+      b = vecScale 2 (vecSub p1 p0)
+      c = vecSub p0 p
+      c3 = 2 * dot a a
+      c2 = 3 * dot a b
+      c1 = dot b b + 2 * dot a c
+      c0 = dot b c
+      roots = solveCubic c3 c2 c1 c0
+      ts = filter (\t -> t >= 0 && t <= 1) roots ++ [0,1]
+  in minimum [ distanceSq (bezier p0 p1 p2 t) p | t <- ts ]
+
+bezier :: Vec2 -> Vec2 -> Vec2 -> Double -> Vec2
+bezier p0 p1 p2 t =
+  let u = 1 - t
+      tt = t * t
+      uu = u * u
+      p0' = vecScale uu p0
+      p1' = vecScale (2 * u * t) p1
+      p2' = vecScale tt p2
+  in vecAdd p0' (vecAdd p1' p2')
+
+distanceSq :: Vec2 -> Vec2 -> Double
+distanceSq (x0,y0) (x1,y1) =
+  let dx = x0 - x1
+      dy = y0 - y1
+  in dx * dx + dy * dy
+
+dot :: Vec2 -> Vec2 -> Double
+dot (x0,y0) (x1,y1) = x0 * x1 + y0 * y1
+
+vecAdd :: Vec2 -> Vec2 -> Vec2
+vecAdd (x0,y0) (x1,y1) = (x0 + x1, y0 + y1)
+
+vecSub :: Vec2 -> Vec2 -> Vec2
+vecSub (x0,y0) (x1,y1) = (x0 - x1, y0 - y1)
+
+vecScale :: Double -> Vec2 -> Vec2
+vecScale s (x,y) = (s * x, s * y)
+
+solveCubic :: Double -> Double -> Double -> Double -> [Double]
+solveCubic a b c d
+  | abs a < 1e-12 = solveQuadratic b c d
+  | otherwise =
+      let a' = b / a
+          b' = c / a
+          c' = d / a
+          p = b' - a' * a' / 3
+          q = 2 * a' * a' * a' / 27 - a' * b' / 3 + c'
+          disc = (q * q) / 4 + (p * p * p) / 27
+      in if disc > 0
+         then
+           let sqrtDisc = sqrt disc
+               u = cbrt (-q / 2 + sqrtDisc)
+               v = cbrt (-q / 2 - sqrtDisc)
+           in [u + v - a' / 3]
+         else if abs disc < 1e-12
+              then
+                let u = cbrt (-q / 2)
+                in [2 * u - a' / 3, -u - a' / 3]
+              else
+                let r = sqrt (-(p * p * p) / 27)
+                    phi = acos (-q / (2 * r))
+                    t = 2 * cbrt r
+                in [ t * cos (phi / 3) - a' / 3
+                   , t * cos ((phi + 2 * pi) / 3) - a' / 3
+                   , t * cos ((phi + 4 * pi) / 3) - a' / 3
+                   ]
+
+solveQuadratic :: Double -> Double -> Double -> [Double]
+solveQuadratic a b c
+  | abs a < 1e-12 = solveLinear b c
+  | otherwise =
+      let disc = b * b - 4 * a * c
+      in if disc < 0
+         then []
+         else
+           let sqrtDisc = sqrt disc
+               t1 = (-b + sqrtDisc) / (2 * a)
+               t2 = (-b - sqrtDisc) / (2 * a)
+           in [t1, t2]
+
+solveLinear :: Double -> Double -> [Double]
+solveLinear a b
+  | abs a < 1e-12 = []
+  | otherwise = [-b / a]
+
+cbrt :: Double -> Double
+cbrt x = if x < 0 then -((abs x) ** (1 / 3)) else x ** (1 / 3)
 
 distanceToByte :: Int -> Double -> Word8
 distanceToByte range dist =

@@ -15,8 +15,9 @@ import Data.Char (chr)
 import Data.Int (Int16, Int32)
 import Data.Word (Word8, Word16, Word32)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
+import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff)
-import System.IO (IOMode(ReadMode), withBinaryFile, hFileSize, hGetBuf)
+import System.IO (Handle, IOMode(ReadMode), withBinaryFile, hFileSize, hGetBuf)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- | A view into a byte buffer.
@@ -32,18 +33,33 @@ readByteBuffer path = withBinaryFile path ReadMode $ \h -> do
   let len = fromIntegral size
   fptr <- mallocForeignPtrBytes len
   withForeignPtr fptr $ \p -> do
-    _ <- hGetBuf h p len
+    readAll h p len
     pure (ByteBuffer fptr len 0)
 
 slice :: ByteBuffer -> Int -> Int -> ByteBuffer
-slice bb off len =
-  let off' = bbOff bb + off
-  in ByteBuffer (bbPtr bb) len off'
+slice bb off len
+  | off < 0 || len < 0 || off + len > bbLen bb = error "slice: out of bounds"
+  | otherwise =
+      let off' = bbOff bb + off
+      in ByteBuffer (bbPtr bb) len off'
 
 readU8 :: ByteBuffer -> Int -> Word8
-readU8 bb i = unsafePerformIO $ withForeignPtr (bbPtr bb) $ \p ->
-  peekByteOff p (bbOff bb + i)
+readU8 bb i
+  | i < 0 || i >= bbLen bb = error "readU8: out of bounds"
+  | otherwise = unsafePerformIO $ withForeignPtr (bbPtr bb) $ \p ->
+      peekByteOff p (bbOff bb + i)
 {-# NOINLINE readU8 #-}
+
+readAll :: Handle -> Ptr a -> Int -> IO ()
+readAll h p len = go 0
+  where
+    go off
+      | off >= len = pure ()
+      | otherwise = do
+          n <- hGetBuf h (p `plusPtr` off) (len - off)
+          if n <= 0
+            then error "readByteBuffer: short read"
+            else go (off + n)
 
 readU16BE :: ByteBuffer -> Int -> Word16
 readU16BE bb i =

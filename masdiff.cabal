@@ -17,6 +17,7 @@ category:           Graphics
 build-type:         Simple
 extra-doc-files:    CHANGELOG.md
                   , README.md
+                  , docs/spec_gaps.md
 extra-source-files:
     assets/Inter/README.txt
   , assets/Inter/OFL.txt

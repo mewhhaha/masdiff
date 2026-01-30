@@ -95,9 +95,25 @@ parseLookup bb lookupListOff numGlyphs lookupIndex =
            subTableCount = fromIntegral (readU16BE bb (lookupTableOff + 4))
            subTableOffsets = [ fromIntegral (readU16BE bb (lookupTableOff + 6 + i * 2))
                              | i <- [0 .. subTableCount - 1] ]
-       in if lookupType /= 2
-          then []
-          else concatMap (parsePairPos bb (lookupTableOff) numGlyphs) subTableOffsets
+       in if lookupType == 2
+          then concatMap (parsePairPos bb (lookupTableOff) numGlyphs) subTableOffsets
+          else if lookupType == 9
+               then concatMap (parseExtensionLookup bb lookupTableOff numGlyphs) subTableOffsets
+               else []
+
+parseExtensionLookup :: ByteBuffer -> Int -> Int -> Int -> [KerningPairRaw]
+parseExtensionLookup bb lookupTableOff numGlyphs subOff =
+  let subTableOff = lookupTableOff + subOff
+      posFormat = fromIntegral (readU16BE bb subTableOff) :: Int
+  in if posFormat /= 1
+     then []
+     else
+       let extensionLookupType = fromIntegral (readU16BE bb (subTableOff + 2)) :: Int
+           extensionOffset = fromIntegral (readU32BE bb (subTableOff + 4)) :: Int
+           extensionSubOff = subTableOff + extensionOffset
+       in if extensionLookupType == 2
+          then parsePairPos bb extensionSubOff numGlyphs 0
+          else []
 
 parsePairPos :: ByteBuffer -> Int -> Int -> Int -> [KerningPairRaw]
 parsePairPos bb lookupTableOff numGlyphs subOff =

@@ -7,11 +7,15 @@ module MSDF.TTF.Parser
   , Loca(..)
   , Cmap(..)
   , NameTable(..)
+  , ParseError(..)
   , parseTTF
+  , parseTTFUnsafe
   , glyphOutline
   , glyphBBoxRaw
+  , compositeMetricsGlyph
   ) where
 
+import Control.Exception (SomeException, try)
 import Data.Array (Array, array, (!))
 import Data.Bits (testBit, shiftL, (.|.), (.&.))
 import Data.Char (chr)
@@ -88,8 +92,21 @@ data NameTable = NameTable
   , nameStyle :: String
   }
 
-parseTTF :: FilePath -> IO TTF
+data ParseError = ParseError
+  { peContext :: String
+  , peMessage :: String
+  } deriving (Eq, Show)
+
+parseTTF :: FilePath -> IO (Either ParseError TTF)
 parseTTF path = do
+  result <- try (parseTTFUnsafe path)
+  case result of
+    Left (e :: SomeException) ->
+      pure (Left (ParseError { peContext = "parseTTF", peMessage = show e }))
+    Right ttf -> pure (Right ttf)
+
+parseTTFUnsafe :: FilePath -> IO TTF
+parseTTFUnsafe path = do
   bb <- readByteBuffer path
   let tables = parseTableDirectory bb
       headTbl = requireTable "head" tables bb
@@ -225,6 +242,8 @@ parseCmap bb =
         Just (_, _, off, fmt) ->
           case fmt of
             4 -> parseCmapFormat4 (slice bb (fromIntegral off) (bbLen bb - fromIntegral off))
+            6 -> parseCmapFormat6 (slice bb (fromIntegral off) (bbLen bb - fromIntegral off))
+            10 -> parseCmapFormat10 (slice bb (fromIntegral off) (bbLen bb - fromIntegral off))
             12 -> parseCmapFormat12 (slice bb (fromIntegral off) (bbLen bb - fromIntegral off))
             _ -> []
   in Cmap { cmapMappings = sortOn fst mappings }
@@ -235,9 +254,13 @@ chooseCmapSubtable subs =
       candidates = concat
         [ pick 3 10 12
         , pick 0 4 12
+        , pick 3 10 10
+        , pick 0 4 10
         , pick 3 1 4
         , pick 0 3 4
         , pick 0 0 4
+        , pick 3 1 6
+        , pick 0 3 6
         ]
   in case candidates of
        (x:_) -> Just x
@@ -293,6 +316,22 @@ parseCmapFormat12 bb =
      [ groupMappings i
      | i <- [0 .. nGroups - 1]
      ]
+
+parseCmapFormat6 :: ByteBuffer -> [(Int, Int)]
+parseCmapFormat6 bb =
+  let firstCode = fromIntegral (readU16BE bb 6)
+      entryCount = fromIntegral (readU16BE bb 8)
+      glyphOff = 10
+      glyphs = [ fromIntegral (readU16BE bb (glyphOff + i * 2)) | i <- [0 .. entryCount - 1] ]
+  in [ (firstCode + i, g) | (i, g) <- zip [0..] glyphs ]
+
+parseCmapFormat10 :: ByteBuffer -> [(Int, Int)]
+parseCmapFormat10 bb =
+  let startChar = fromIntegral (readU32BE bb 12) :: Int
+      numChars = fromIntegral (readU32BE bb 16) :: Int
+      glyphOff = 20
+      glyphs = [ fromIntegral (readU16BE bb (glyphOff + i * 2)) | i <- [0 .. numChars - 1] ]
+  in [ (startChar + i, g) | (i, g) <- zip [0..] glyphs ]
 
 -- kern ---------------------------------------------------------------------
 
@@ -445,17 +484,18 @@ parseSimpleGlyph bb numContours =
   in splitContours points endPts
 
 readFlags :: ByteBuffer -> Int -> Int -> [Word8]
-readFlags bb off count = go off []
+readFlags bb off count = reverse (go off count [])
   where
-    go _ acc | length acc >= count = take count acc
-    go idx acc =
+    go _ 0 acc = acc
+    go idx n acc =
       let flag = readU8 bb idx
           repeatCount = if testBit flag 3
                         then fromIntegral (readU8 bb (idx + 1))
                         else 0
-          acc' = acc ++ replicate (repeatCount + 1) flag
+          toTake = min n (repeatCount + 1)
+          acc' = replicate toTake flag ++ acc
           idx' = idx + 1 + if repeatCount > 0 then 1 else 0
-      in go idx' acc'
+      in go idx' (n - toTake) acc'
 
 readCoords :: ByteBuffer -> Int -> [Word8] -> Bool -> ([Int], Int)
 readCoords bb off flags isX =
@@ -498,10 +538,16 @@ parseCompositeGlyph bb depth ttf _glyphIndex =
             if testBit flags 0
             then (fromIntegral (readS16BE bb (off + 4)), fromIntegral (readS16BE bb (off + 6)), off + 8)
             else (fromIntegral (readU8 bb (off + 4)), fromIntegral (readU8 bb (off + 5)), off + 6)
-          (dx, dy) = if testBit flags 1 then (arg1, arg2) else (0, 0)
           (transform, offTrans) = readTransform bb offArgs flags
           contours = glyphContoursAt ttf glyphIndex (depth + 1)
-          transformed = map (map (applyTransform transform dx dy)) contours
+          transformedNoTrans = map (map (applyTransform transform 0 0)) contours
+          (dx, dy) = if testBit flags 1
+                     then applyComponentOffset flags transform (fromIntegral arg1, fromIntegral arg2)
+                     else pointMatchOffset acc transformedNoTrans arg1 arg2
+          (dx', dy') = if testBit flags 2
+                       then (fromIntegral (round dx :: Int), fromIntegral (round dy :: Int))
+                       else (dx, dy)
+          transformed = map (map (applyTransform transform dx' dy')) contours
           acc' = acc ++ transformed
       in if testBit flags 5
          then go offTrans acc'
@@ -524,13 +570,78 @@ readTransform bb off flags
       in ((a, b, c, d), off + 8)
   | otherwise = ((1, 0, 0, 1), off)
 
-applyTransform :: (Double, Double, Double, Double) -> Int -> Int -> Point -> Point
+applyTransform :: (Double, Double, Double, Double) -> Double -> Double -> Point -> Point
 applyTransform (a,b,c,d) dx dy p =
-  let x' = a * px p + b * py p + fromIntegral dx
-      y' = c * px p + d * py p + fromIntegral dy
+  let x' = a * px p + b * py p + dx
+      y' = c * px p + d * py p + dy
   in p { px = x', py = y' }
 
 f2dot14 :: Int16 -> Double
 f2dot14 v =
   let i = fromIntegral v :: Double
   in i / 16384.0
+
+applyComponentOffset :: Word16 -> (Double, Double, Double, Double) -> (Double, Double) -> (Double, Double)
+applyComponentOffset flags (a,b,c,d) (dx, dy)
+  | testBit flags 12 = (dx, dy)
+  | testBit flags 11 = (a * dx + b * dy, c * dx + d * dy)
+  | hasScale = (a * dx + b * dy, c * dx + d * dy)
+  | otherwise = (dx, dy)
+  where
+    hasScale = testBit flags 3 || testBit flags 6 || testBit flags 7
+
+pointMatchOffset :: [[Point]] -> [[Point]] -> Int -> Int -> (Double, Double)
+pointMatchOffset compositeContours componentContours compPointIndex compGlyphPointIndex =
+  case (pointAt componentContours compPointIndex, pointAt compositeContours compGlyphPointIndex) of
+    (Just compPt, Just basePt) ->
+      let dx = px basePt - px compPt
+          dy = py basePt - py compPt
+      in (dx, dy)
+    _ -> (0, 0)
+
+pointAt :: [[Point]] -> Int -> Maybe Point
+pointAt contours idx
+  | idx < 0 = Nothing
+  | otherwise = go contours idx
+  where
+    go [] _ = Nothing
+    go (c:cs) n
+      | n < length c = Just (c !! n)
+      | otherwise = go cs (n - length c)
+
+compositeMetricsGlyph :: TTF -> Int -> Maybe Int
+compositeMetricsGlyph ttf glyphIndex =
+  let glyf = ttfGlyf ttf
+      offsets = locaOffsets (ttfLoca ttf)
+      start = offsets ! glyphIndex
+      end = offsets ! (glyphIndex + 1)
+  in if end <= start
+     then Nothing
+     else
+       let bb = slice glyf start (end - start)
+           numContours = fromIntegral (readS16BE bb 0) :: Int
+       in if numContours >= 0
+          then Nothing
+          else compositeUseMyMetrics bb
+
+compositeUseMyMetrics :: ByteBuffer -> Maybe Int
+compositeUseMyMetrics bb = go 10
+  where
+    go off =
+      let flags = readU16BE bb off
+          glyphIndex = fromIntegral (readU16BE bb (off + 2))
+          argsAreWords = testBit flags 0
+          offArgs = off + 2 + if argsAreWords then 4 else 2
+          offTrans = offArgs + transformSize flags
+      in if testBit flags 9
+         then Just glyphIndex
+         else if testBit flags 5
+              then go offTrans
+              else Nothing
+
+transformSize :: Word16 -> Int
+transformSize flags
+  | testBit flags 3 = 2
+  | testBit flags 6 = 4
+  | testBit flags 7 = 8
+  | otherwise = 0
