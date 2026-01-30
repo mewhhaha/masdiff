@@ -42,6 +42,7 @@ main = do
         { MSDF.pixelSize = 24
         , MSDF.glyphSet = GlyphSetCodepoints [65,66,67]
         , MSDF.parallelism = 64 -- optional: chunk size for parallel rendering
+        , MSDF.variations = [("wght", 700)] -- optional: variable font axes
         }
   result <- generateMSDFWithConfig cfg "path/to/font.ttf"
   case result of

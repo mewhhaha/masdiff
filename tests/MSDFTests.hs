@@ -1,9 +1,10 @@
 module Main (main) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, try, evaluate)
 import Data.Array (elems, (!))
 import Data.Array.IArray (bounds, rangeSize)
-import Data.Bits (testBit)
+import Data.Bits (testBit, (.&.))
+import Data.List (find)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word16)
 import System.Exit (exitFailure)
@@ -13,7 +14,9 @@ import MSDF.Generated (generateMSDFWithConfig)
 import MSDF.MSDF (MSDFConfig(..), defaultMSDFConfig, renderGlyphMSDF, glyphMetricsOnly, GlyphSet(..))
 import qualified MSDF.MSDF as MSDF
 import MSDF.Binary (ByteBuffer, readS16BE, readU16BE, slice)
+import MSDF.Outline (Point(..))
 import MSDF.TTF.Parser
+import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..))
 import MSDF.Types
 import Paths_masdiff (getDataFileName)
 
@@ -33,6 +36,7 @@ main = do
     , runTest "glyph outline A" (testOutlineA ttf)
     , runTest "composite glyph" (testCompositeGlyph ttf)
     , runTest "render glyph MSDF" (testRenderGlyph ttf cfgSmall)
+    , runTest "variable font axes" (testVariableFont ttf)
     , runTest "subset atlas" (testGenerateSubset subsetAtlas)
     , runTest "kerning sorted" (testKerningSorted subsetAtlas)
     , runTest "metrics only" (testMetricsOnly ttf cfgSmall)
@@ -124,6 +128,58 @@ testRenderGlyph ttf cfg = do
       size = rangeSize (lo, hi)
       expected = bmp.width * bmp.height * 3
   assert (size == expected) "bitmap pixel buffer size mismatch"
+
+testVariableFont :: TTF -> IO ()
+testVariableFont ttf = do
+  let mappings = ttf.cmap.mappings
+      gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
+  assert (gA >= 0) "glyph index for A not found"
+  case ttf.variations of
+    Nothing -> assert False "font has no variation tables"
+    Just (Variations fvar avar gvar) -> do
+      let Fvar axes _ = fvar
+      assert (not (null axes)) "fvar has no axes"
+      case find (\a -> case a of FvarAxis t _ _ _ _ -> t == "wght") axes of
+        Nothing -> assert False "wght axis missing"
+        Just (FvarAxis _ minV defV maxV _) ->
+          assert (minV < defV && defV < maxV) "wght axis values invalid"
+      let loc@(VariationLocation locCoords) = normalizeLocation fvar avar [("wght", 900)]
+      assert (not (null locCoords)) "normalized variation coords are empty"
+      let tags = [ t | FvarAxis t _ _ _ _ <- axes ]
+          wghtIndex = fromMaybe (-1) (lookup "wght" (zip tags [0..]))
+      assert (wghtIndex >= 0) "wght axis index not found"
+      case find (\a -> case a of FvarAxis t _ _ _ _ -> t == "wght") axes of
+        Nothing -> assert False "wght axis missing"
+        Just (FvarAxis _ minV defV maxV _) -> do
+          let expected = if 900 < defV
+                         then (900 - defV) / (defV - minV)
+                         else (900 - defV) / (maxV - defV)
+          assert (expected /= 0) "expected normalized value is zero"
+          assert (locCoords !! wghtIndex /= 0) "normalized variation coords are all zero"
+      case gvar of
+        Nothing -> assert False "gvar table missing"
+        Just (Gvar _ _ offsets dataOffset _ buffer) ->
+          let (lo, hi) = bounds offsets
+          in if gA < lo || gA + 1 > hi
+             then assert False "gvar offsets out of range"
+             else do
+               let off = offsets ! gA
+                   off' = offsets ! (gA + 1)
+               assert (off' > off) "gvar has no data for glyph A"
+               let bb = slice buffer (dataOffset + off) (off' - off)
+                   tupleCount = readU16BE bb 0 .&. 0x0FFF
+               assert (tupleCount > 0) "gvar has zero tuple variations for glyph A"
+      let maxGlyph = min (ttf.maxp.numGlyphs - 1) 200
+      varies <- anyM (glyphVaries ttf loc) [0 .. maxGlyph]
+      assert varies "variable font should alter at least one glyph outline"
+  let cfgDefault = defaultMSDFConfig { MSDF.pixelSize = 24 }
+      cfgVar = defaultMSDFConfig
+        { MSDF.pixelSize = 24
+        , MSDF.variations = [("wght", 900)]
+        }
+      _glyphDefault = renderGlyphMSDF cfgDefault ttf gA
+      _glyphVar = renderGlyphMSDF cfgVar ttf gA
+  pure ()
 
 
 testGenerateSubset :: MSDFAtlas -> IO ()
@@ -222,3 +278,29 @@ transformSize flags
   | testBit flags 6 = 4
   | testBit flags 7 = 8
   | otherwise = 0
+
+anyM :: Monad m => (a -> m Bool) -> [a] -> m Bool
+anyM _ [] = pure False
+anyM f (x:xs) = do
+  ok <- f x
+  if ok then pure True else anyM f xs
+
+glyphVaries :: TTF -> VariationLocation -> Int -> IO Bool
+glyphVaries ttf loc glyphIndex = do
+  base <- safeHash Nothing
+  var <- safeHash (Just loc)
+  pure (case (base, var) of
+    (Just b, Just v) -> b /= v
+    _ -> False)
+  where
+    safeHash mLoc = do
+      let contours = glyphOutlineAt mLoc ttf glyphIndex
+          h = contourHash contours
+      result <- try (evaluate h) :: IO (Either SomeException Double)
+      case result of
+        Left _ -> pure Nothing
+        Right v -> pure (Just v)
+
+contourHash :: [[Point]] -> Double
+contourHash contours =
+  foldl' (\acc (Point px py _) -> acc + px * 0.7 + py * 0.3) 0 [ p | c <- contours, p <- c ]

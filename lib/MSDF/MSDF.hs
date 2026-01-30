@@ -12,6 +12,7 @@ import Data.List (sort)
 import Data.Word (Word8)
 import MSDF.Outline
 import MSDF.TTF.Parser
+import MSDF.TTF.Variations (applyGvarToContours)
 import MSDF.Types
 
 -- | Configuration for MSDF generation.
@@ -21,6 +22,7 @@ data MSDFConfig = MSDFConfig
   , cornerThreshold :: Double
   , glyphSet :: GlyphSet
   , parallelism :: Int
+  , variations :: [(String, Double)]
   }
 
 -- | Glyph subset selection.
@@ -47,12 +49,20 @@ defaultMSDFConfig = MSDFConfig
   , cornerThreshold = 3.0
   , glyphSet = GlyphSetAll
   , parallelism = 0
+  , variations = []
   }
+
+variationLocation :: MSDFConfig -> TTF -> Maybe VariationLocation
+variationLocation cfg ttf =
+  case ttf.variations of
+    Nothing -> Nothing
+    Just vars -> Just (normalizeLocation vars.fvar vars.avar cfg.variations)
 
 renderGlyphMSDF :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 renderGlyphMSDF cfg ttf glyphIndex =
-  let contours = glyphOutline ttf glyphIndex
-      base = glyphMetricsOnly cfg ttf glyphIndex
+  let loc = variationLocation cfg ttf
+      contours = glyphOutlineAt loc ttf glyphIndex
+      base = glyphMetricsOnlyAt loc cfg ttf glyphIndex
       bbox = base.bbox
       unitsPerEm = ttf.head.unitsPerEm
       scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
@@ -87,14 +97,22 @@ renderGlyphMSDF cfg ttf glyphIndex =
 
 glyphMetricsOnly :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 glyphMetricsOnly cfg ttf glyphIndex =
-  let (xMin, yMin, xMax, yMax) = glyphBBoxRaw ttf glyphIndex
+  let loc = variationLocation cfg ttf
+  in glyphMetricsOnlyAt loc cfg ttf glyphIndex
+
+glyphMetricsOnlyAt :: Maybe VariationLocation -> MSDFConfig -> TTF -> Int -> GlyphMSDF
+glyphMetricsOnlyAt loc cfg ttf glyphIndex =
+  let (xMin, yMin, xMax, yMax) = glyphBBoxRawAt loc ttf glyphIndex
       metricsGlyph = case compositeMetricsGlyph ttf glyphIndex of
                        Just g -> g
                        Nothing -> glyphIndex
       unitsPerEm = ttf.head.unitsPerEm
       scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
-      advance = fromIntegral (ttf.hmtx.advances ! metricsGlyph) * scale
-      lsb = fromIntegral (ttf.hmtx.lsb ! metricsGlyph) * scale
+      baseAdvance = fromIntegral (ttf.hmtx.advances ! metricsGlyph)
+      baseLsb = fromIntegral (ttf.hmtx.lsb ! metricsGlyph)
+      (deltaL, deltaR) = phantomDeltas loc ttf metricsGlyph
+      advance = (baseAdvance + (deltaR - deltaL)) * scale
+      lsb = (baseLsb + deltaL) * scale
       bearingY = fromIntegral yMax * scale
       bbox = BBox
         { xMin = fromIntegral xMin * scale
@@ -111,6 +129,18 @@ glyphMetricsOnly cfg ttf glyphIndex =
       , bbox = bbox
       , bitmap = emptyBitmap
       }
+
+phantomDeltas :: Maybe VariationLocation -> TTF -> Int -> (Double, Double)
+phantomDeltas loc ttf glyphIndex =
+  case (loc, ttf.variations) of
+    (Just loc', Just vars) ->
+      case vars.gvar of
+        Just gv ->
+          let baseContours = glyphOutlineAt Nothing ttf glyphIndex
+              (_, (dLeft, dRight, _, _)) = applyGvarToContours gv loc' glyphIndex baseContours
+          in (dLeft, dRight)
+        Nothing -> (0, 0)
+    _ -> (0, 0)
 
 emptyBitmap :: MSDFBitmap
 emptyBitmap = MSDFBitmap

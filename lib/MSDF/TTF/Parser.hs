@@ -8,10 +8,16 @@ module MSDF.TTF.Parser
   , Cmap(..)
   , NameTable(..)
   , ParseError(..)
+  , Variations(..)
+  , VariationLocation(..)
+  , normalizeLocation
+  , defaultLocation
   , parseTTF
   , parseTTFUnsafe
   , glyphOutline
+  , glyphOutlineAt
   , glyphBBoxRaw
+  , glyphBBoxRawAt
   , compositeMetricsGlyph
   ) where
 
@@ -25,6 +31,7 @@ import Data.Word (Word8, Word16, Word32)
 import MSDF.Binary
 import MSDF.Outline (Point(..))
 import MSDF.TTF.GPOS (KerningPairRaw(..), parseGPOS)
+import MSDF.TTF.Variations
 
 within :: ByteBuffer -> Int -> Int -> Bool
 within bb off size =
@@ -42,6 +49,7 @@ data TTF = TTF
   , kern :: [KerningPairRaw]
   , gpos :: [KerningPairRaw]
   , name :: NameTable
+  , variations :: Maybe Variations
   }
 
 -- | head table
@@ -123,6 +131,9 @@ parseTTFUnsafe path = do
       kernTbl = optionalTable "kern" tables bb
       gposTbl = optionalTable "GPOS" tables bb
       nameTbl = optionalTable "name" tables bb
+      fvarTbl = optionalTable "fvar" tables bb
+      avarTbl = optionalTable "avar" tables bb
+      gvarTbl = optionalTable "gvar" tables bb
       headInfo = parseHead headTbl
       hhea = parseHhea hheaTbl
       maxp = parseMaxp maxpTbl
@@ -132,6 +143,14 @@ parseTTFUnsafe path = do
       kern = maybe [] parseKern kernTbl
       gpos = maybe [] (parseGPOS maxp.numGlyphs) gposTbl
       name = maybe (NameTable "" "") parseName nameTbl
+      variations =
+        case fvarTbl of
+          Nothing -> Nothing
+          Just fvarTable ->
+            let fvar = parseFvar fvarTable
+                avar = fmap parseAvar avarTbl
+                gvar = fmap (parseGvar maxp.numGlyphs) gvarTbl
+            in Just (Variations fvar avar gvar)
   pure TTF
     { head = headInfo
     , hhea = hhea
@@ -143,6 +162,7 @@ parseTTFUnsafe path = do
     , kern = kern
     , gpos = gpos
     , name = name
+    , variations = variations
     }
 
 -- Table directory -----------------------------------------------------------
@@ -459,26 +479,41 @@ decodeUTF16BE (b0:b1:rest) =
 
 glyphOutline :: TTF -> Int -> [[Point]]
 glyphOutline ttf glyphIndex =
-  glyphContoursAt ttf glyphIndex 0
+  glyphOutlineAt Nothing ttf glyphIndex
 
-glyphContoursAt :: TTF -> Int -> Int -> [[Point]]
-glyphContoursAt ttf glyphIndex depth =
+glyphOutlineAt :: Maybe VariationLocation -> TTF -> Int -> [[Point]]
+glyphOutlineAt loc ttf glyphIndex =
+  fst (glyphContoursAtVar loc ttf glyphIndex 0)
+
+glyphContoursAtVar :: Maybe VariationLocation -> TTF -> Int -> Int -> ([[Point]], (Double, Double, Double, Double))
+glyphContoursAtVar loc ttf glyphIndex depth =
   let numGlyphs = ttf.maxp.numGlyphs
       glyf = ttf.glyf
       loca = ttf.loca
       offsets = loca.offsets
   in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
-     then []
+     then ([], (0,0,0,0))
      else
        let start = offsets ! glyphIndex
            end = offsets ! (glyphIndex + 1)
        in if end <= start || end > glyf.len
-         then []
-         else parseGlyphContours glyf start (end - start) depth ttf glyphIndex
+         then ([], (0,0,0,0))
+         else
+           let baseContours = parseGlyphContours loc glyf start (end - start) depth ttf glyphIndex
+           in case (loc, ttf.variations) of
+                (Just loc', Just vars) ->
+                  case vars.gvar of
+                    Just gv -> applyGvarToContours gv loc' glyphIndex baseContours
+                    Nothing -> (baseContours, (0,0,0,0))
+                _ -> (baseContours, (0,0,0,0))
 
 -- | Raw bounding box for a glyph (font units).
 glyphBBoxRaw :: TTF -> Int -> (Int, Int, Int, Int)
 glyphBBoxRaw ttf glyphIndex =
+  glyphBBoxRawAt Nothing ttf glyphIndex
+
+glyphBBoxRawAt :: Maybe VariationLocation -> TTF -> Int -> (Int, Int, Int, Int)
+glyphBBoxRawAt loc ttf glyphIndex =
   let numGlyphs = ttf.maxp.numGlyphs
       glyf = ttf.glyf
       loca = ttf.loca
@@ -491,15 +526,20 @@ glyphBBoxRaw ttf glyphIndex =
        in if end <= start || end > glyf.len
           then (0,0,0,0)
           else
-            let bb = slice glyf start (end - start)
-                xMin = fromIntegral (readS16BE bb 2)
-                yMin = fromIntegral (readS16BE bb 4)
-                xMax = fromIntegral (readS16BE bb 6)
-                yMax = fromIntegral (readS16BE bb 8)
-            in (xMin, yMin, xMax, yMax)
+            case loc of
+              Nothing ->
+                let bb = slice glyf start (end - start)
+                    xMin = fromIntegral (readS16BE bb 2)
+                    yMin = fromIntegral (readS16BE bb 4)
+                    xMax = fromIntegral (readS16BE bb 6)
+                    yMax = fromIntegral (readS16BE bb 8)
+                in (xMin, yMin, xMax, yMax)
+              Just _ ->
+                let (contours, _) = glyphContoursAtVar loc ttf glyphIndex 0
+                in bboxFromContours contours
 
-parseGlyphContours :: ByteBuffer -> Int -> Int -> Int -> TTF -> Int -> [[Point]]
-parseGlyphContours glyf off len depth ttf glyphIndex =
+parseGlyphContours :: Maybe VariationLocation -> ByteBuffer -> Int -> Int -> Int -> TTF -> Int -> [[Point]]
+parseGlyphContours loc glyf off len depth ttf glyphIndex =
   let bb = slice glyf off len
   in if bb.len < 2
      then []
@@ -509,7 +549,7 @@ parseGlyphContours glyf off len depth ttf glyphIndex =
           then parseSimpleGlyph bb numContours
           else if depth > 16
                then []
-               else parseCompositeGlyph bb depth ttf glyphIndex
+               else parseCompositeGlyph loc bb depth ttf glyphIndex
 
 parseSimpleGlyph :: ByteBuffer -> Int -> [[Point]]
 parseSimpleGlyph bb numContours =
@@ -532,6 +572,19 @@ parseSimpleGlyph bb numContours =
                 points = [ Point (fromIntegral (xs !! i)) (fromIntegral (ys !! i)) (testBit (flags !! i) 0)
                          | i <- [0 .. min (length flags - 1) (numPoints - 1)] ]
             in splitContours points endPts
+
+bboxFromContours :: [[Point]] -> (Int, Int, Int, Int)
+bboxFromContours contours =
+  case [ (p.x, p.y) | c <- contours, p <- c ] of
+    [] -> (0,0,0,0)
+    pts ->
+      let xs = map fst pts
+          ys = map snd pts
+          xMin' = floor (minimum xs)
+          yMin' = floor (minimum ys)
+          xMax' = ceiling (maximum xs)
+          yMax' = ceiling (maximum ys)
+      in (xMin', yMin', xMax', yMax')
 
 readFlags :: ByteBuffer -> Int -> Int -> [Word8]
 readFlags bb off count = reverse (go off count [])
@@ -585,8 +638,8 @@ splitContours points endPts =
       let (a, b) = splitAt n pts
       in a : go b (map (subtract n) ns)
 
-parseCompositeGlyph :: ByteBuffer -> Int -> TTF -> Int -> [[Point]]
-parseCompositeGlyph bb depth ttf _glyphIndex =
+parseCompositeGlyph :: Maybe VariationLocation -> ByteBuffer -> Int -> TTF -> Int -> [[Point]]
+parseCompositeGlyph loc bb depth ttf _glyphIndex =
   let flagsOff = 10
   in go flagsOff []
   where
@@ -610,7 +663,7 @@ parseCompositeGlyph bb depth ttf _glyphIndex =
                 then acc
                 else
                   let (transform, offTrans) = readTransform bb offArgs flags
-                      contours = glyphContoursAt ttf glyphIndex (depth + 1)
+                      (contours, _) = glyphContoursAtVar loc ttf glyphIndex (depth + 1)
                       transformedNoTrans = map (map (applyTransform transform 0 0)) contours
                       (dx, dy) = if testBit flags 1
                                  then applyComponentOffset flags transform (fromIntegral arg1, fromIntegral arg2)
