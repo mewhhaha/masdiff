@@ -1,0 +1,10 @@
+dist-newstyle/
+.ghc.environment.*
+*.hi
+*.o
+*.dyn_o
+*.dyn_hi
+*.prof
+*.hp
+*.eventlog
+.stack-work/
