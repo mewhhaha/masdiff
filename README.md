@@ -37,7 +37,11 @@ import MSDF.TTF.Parser (ParseError(..))
 
 main :: IO ()
 main = do
-  let cfg = defaultMSDFConfig { cfgPixelSize = 24, cfgGlyphSet = GlyphSetCodepoints [65,66,67] }
+  let cfg = defaultMSDFConfig
+        { cfgPixelSize = 24
+        , cfgGlyphSet = GlyphSetCodepoints [65,66,67]
+        , cfgParallelism = 64 -- optional: chunk size for parallel rendering
+        }
   result <- generateMSDFWithConfig cfg "path/to/font.ttf"
   case result of
     Left err -> putStrLn (peContext err ++ ": " ++ peMessage err)
@@ -164,6 +168,12 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 - TrueType outlines only (no CFF).
 - Variable fonts use default axis values.
 - GPOS support is limited to Pair Adjustment lookups (format 1/2).
+
+Glyph selection:
+
+- `GlyphSetAll` renders all glyphs.
+- `GlyphSetNone` renders only metrics (no bitmaps).
+- `GlyphSetCodepoints [...]` renders a subset.
 
 ## Assets and licensing
 

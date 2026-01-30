@@ -4,6 +4,7 @@ module MSDF.Generated
   , generateMSDFOrThrow
   ) where
 
+import Control.Parallel.Strategies (parListChunk, rdeepseq, withStrategy)
 import Data.Array (Array, array, listArray, accumArray, bounds, (!))
 import Data.List (sortOn, sort)
 import MSDF.MSDF
@@ -39,8 +40,8 @@ buildAtlas cfg ttf =
       codepointArr = accumCodepoints numGlyphs mappings
       codepointEntries = map (uncurry CodepointMapEntry) (sortOn fst mappings)
       codepointIndex = arrayFromList codepointEntries
-      selectedGlyphs = glyphSelection cfg mappings
-      glyphs = [ buildGlyph ttf cfg codepointArr selectedGlyphs i | i <- [0 .. numGlyphs - 1] ]
+      selector = glyphSelector (cfgGlyphSet cfg) mappings
+      glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
       glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphs)
       kernPairs = buildKerning scale (ttfGpos ttf) (ttfKern ttf)
       kernArray = arrayFromList kernPairs
@@ -62,11 +63,10 @@ buildAtlas cfg ttf =
        , msdfKerning = kernArray
        }
 
-buildGlyph :: TTF -> MSDFConfig -> Array Int [Int] -> [Int] -> Int -> GlyphMSDF
-buildGlyph ttf cfg codepointArr selected glyphIndex =
+buildGlyph :: TTF -> MSDFConfig -> Array Int [Int] -> (Int -> Bool) -> Int -> GlyphMSDF
+buildGlyph ttf cfg codepointArr shouldRender glyphIndex =
   let codepoints = reverse (codepointArr ! glyphIndex)
-      render = if null selected then True else glyphIndex `elem` selected
-      base = if render
+      base = if shouldRender glyphIndex
              then renderGlyphMSDF cfg ttf glyphIndex
              else glyphMetricsOnly cfg ttf glyphIndex
   in base { glyphCodepoints = codepoints }
@@ -118,14 +118,25 @@ buildFontName nt =
        (f, s) -> f ++ " " ++ s
 
 -- | Select glyph indices for rendering based on config.
-glyphSelection :: MSDFConfig -> [(Int, Int)] -> [Int]
-glyphSelection cfg mappings =
-  case cfgGlyphSet cfg of
-    GlyphSetAll -> []
+glyphSelector :: GlyphSet -> [(Int, Int)] -> (Int -> Bool)
+glyphSelector set mappings =
+  case set of
+    GlyphSetAll -> const True
+    GlyphSetNone -> const False
     GlyphSetCodepoints cps ->
       let cpsSorted = sort cps
           cpsArr = if null cpsSorted then Nothing else Just (listArray (0, length cpsSorted - 1) cpsSorted)
-      in uniqueSorted [ g | (c, g) <- mappings, memberSorted cpsArr c ]
+          allowed = uniqueSorted [ g | (c, g) <- mappings, memberSorted cpsArr c ]
+          allowedArr = if null allowed then Nothing else Just (listArray (0, length allowed - 1) allowed)
+      in memberSorted allowedArr
+
+renderGlyphs :: MSDFConfig -> TTF -> Array Int [Int] -> (Int -> Bool) -> Int -> [GlyphMSDF]
+renderGlyphs cfg ttf codepointArr shouldRender numGlyphs =
+  let glyphs = [ buildGlyph ttf cfg codepointArr shouldRender i | i <- [0 .. numGlyphs - 1] ]
+      chunk = cfgParallelism cfg
+  in if chunk > 0
+     then withStrategy (parListChunk chunk rdeepseq) glyphs
+     else glyphs
 
 memberSorted :: Maybe (Array Int Int) -> Int -> Bool
 memberSorted Nothing _ = False

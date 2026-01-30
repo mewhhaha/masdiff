@@ -3,12 +3,16 @@ module MSDF.Types
   , GlyphMSDF(..)
   , MSDFBitmap(..)
   , BBox(..)
+  , BBoxUnion(..)
+  , bboxUnion
+  , bboxUnionMaybe
   , CodepointMapEntry(..)
   , KerningPair(..)
   , lookupCodepoint
   , lookupKerning
   ) where
 
+import Control.DeepSeq (NFData(..))
 import Data.Array (Array, (!), bounds)
 import Data.Array.Unboxed (UArray)
 import Data.Word (Word8)
@@ -62,6 +66,31 @@ data BBox = BBox
   , bboxYMax :: Double
   } deriving (Eq, Show)
 
+newtype BBoxUnion = BBoxUnion { getBBoxUnion :: Maybe BBox }
+  deriving (Eq, Show)
+
+bboxUnion :: BBox -> BBox -> BBox
+bboxUnion a b = BBox
+  { bboxXMin = min (bboxXMin a) (bboxXMin b)
+  , bboxYMin = min (bboxYMin a) (bboxYMin b)
+  , bboxXMax = max (bboxXMax a) (bboxXMax b)
+  , bboxYMax = max (bboxYMax a) (bboxYMax b)
+  }
+
+bboxUnionMaybe :: Maybe BBox -> BBox -> Maybe BBox
+bboxUnionMaybe Nothing b = Just b
+bboxUnionMaybe (Just a) b = Just (bboxUnion a b)
+
+instance Semigroup BBoxUnion where
+  BBoxUnion a <> BBoxUnion b =
+    BBoxUnion (case (a, b) of
+      (Nothing, x) -> x
+      (x, Nothing) -> x
+      (Just x, Just y) -> Just (bboxUnion x y))
+
+instance Monoid BBoxUnion where
+  mempty = BBoxUnion Nothing
+
 -- | Packed RGB bitmap data.
 data MSDFBitmap = MSDFBitmap
   { bmpWidth :: Int
@@ -70,6 +99,29 @@ data MSDFBitmap = MSDFBitmap
   , bmpOffsetY :: Double
   , bmpPixels :: UArray Int Word8
   } deriving (Eq, Show)
+
+instance NFData BBox where
+  rnf (BBox a b c d) = a `seq` b `seq` c `seq` d `seq` ()
+
+instance NFData BBoxUnion where
+  rnf (BBoxUnion m) = rnf m
+
+instance NFData CodepointMapEntry where
+  rnf (CodepointMapEntry a b) = a `seq` b `seq` ()
+
+instance NFData KerningPair where
+  rnf (KerningPair a b c) = a `seq` b `seq` c `seq` ()
+
+instance NFData MSDFBitmap where
+  rnf (MSDFBitmap w h ox oy px) = w `seq` h `seq` ox `seq` oy `seq` px `seq` ()
+
+instance NFData GlyphMSDF where
+  rnf (GlyphMSDF i cps adv bx by bb bm) =
+    i `seq` cps `seq` adv `seq` bx `seq` by `seq` bb `seq` bm `seq` ()
+
+instance NFData MSDFAtlas where
+  rnf (MSDFAtlas n u a d l p r s g c k) =
+    n `seq` u `seq` a `seq` d `seq` l `seq` p `seq` r `seq` s `seq` g `seq` c `seq` k `seq` ()
 
 lookupCodepoint :: MSDFAtlas -> Int -> Maybe Int
 lookupCodepoint atlas codepoint =

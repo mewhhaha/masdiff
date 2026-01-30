@@ -20,12 +20,24 @@ data MSDFConfig = MSDFConfig
   , cfgRange :: Int
   , cfgCornerThreshold :: Double
   , cfgGlyphSet :: GlyphSet
+  , cfgParallelism :: Int
   }
 
 -- | Glyph subset selection.
 data GlyphSet
-  = GlyphSetAll
+  = GlyphSetNone
+  | GlyphSetAll
   | GlyphSetCodepoints [Int]
+
+instance Semigroup GlyphSet where
+  GlyphSetAll <> _ = GlyphSetAll
+  _ <> GlyphSetAll = GlyphSetAll
+  GlyphSetNone <> x = x
+  x <> GlyphSetNone = x
+  GlyphSetCodepoints a <> GlyphSetCodepoints b = GlyphSetCodepoints (uniqueSorted (a ++ b))
+
+instance Monoid GlyphSet where
+  mempty = GlyphSetNone
 
 -- | Default configuration.
 defaultMSDFConfig :: MSDFConfig
@@ -34,6 +46,7 @@ defaultMSDFConfig = MSDFConfig
   , cfgRange = 4
   , cfgCornerThreshold = 3.0
   , cfgGlyphSet = GlyphSetAll
+  , cfgParallelism = 0
   }
 
 renderGlyphMSDF :: MSDFConfig -> TTF -> Int -> GlyphMSDF

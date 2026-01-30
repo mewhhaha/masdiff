@@ -44,6 +44,8 @@ library
     -- other-extensions:
     build-depends:    base ^>=4.21.0.0
                     , array ^>=0.5.8.0
+                    , deepseq ^>=1.5.0.0
+                    , parallel ^>=3.2.2.0
     hs-source-dirs:   lib
     default-language: GHC2024
 
