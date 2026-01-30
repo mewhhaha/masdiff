@@ -28,39 +28,39 @@ generateMSDFOrThrow :: FilePath -> IO MSDFAtlas
 generateMSDFOrThrow path = do
   result <- generateMSDF path
   case result of
-    Left err -> error (peContext err ++ ": " ++ peMessage err)
+    Left err -> error (err.context ++ ": " ++ err.message)
     Right atlas -> pure atlas
 
 buildAtlas :: MSDFConfig -> TTF -> MSDFAtlas
 buildAtlas cfg ttf =
-  let numGlyphs = maxpNumGlyphs (ttfMaxp ttf)
-      unitsPerEm = headUnitsPerEm (ttfHead ttf)
-      scale = fromIntegral (cfgPixelSize cfg) / fromIntegral unitsPerEm
-      mappings = cmapMappings (ttfCmap ttf)
+  let numGlyphs = ttf.maxp.numGlyphs
+      unitsPerEm = ttf.head.unitsPerEm
+      scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
+      mappings = ttf.cmap.mappings
       codepointArr = accumCodepoints numGlyphs mappings
       codepointEntries = map (uncurry CodepointMapEntry) (sortOn fst mappings)
       codepointIndex = arrayFromList codepointEntries
-      selector = glyphSelector (cfgGlyphSet cfg) mappings
+      selector = glyphSelector cfg.glyphSet mappings
       glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
       glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphs)
-      kernPairs = buildKerning scale (ttfGpos ttf) (ttfKern ttf)
+      kernPairs = buildKerning scale ttf.gpos ttf.kern
       kernArray = arrayFromList kernPairs
-      fontName = buildFontName (ttfName ttf)
-      ascent = round (fromIntegral (hheaAscent (ttfHhea ttf)) * scale)
-      descent = round (fromIntegral (hheaDescent (ttfHhea ttf)) * scale)
-      lineGap = round (fromIntegral (hheaLineGap (ttfHhea ttf)) * scale)
+      fontName = buildFontName ttf.name
+      ascent = round (fromIntegral ttf.hhea.ascent * scale)
+      descent = round (fromIntegral ttf.hhea.descent * scale)
+      lineGap = round (fromIntegral ttf.hhea.lineGap * scale)
   in MSDFAtlas
-       { msdfFontName = fontName
-       , msdfUnitsPerEm = unitsPerEm
-       , msdfAscent = ascent
-       , msdfDescent = descent
-       , msdfLineGap = lineGap
-       , msdfPixelSize = cfgPixelSize cfg
-       , msdfRange = cfgRange cfg
-       , msdfScale = scale
-       , msdfGlyphs = glyphArray
-       , msdfCodepointIndex = codepointIndex
-       , msdfKerning = kernArray
+       { fontName = fontName
+       , unitsPerEm = unitsPerEm
+       , ascent = ascent
+       , descent = descent
+       , lineGap = lineGap
+       , pixelSize = cfg.pixelSize
+       , range = cfg.range
+       , scale = scale
+       , glyphs = glyphArray
+       , codepointIndex = codepointIndex
+       , kerning = kernArray
        }
 
 buildGlyph :: TTF -> MSDFConfig -> Array Int [Int] -> (Int -> Bool) -> Int -> GlyphMSDF
@@ -69,7 +69,7 @@ buildGlyph ttf cfg codepointArr shouldRender glyphIndex =
       base = if shouldRender glyphIndex
              then renderGlyphMSDF cfg ttf glyphIndex
              else glyphMetricsOnly cfg ttf glyphIndex
-  in base { glyphCodepoints = codepoints }
+  in base { codepoints = codepoints }
 
 accumCodepoints :: Int -> [(Int, Int)] -> Array Int [Int]
 accumCodepoints numGlyphs mappings =
@@ -83,7 +83,7 @@ arrayFromList xs =
   else listArray (0, length xs - 1) xs
 
 kernKey :: KerningPair -> (Int, Int)
-kernKey k = (kernLeft k, kernRight k)
+kernKey k = (k.left, k.right)
 
 buildKerning :: Double -> [KerningPairRaw] -> [KerningPairRaw] -> [KerningPair]
 buildKerning scale gpos kern =
@@ -102,15 +102,15 @@ mergeKerning (x:xs) (y:ys) =
 
 toKerning :: Double -> KerningPairRaw -> KerningPair
 toKerning scale kp = KerningPair
-  { kernLeft = kpLeft kp
-  , kernRight = kpRight kp
-  , kernXAdvance = fromIntegral (kpXAdvance kp) * scale
+  { left = kp.left
+  , right = kp.right
+  , xAdvance = fromIntegral kp.xAdvance * scale
   }
 
 buildFontName :: NameTable -> String
 buildFontName nt =
-  let fam = nameFamily nt
-      sty = nameStyle nt
+  let fam = nt.family
+      sty = nt.style
   in case (fam, sty) of
        ("", "") -> ""
        (f, "") -> f
@@ -133,7 +133,7 @@ glyphSelector set mappings =
 renderGlyphs :: MSDFConfig -> TTF -> Array Int [Int] -> (Int -> Bool) -> Int -> [GlyphMSDF]
 renderGlyphs cfg ttf codepointArr shouldRender numGlyphs =
   let glyphs = [ buildGlyph ttf cfg codepointArr shouldRender i | i <- [0 .. numGlyphs - 1] ]
-      chunk = cfgParallelism cfg
+      chunk = cfg.parallelism
   in if chunk > 0
      then withStrategy (parListChunk chunk rdeepseq) glyphs
      else glyphs

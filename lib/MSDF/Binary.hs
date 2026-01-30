@@ -22,9 +22,9 @@ import System.IO.Unsafe (unsafePerformIO)
 
 -- | A view into a byte buffer.
 data ByteBuffer = ByteBuffer
-  { bbPtr :: ForeignPtr Word8
-  , bbLen :: Int
-  , bbOff :: Int
+  { ptr :: ForeignPtr Word8
+  , len :: Int
+  , off :: Int
   }
 
 readByteBuffer :: FilePath -> IO ByteBuffer
@@ -38,16 +38,16 @@ readByteBuffer path = withBinaryFile path ReadMode $ \h -> do
 
 slice :: ByteBuffer -> Int -> Int -> ByteBuffer
 slice bb off len
-  | off < 0 || len < 0 || off + len > bbLen bb = error "slice: out of bounds"
+  | off < 0 || len < 0 || off + len > bb.len = error "slice: out of bounds"
   | otherwise =
-      let off' = bbOff bb + off
-      in ByteBuffer (bbPtr bb) len off'
+      let off' = bb.off + off
+      in ByteBuffer bb.ptr len off'
 
 readU8 :: ByteBuffer -> Int -> Word8
 readU8 bb i
-  | i < 0 || i >= bbLen bb = error "readU8: out of bounds"
-  | otherwise = unsafePerformIO $ withForeignPtr (bbPtr bb) $ \p ->
-      peekByteOff p (bbOff bb + i)
+  | i < 0 || i >= bb.len = error "readU8: out of bounds"
+  | otherwise = unsafePerformIO $ withForeignPtr bb.ptr $ \p ->
+      peekByteOff p (bb.off + i)
 {-# NOINLINE readU8 #-}
 
 readAll :: Handle -> Ptr a -> Int -> IO ()

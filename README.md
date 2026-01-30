@@ -19,13 +19,13 @@ main :: IO ()
 main = do
   result <- generateMSDF "path/to/font.ttf"
   case result of
-    Left err -> putStrLn (peContext err ++ ": " ++ peMessage err)
-    Right atlas -> print (msdfFontName atlas)
+    Left err -> putStrLn (err.context ++ ": " ++ err.message)
+    Right atlas -> print (atlas.fontName)
 
 -- Or throw on parse errors:
 main = do
   atlas <- generateMSDFOrThrow "path/to/font.ttf"
-  print (msdfFontName atlas)
+  print (atlas.fontName)
 ```
 
 ### Custom config
@@ -33,19 +33,20 @@ main = do
 ```haskell
 import MSDF.Generated (generateMSDFWithConfig)
 import MSDF.MSDF (defaultMSDFConfig, GlyphSet(..))
+import qualified MSDF.MSDF as MSDF
 import MSDF.TTF.Parser (ParseError(..))
 
 main :: IO ()
 main = do
   let cfg = defaultMSDFConfig
-        { cfgPixelSize = 24
-        , cfgGlyphSet = GlyphSetCodepoints [65,66,67]
-        , cfgParallelism = 64 -- optional: chunk size for parallel rendering
+        { MSDF.pixelSize = 24
+        , MSDF.glyphSet = GlyphSetCodepoints [65,66,67]
+        , MSDF.parallelism = 64 -- optional: chunk size for parallel rendering
         }
   result <- generateMSDFWithConfig cfg "path/to/font.ttf"
   case result of
-    Left err -> putStrLn (peContext err ++ ": " ++ peMessage err)
-    Right atlas -> print (length (msdfGlyphs atlas))
+    Left err -> putStrLn (err.context ++ ": " ++ err.message)
+    Right atlas -> print (length (atlas.glyphs))
 ```
 
 ## Tests

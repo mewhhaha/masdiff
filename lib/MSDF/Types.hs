@@ -21,49 +21,49 @@ import Data.Word (Word8)
 type GlyphIndex = Int
 
 data MSDFAtlas = MSDFAtlas
-  { msdfFontName :: String
-  , msdfUnitsPerEm :: Int
-  , msdfAscent :: Int
-  , msdfDescent :: Int
-  , msdfLineGap :: Int
-  , msdfPixelSize :: Int
-  , msdfRange :: Int
-  , msdfScale :: Double
-  , msdfGlyphs :: Array GlyphIndex GlyphMSDF
-  , msdfCodepointIndex :: Array Int CodepointMapEntry
-  , msdfKerning :: Array Int KerningPair
+  { fontName :: String
+  , unitsPerEm :: Int
+  , ascent :: Int
+  , descent :: Int
+  , lineGap :: Int
+  , pixelSize :: Int
+  , range :: Int
+  , scale :: Double
+  , glyphs :: Array GlyphIndex GlyphMSDF
+  , codepointIndex :: Array Int CodepointMapEntry
+  , kerning :: Array Int KerningPair
   }
 
 -- | Map from Unicode codepoint to glyph index.
 data CodepointMapEntry = CodepointMapEntry
-  { cmapCodepoint :: Int
-  , cmapGlyphIndex :: Int
+  { codepoint :: Int
+  , glyphIndex :: Int
   } deriving (Eq, Show)
 
 -- | Kerning pair adjustment in pixels.
 data KerningPair = KerningPair
-  { kernLeft :: Int
-  , kernRight :: Int
-  , kernXAdvance :: Double
+  { left :: Int
+  , right :: Int
+  , xAdvance :: Double
   } deriving (Eq, Show)
 
 -- | Per-glyph MSDF data.
 data GlyphMSDF = GlyphMSDF
-  { glyphIndex :: GlyphIndex
-  , glyphCodepoints :: [Int]
-  , glyphAdvance :: Double
-  , glyphBearingX :: Double
-  , glyphBearingY :: Double
-  , glyphBBox :: BBox
-  , glyphBitmap :: MSDFBitmap
+  { index :: GlyphIndex
+  , codepoints :: [Int]
+  , advance :: Double
+  , bearingX :: Double
+  , bearingY :: Double
+  , bbox :: BBox
+  , bitmap :: MSDFBitmap
   } deriving (Eq, Show)
 
 -- | Glyph bounding box in pixels.
 data BBox = BBox
-  { bboxXMin :: Double
-  , bboxYMin :: Double
-  , bboxXMax :: Double
-  , bboxYMax :: Double
+  { xMin :: Double
+  , yMin :: Double
+  , xMax :: Double
+  , yMax :: Double
   } deriving (Eq, Show)
 
 newtype BBoxUnion = BBoxUnion { getBBoxUnion :: Maybe BBox }
@@ -71,10 +71,10 @@ newtype BBoxUnion = BBoxUnion { getBBoxUnion :: Maybe BBox }
 
 bboxUnion :: BBox -> BBox -> BBox
 bboxUnion a b = BBox
-  { bboxXMin = min (bboxXMin a) (bboxXMin b)
-  , bboxYMin = min (bboxYMin a) (bboxYMin b)
-  , bboxXMax = max (bboxXMax a) (bboxXMax b)
-  , bboxYMax = max (bboxYMax a) (bboxYMax b)
+  { xMin = min a.xMin b.xMin
+  , yMin = min a.yMin b.yMin
+  , xMax = max a.xMax b.xMax
+  , yMax = max a.yMax b.yMax
   }
 
 bboxUnionMaybe :: Maybe BBox -> BBox -> Maybe BBox
@@ -93,11 +93,11 @@ instance Monoid BBoxUnion where
 
 -- | Packed RGB bitmap data.
 data MSDFBitmap = MSDFBitmap
-  { bmpWidth :: Int
-  , bmpHeight :: Int
-  , bmpOffsetX :: Double
-  , bmpOffsetY :: Double
-  , bmpPixels :: UArray Int Word8
+  { width :: Int
+  , height :: Int
+  , offsetX :: Double
+  , offsetY :: Double
+  , pixels :: UArray Int Word8
   } deriving (Eq, Show)
 
 instance NFData BBox where
@@ -124,16 +124,16 @@ instance NFData MSDFAtlas where
     n `seq` u `seq` a `seq` d `seq` l `seq` p `seq` r `seq` s `seq` g `seq` c `seq` k `seq` ()
 
 lookupCodepoint :: MSDFAtlas -> Int -> Maybe Int
-lookupCodepoint atlas codepoint =
-  let arr = msdfCodepointIndex atlas
+lookupCodepoint atlas cp =
+  let arr = atlas.codepointIndex
       (lo, hi) = boundsSafe arr
-  in if lo > hi then Nothing else binarySearchCodepoint arr codepoint lo hi
+  in if lo > hi then Nothing else binarySearchCodepoint arr cp lo hi
 
 lookupKerning :: MSDFAtlas -> Int -> Int -> Double
-lookupKerning atlas left right =
-  let arr = msdfKerning atlas
+lookupKerning atlas l r =
+  let arr = atlas.kerning
       (lo, hi) = boundsSafe arr
-  in if lo > hi then 0 else binarySearchKerning arr left right lo hi
+  in if lo > hi then 0 else binarySearchKerning arr l r lo hi
 
 boundsSafe :: Array Int a -> (Int, Int)
 boundsSafe arr =
@@ -141,28 +141,28 @@ boundsSafe arr =
   in (l, h)
 
 binarySearchCodepoint :: Array Int CodepointMapEntry -> Int -> Int -> Int -> Maybe Int
-binarySearchCodepoint arr codepoint lo hi
+binarySearchCodepoint arr cp lo hi
   | lo > hi = Nothing
   | otherwise =
       let mid = (lo + hi) `div` 2
           entry = arr ! mid
-          c = cmapCodepoint entry
-      in if codepoint == c
-         then Just (cmapGlyphIndex entry)
-         else if codepoint < c
-              then binarySearchCodepoint arr codepoint lo (mid - 1)
-              else binarySearchCodepoint arr codepoint (mid + 1) hi
+          c = entry.codepoint
+      in if cp == c
+         then Just entry.glyphIndex
+         else if cp < c
+              then binarySearchCodepoint arr cp lo (mid - 1)
+              else binarySearchCodepoint arr cp (mid + 1) hi
 
 binarySearchKerning :: Array Int KerningPair -> Int -> Int -> Int -> Int -> Double
-binarySearchKerning arr left right lo hi
+binarySearchKerning arr l r lo hi
   | lo > hi = 0
   | otherwise =
       let mid = (lo + hi) `div` 2
           entry = arr ! mid
-          keyL = kernLeft entry
-          keyR = kernRight entry
-      in if left == keyL && right == keyR
-         then kernXAdvance entry
-         else if (left < keyL) || (left == keyL && right < keyR)
-              then binarySearchKerning arr left right lo (mid - 1)
-              else binarySearchKerning arr left right (mid + 1) hi
+          keyL = entry.left
+          keyR = entry.right
+      in if l == keyL && r == keyR
+         then entry.xAdvance
+         else if (l < keyL) || (l == keyL && r < keyR)
+              then binarySearchKerning arr l r lo (mid - 1)
+              else binarySearchKerning arr l r (mid + 1) hi

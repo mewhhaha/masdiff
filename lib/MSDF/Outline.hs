@@ -11,9 +11,9 @@ module MSDF.Outline
 
 -- | A point from the glyph outline.
 data Point = Point
-  { px :: Double
-  , py :: Double
-  , pOn :: Bool
+  { x :: Double
+  , y :: Double
+  , on :: Bool
   } deriving (Eq, Show)
 
 type Vec2 = (Double, Double)
@@ -36,25 +36,25 @@ insertImpliedPoints pts =
       case xs of
         [] -> []
         (p:_) ->
-          if pOn p then xs
+          if p.on then xs
           else
             let lastP = last xs
                 mid = midpointPoint lastP p
             in mid : xs
 
-    midpointPoint a b = Point ((px a + px b) * 0.5) ((py a + py b) * 0.5) True
+    midpointPoint a b = Point ((a.x + b.x) * 0.5) ((a.y + b.y) * 0.5) True
 
     go [] _ acc = reverse acc
     go [p] first acc =
       let acc' = p : acc
-      in if pOn p && pOn first
+      in if p.on && first.on
          then reverse acc'
-         else if not (pOn p) && not (pOn first)
+         else if not p.on && not first.on
               then reverse (midpointPoint p first : acc')
               else reverse acc'
     go (p1:p2:rest) first acc
-      | pOn p1 && not (pOn p2) = go (p2:rest) first (p1:acc)
-      | not (pOn p1) && not (pOn p2) =
+      | p1.on && not p2.on = go (p2:rest) first (p1:acc)
+      | not p1.on && not p2.on =
           let mid = midpointPoint p1 p2
           in go (p2:rest) first (mid:p1:acc)
       | otherwise = go (p2:rest) first (p1:acc)
@@ -76,18 +76,18 @@ contourToEdges pts0 =
 
     go _ [] = []
     go current (p1:rest)
-      | pOn p1 =
+      | p1.on =
           EdgeLine (toVec current) (toVec p1) : go p1 rest
       | otherwise =
           case rest of
             [] -> []
             (p2:rest2) ->
-              let endPoint = if pOn p2
+              let endPoint = if p2.on
                              then p2
-                             else Point ((px p1 + px p2) * 0.5) ((py p1 + py p2) * 0.5) True
-              in EdgeQuad (toVec current) (toVec p1) (toVec endPoint) : go endPoint (if pOn p2 then rest2 else p2:rest2)
+                             else Point ((p1.x + p2.x) * 0.5) ((p1.y + p2.y) * 0.5) True
+              in EdgeQuad (toVec current) (toVec p1) (toVec endPoint) : go endPoint (if p2.on then rest2 else p2:rest2)
 
-    toVec p = (px p, py p)
+    toVec p = (p.x, p.y)
 
 edgeStartDir :: Edge -> Vec2
 edgeStartDir (EdgeLine (x0, y0) (x1, y1)) = (x1 - x0, y1 - y0)

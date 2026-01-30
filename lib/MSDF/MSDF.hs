@@ -16,11 +16,11 @@ import MSDF.Types
 
 -- | Configuration for MSDF generation.
 data MSDFConfig = MSDFConfig
-  { cfgPixelSize :: Int
-  , cfgRange :: Int
-  , cfgCornerThreshold :: Double
-  , cfgGlyphSet :: GlyphSet
-  , cfgParallelism :: Int
+  { pixelSize :: Int
+  , range :: Int
+  , cornerThreshold :: Double
+  , glyphSet :: GlyphSet
+  , parallelism :: Int
   }
 
 -- | Glyph subset selection.
@@ -42,46 +42,46 @@ instance Monoid GlyphSet where
 -- | Default configuration.
 defaultMSDFConfig :: MSDFConfig
 defaultMSDFConfig = MSDFConfig
-  { cfgPixelSize = 32
-  , cfgRange = 4
-  , cfgCornerThreshold = 3.0
-  , cfgGlyphSet = GlyphSetAll
-  , cfgParallelism = 0
+  { pixelSize = 32
+  , range = 4
+  , cornerThreshold = 3.0
+  , glyphSet = GlyphSetAll
+  , parallelism = 0
   }
 
 renderGlyphMSDF :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 renderGlyphMSDF cfg ttf glyphIndex =
   let contours = glyphOutline ttf glyphIndex
       base = glyphMetricsOnly cfg ttf glyphIndex
-      bbox = glyphBBox base
-      unitsPerEm = headUnitsPerEm (ttfHead ttf)
-      scale = fromIntegral (cfgPixelSize cfg) / fromIntegral unitsPerEm
-      safeRange = max 1 (cfgRange cfg)
+      bbox = base.bbox
+      unitsPerEm = ttf.head.unitsPerEm
+      scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
+      safeRange = max 1 cfg.range
   in if null contours
      then base
      else
-       let coloredEdges = concatMap (colorContourEdges (cfgCornerThreshold cfg)) (splitContoursEdges contours scale)
+       let coloredEdges = concatMap (colorContourEdges cfg.cornerThreshold) (splitContoursEdges contours scale)
            allLines = concatMap (flattenEdge 0.25) (map snd coloredEdges)
            colorEdges = splitColoredEdges coloredEdges
-           padding = fromIntegral (cfgRange cfg + 1) :: Double
-           width = max 1 (ceiling ((bboxXMax bbox - bboxXMin bbox) + 2 * padding))
-           height = max 1 (ceiling ((bboxYMax bbox - bboxYMin bbox) + 2 * padding))
-           offsetX = bboxXMin bbox - padding
-           offsetY = bboxYMin bbox - padding
+           padding = fromIntegral (cfg.range + 1) :: Double
+           width = max 1 (ceiling ((bbox.xMax - bbox.xMin) + 2 * padding))
+           height = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding))
+           offsetX = bbox.xMin - padding
+           offsetY = bbox.yMin - padding
            pixels = renderBitmap width height offsetX offsetY safeRange colorEdges allLines
        in GlyphMSDF
-            { glyphIndex = glyphIndex
-            , glyphCodepoints = []
-            , glyphAdvance = glyphAdvance base
-            , glyphBearingX = glyphBearingX base
-            , glyphBearingY = glyphBearingY base
-            , glyphBBox = bbox
-            , glyphBitmap = MSDFBitmap
-                { bmpWidth = width
-                , bmpHeight = height
-                , bmpOffsetX = offsetX
-                , bmpOffsetY = offsetY
-                , bmpPixels = pixels
+            { index = glyphIndex
+            , codepoints = []
+            , advance = base.advance
+            , bearingX = base.bearingX
+            , bearingY = base.bearingY
+            , bbox = bbox
+            , bitmap = MSDFBitmap
+                { width = width
+                , height = height
+                , offsetX = offsetX
+                , offsetY = offsetY
+                , pixels = pixels
                 }
             }
 
@@ -91,34 +91,34 @@ glyphMetricsOnly cfg ttf glyphIndex =
       metricsGlyph = case compositeMetricsGlyph ttf glyphIndex of
                        Just g -> g
                        Nothing -> glyphIndex
-      unitsPerEm = headUnitsPerEm (ttfHead ttf)
-      scale = fromIntegral (cfgPixelSize cfg) / fromIntegral unitsPerEm
-      advance = fromIntegral (hmtxAdvances (ttfHmtx ttf) ! metricsGlyph) * scale
-      lsb = fromIntegral (hmtxLSB (ttfHmtx ttf) ! metricsGlyph) * scale
+      unitsPerEm = ttf.head.unitsPerEm
+      scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
+      advance = fromIntegral (ttf.hmtx.advances ! metricsGlyph) * scale
+      lsb = fromIntegral (ttf.hmtx.lsb ! metricsGlyph) * scale
       bearingY = fromIntegral yMax * scale
       bbox = BBox
-        { bboxXMin = fromIntegral xMin * scale
-        , bboxYMin = fromIntegral yMin * scale
-        , bboxXMax = fromIntegral xMax * scale
-        , bboxYMax = fromIntegral yMax * scale
+        { xMin = fromIntegral xMin * scale
+        , yMin = fromIntegral yMin * scale
+        , xMax = fromIntegral xMax * scale
+        , yMax = fromIntegral yMax * scale
         }
   in GlyphMSDF
-      { glyphIndex = glyphIndex
-      , glyphCodepoints = []
-      , glyphAdvance = advance
-      , glyphBearingX = lsb
-      , glyphBearingY = bearingY
-      , glyphBBox = bbox
-      , glyphBitmap = emptyBitmap
+      { index = glyphIndex
+      , codepoints = []
+      , advance = advance
+      , bearingX = lsb
+      , bearingY = bearingY
+      , bbox = bbox
+      , bitmap = emptyBitmap
       }
 
 emptyBitmap :: MSDFBitmap
 emptyBitmap = MSDFBitmap
-  { bmpWidth = 0
-  , bmpHeight = 0
-  , bmpOffsetX = 0
-  , bmpOffsetY = 0
-  , bmpPixels = listArray (0, -1) []
+  { width = 0
+  , height = 0
+  , offsetX = 0
+  , offsetY = 0
+  , pixels = listArray (0, -1) []
   }
 
 scaleEdge :: Double -> Edge -> Edge

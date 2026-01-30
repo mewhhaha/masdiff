@@ -32,6 +32,9 @@ common warnings
 
 library
     import:           warnings
+    default-extensions: DuplicateRecordFields
+                        , NoFieldSelectors
+                        , OverloadedRecordDot
     exposed-modules:  MyLib
                     , MSDF.Types
                     , MSDF.Binary
@@ -60,3 +63,6 @@ test-suite msdf-tests
                     , array ^>=0.5.8.0
                     , masdiff
     default-language: GHC2024
+    default-extensions: DuplicateRecordFields
+                        , NoFieldSelectors
+                        , OverloadedRecordDot

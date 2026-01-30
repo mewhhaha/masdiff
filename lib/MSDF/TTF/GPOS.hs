@@ -10,9 +10,9 @@ import MSDF.Binary
 
 -- | Kerning pair in font units.
 data KerningPairRaw = KerningPairRaw
-  { kpLeft :: Int
-  , kpRight :: Int
-  , kpXAdvance :: Int
+  { left :: Int
+  , right :: Int
+  , xAdvance :: Int
   } deriving (Eq, Show)
 
 parseGPOS :: Int -> ByteBuffer -> [KerningPairRaw]
@@ -146,7 +146,7 @@ parsePairSet bb pairSetOff firstGlyph valueFormat1 valueFormat2 =
             secondGlyph = fromIntegral (readU16BE bb recordOff)
             (v1, off1) = readValueRecord bb (recordOff + 2) valueFormat1
             (v2, _off2) = readValueRecord bb off1 valueFormat2
-            xAdv = valueXAdvance v1 + valueXAdvance v2
+            xAdv = v1.xAdvance + v2.xAdvance
         in KerningPairRaw firstGlyph secondGlyph xAdv
   in [ pairValueAt j | j <- [0 .. pairValueCount - 1] ]
 
@@ -177,7 +177,7 @@ pairsForLeft bb recordsOff valueFormat1 valueFormat2 class1Count class2Count cla
     pairsForClass2 recordOff class2 =
       let (v1, off1) = readValueRecord bb recordOff valueFormat1
           (v2, _off2) = readValueRecord bb off1 valueFormat2
-          xAdv = valueXAdvance v1 + valueXAdvance v2
+          xAdv = v1.xAdvance + v2.xAdvance
       in if xAdv == 0
          then []
          else [ KerningPairRaw leftGlyph rightGlyph xAdv
@@ -238,7 +238,7 @@ buildClassGlyphs numGlyphs classCount classFn =
 -- Value records -------------------------------------------------------------
 
 data ValueRecord = ValueRecord
-  { valueXAdvance :: Int
+  { xAdvance :: Int
   }
 
 readValueRecord :: ByteBuffer -> Int -> Word16 -> (ValueRecord, Int)

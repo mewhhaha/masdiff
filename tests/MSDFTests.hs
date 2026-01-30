@@ -11,6 +11,7 @@ import System.IO (hPutStrLn, stderr)
 
 import MSDF.Generated (generateMSDFWithConfig)
 import MSDF.MSDF (MSDFConfig(..), defaultMSDFConfig, renderGlyphMSDF, glyphMetricsOnly, GlyphSet(..))
+import qualified MSDF.MSDF as MSDF
 import MSDF.Binary (ByteBuffer, readS16BE, readU16BE, slice)
 import MSDF.TTF.Parser
 import MSDF.Types
@@ -23,8 +24,9 @@ main :: IO ()
 main = do
   fontPath <- ttfPath
   ttf <- requireRight "parseTTF" =<< parseTTF fontPath
-  let cfgSmall = defaultMSDFConfig { cfgPixelSize = 16 }
-  subsetAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig (cfgSmall { cfgGlyphSet = GlyphSetCodepoints [65, 66] }) fontPath
+  let cfgSmall :: MSDFConfig
+      cfgSmall = defaultMSDFConfig { MSDF.pixelSize = 16 }
+  subsetAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig (cfgSmall { MSDF.glyphSet = GlyphSetCodepoints [65, 66] }) fontPath
   results <- sequence
     [ runTest "parseTTF basic" (testParseTTF ttf)
     , runTest "cmap includes" (testCmap ttf)
@@ -56,7 +58,7 @@ assert cond msg = if cond then pure () else error msg
 requireRight :: String -> Either ParseError a -> IO a
 requireRight label result =
   case result of
-    Left err -> error (label ++ ": " ++ peContext err ++ ": " ++ peMessage err)
+    Left err -> error (label ++ ": " ++ err.context ++ ": " ++ err.message)
     Right val -> pure val
 
 lookupCodepointList :: Int -> [(Int, Int)] -> Maybe Int
@@ -66,15 +68,15 @@ lookupCodepointList cp mappings = lookup cp mappings
 
 testParseTTF :: TTF -> IO ()
 testParseTTF ttf = do
-  assert (headUnitsPerEm (ttfHead ttf) > 0) "unitsPerEm should be > 0"
-  assert (maxpNumGlyphs (ttfMaxp ttf) > 0) "numGlyphs should be > 0"
-  assert (not (null (cmapMappings (ttfCmap ttf)))) "cmap mappings should not be empty"
+  assert (ttf.head.unitsPerEm > 0) "unitsPerEm should be > 0"
+  assert (ttf.maxp.numGlyphs > 0) "numGlyphs should be > 0"
+  assert (not (null ttf.cmap.mappings)) "cmap mappings should not be empty"
 
 
 testCmap :: TTF -> IO ()
 testCmap ttf = do
-  let mappings = cmapMappings (ttfCmap ttf)
-      numGlyphs = maxpNumGlyphs (ttfMaxp ttf)
+  let mappings = ttf.cmap.mappings
+      numGlyphs = ttf.maxp.numGlyphs
   assert (lookupCodepointList 32 mappings /= Nothing) "cmap missing U+0020"
   assert (lookupCodepointList 65 mappings /= Nothing) "cmap missing U+0041"
   let gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
@@ -83,7 +85,7 @@ testCmap ttf = do
 
 testOutlineA :: TTF -> IO ()
 testOutlineA ttf = do
-  let mappings = cmapMappings (ttfCmap ttf)
+  let mappings = ttf.cmap.mappings
       gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
   assert (gA >= 0) "glyph index for A not found"
   let contours = glyphOutline ttf gA
@@ -93,7 +95,7 @@ testOutlineA ttf = do
 
 testCompositeGlyph :: TTF -> IO ()
 testCompositeGlyph ttf = do
-  let mappings = cmapMappings (ttfCmap ttf)
+  let mappings = ttf.cmap.mappings
       cp = 0x00C5 -- Å
       mGlyph = lookupCodepointList cp mappings
   assert (mGlyph /= Nothing) "cmap missing U+00C5 (Å)"
@@ -112,15 +114,15 @@ testCompositePointMatch ttf = do
 
 testRenderGlyph :: TTF -> MSDFConfig -> IO ()
 testRenderGlyph ttf cfg = do
-  let mappings = cmapMappings (ttfCmap ttf)
+  let mappings = ttf.cmap.mappings
       gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
   assert (gA >= 0) "glyph index for A not found"
   let glyph = renderGlyphMSDF cfg ttf gA
-      bmp = glyphBitmap glyph
-  assert (bmpWidth bmp > 0 && bmpHeight bmp > 0) "bitmap should have positive dimensions"
-  let (lo, hi) = bounds (bmpPixels bmp)
+      bmp = glyph.bitmap
+  assert (bmp.width > 0 && bmp.height > 0) "bitmap should have positive dimensions"
+  let (lo, hi) = bounds bmp.pixels
       size = rangeSize (lo, hi)
-      expected = bmpWidth bmp * bmpHeight bmp * 3
+      expected = bmp.width * bmp.height * 3
   assert (size == expected) "bitmap pixel buffer size mismatch"
 
 
@@ -132,10 +134,10 @@ testGenerateSubset atlas = do
   assert (mB /= Nothing) "atlas missing U+0042"
   let gA = fromMaybe (-1) mA
       gB = fromMaybe (-1) mB
-      glyphA = msdfGlyphs atlas ! gA
-      glyphB = msdfGlyphs atlas ! gB
-  assert (bmpWidth (glyphBitmap glyphA) > 0) "glyph A bitmap should be rendered"
-  assert (bmpWidth (glyphBitmap glyphB) > 0) "glyph B bitmap should be rendered"
+      glyphA = atlas.glyphs ! gA
+      glyphB = atlas.glyphs ! gB
+  assert (glyphA.bitmap.width > 0) "glyph A bitmap should be rendered"
+  assert (glyphB.bitmap.width > 0) "glyph B bitmap should be rendered"
   let mC = lookupCodepoint atlas 67
   case mC of
     Nothing -> pure ()
@@ -143,27 +145,27 @@ testGenerateSubset atlas = do
       if gC == gA || gC == gB
       then pure ()
       else do
-        let glyphC = msdfGlyphs atlas ! gC
-        assert (bmpWidth (glyphBitmap glyphC) == 0) "glyph C bitmap should be empty in subset"
+        let glyphC = atlas.glyphs ! gC
+        assert (glyphC.bitmap.width == 0) "glyph C bitmap should be empty in subset"
 
 
 testKerningSorted :: MSDFAtlas -> IO ()
 testKerningSorted atlas = do
-  let ks = elems (msdfKerning atlas)
+  let ks = elems (atlas.kerning)
   assert (isSortedBy kernKey ks) "kerning pairs not sorted"
-  assert (all (not . isNaN . kernXAdvance) ks) "kerning contains NaN"
+  assert (all (not . isNaN . (\k -> k.xAdvance)) ks) "kerning contains NaN"
   where
-    kernKey k = (kernLeft k, kernRight k)
+    kernKey k = (k.left, k.right)
 
 
 testMetricsOnly :: TTF -> MSDFConfig -> IO ()
 testMetricsOnly ttf cfg = do
-  let mappings = cmapMappings (ttfCmap ttf)
+  let mappings = ttf.cmap.mappings
       gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
   assert (gA >= 0) "glyph index for A not found"
   let glyph = glyphMetricsOnly cfg ttf gA
-  assert (glyphAdvance glyph /= 0) "advance should be non-zero"
-  assert (bmpWidth (glyphBitmap glyph) == 0) "metrics-only should have empty bitmap"
+  assert (glyph.advance /= 0) "advance should be non-zero"
+  assert (glyph.bitmap.width == 0) "metrics-only should have empty bitmap"
 
 -- Helpers -------------------------------------------------------------------
 
@@ -179,9 +181,9 @@ isSortedBy key (x:xs) = go (key x) xs
 findCompositePointMatchGlyph :: TTF -> Maybe Int
 findCompositePointMatchGlyph ttf = go 0
   where
-    numGlyphs = maxpNumGlyphs (ttfMaxp ttf)
-    glyf = ttfGlyf ttf
-    offsets = locaOffsets (ttfLoca ttf)
+    numGlyphs = ttf.maxp.numGlyphs
+    glyf = ttf.glyf
+    offsets = ttf.loca.offsets
     go i
       | i >= numGlyphs = Nothing
       | otherwise =
