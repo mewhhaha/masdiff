@@ -1,10 +1,24 @@
 # Revision history for masdiff
 
-## 0.1.1.0 -- 2026-01-30
+## Unreleased
+
+* Added GPOS mark-to-base/mark-to-mark parsing and exposed anchors in `MSDFAtlas`.
+* Applied gvar component deltas for composite glyph offsets and phantom points.
+* Added an edge spatial index for faster MSDF distance queries.
+* Added render guide and versioning policy docs.
+* Added per-glyph outline caching APIs for repeated renders.
+* Added `msdf-bench` for basic generation/packing timing.
+
+## 0.2.0.0 -- 2026-01-30
 
 * Hardened variable font parsing (gvar tuple bounds + zero-delta handling).
 * Deterministic cmap mapping (dedupe by codepoint, smallest glyph index).
+* Added atlas packing with glyph placements and UVs.
+* Added MSDF error correction pass and edge-color conflict mitigation.
 * Added API overview docs and expanded regression tests (parallelism + gvar safety).
+* Added vertical metrics (vhea/vmtx) and VVAR/MVAR vhea deltas.
+* Fixed glyf flag-repeat parsing for zero-count repeats.
+* Added MSDF.Render helpers for quad/UV and pixel range.
 
 ## 0.1.0.0 -- 2026-01-30
 

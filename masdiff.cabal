@@ -1,6 +1,6 @@
 cabal-version:      3.14
 name:               masdiff
-version:            0.1.1.0
+version:            0.2.0.0
 synopsis:           Pure Haskell MSDF generator for TrueType fonts
 description:
     Pure Haskell MSDF generator that parses TrueType fonts (glyf/loca/cmap)
@@ -8,7 +8,7 @@ description:
     Variable font axes can be selected via MSDFConfig.variations.
     .
     Limitations: TrueType outlines only (no CFF), partial GPOS support (pair
-    adjustments), and no VVAR or most MVAR tags.
+    adjustments + mark attachments), and most MVAR tags.
 license:            MIT
 license-file:       LICENSE
 author:             mewhhaha
@@ -20,6 +20,9 @@ extra-doc-files:    CHANGELOG.md
                   , README.md
                   , docs/spec_gaps.md
                   , docs/api.md
+                  , docs/render_guide.md
+                  , docs/reference_renderer.md
+                  , docs/versioning.md
 extra-source-files:
     assets/Inter/README.txt
   , assets/Inter/OFL.txt
@@ -44,6 +47,7 @@ library
                     , MSDF.TTF.Variations
                     , MSDF.Outline
                     , MSDF.MSDF
+                    , MSDF.Render
                     , MSDF.Generated
     -- other-modules:
     -- other-extensions:
@@ -63,6 +67,20 @@ test-suite msdf-tests
     autogen-modules:  Paths_masdiff
     build-depends:    base ^>=4.21.0.0
                     , array ^>=0.5.8.0
+                    , masdiff
+    default-language: GHC2024
+    default-extensions: DuplicateRecordFields
+                        , NoFieldSelectors
+                        , OverloadedRecordDot
+
+executable msdf-bench
+    import:           warnings
+    hs-source-dirs:   bench
+    main-is:          MSDFBench.hs
+    other-modules:    Paths_masdiff
+    autogen-modules:  Paths_masdiff
+    build-depends:    base ^>=4.21.0.0
+                    , deepseq ^>=1.5.0.0
                     , masdiff
     default-language: GHC2024
     default-extensions: DuplicateRecordFields

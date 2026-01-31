@@ -1,6 +1,9 @@
 module MSDF.Types
   ( MSDFAtlas(..)
   , GlyphMSDF(..)
+  , GlyphPlacement(..)
+  , VerticalMetrics(..)
+  , AtlasImage(..)
   , MSDFBitmap(..)
   , BBox(..)
   , BBoxUnion(..)
@@ -8,6 +11,11 @@ module MSDF.Types
   , bboxUnionMaybe
   , CodepointMapEntry(..)
   , KerningPair(..)
+  , Anchor(..)
+  , MarkGlyph(..)
+  , BaseGlyph(..)
+  , MarkToBase(..)
+  , MarkToMark(..)
   , lookupCodepoint
   , lookupKerning
   ) where
@@ -26,12 +34,19 @@ data MSDFAtlas = MSDFAtlas
   , ascent :: Int
   , descent :: Int
   , lineGap :: Int
+  , vAscent :: Maybe Int
+  , vDescent :: Maybe Int
+  , vLineGap :: Maybe Int
   , pixelSize :: Int
   , range :: Int
   , scale :: Double
+  , atlasPadding :: Int
+  , atlas :: Maybe AtlasImage
   , glyphs :: Array GlyphIndex GlyphMSDF
   , codepointIndex :: Array Int CodepointMapEntry
   , kerning :: Array Int KerningPair
+  , markToBase :: [MarkToBase]
+  , markToMark :: [MarkToMark]
   }
 
 -- | Map from Unicode codepoint to glyph index.
@@ -47,6 +62,35 @@ data KerningPair = KerningPair
   , xAdvance :: Double
   } deriving (Eq, Show)
 
+-- | Anchor position in pixels.
+data Anchor = Anchor
+  { x :: Double
+  , y :: Double
+  } deriving (Eq, Show)
+
+-- | Mark glyph anchor and class.
+data MarkGlyph = MarkGlyph
+  { markClass :: Int
+  , anchor :: Anchor
+  } deriving (Eq, Show)
+
+-- | Base glyph anchors per mark class.
+data BaseGlyph = BaseGlyph
+  { anchors :: Array Int (Maybe Anchor)
+  } deriving (Eq, Show)
+
+data MarkToBase = MarkToBase
+  { classCount :: Int
+  , marks :: Array Int (Maybe MarkGlyph)
+  , bases :: Array Int (Maybe BaseGlyph)
+  } deriving (Eq, Show)
+
+data MarkToMark = MarkToMark
+  { classCount :: Int
+  , marks1 :: Array Int (Maybe MarkGlyph)
+  , marks2 :: Array Int (Maybe BaseGlyph)
+  } deriving (Eq, Show)
+
 -- | Per-glyph MSDF data.
 data GlyphMSDF = GlyphMSDF
   { index :: GlyphIndex
@@ -56,6 +100,33 @@ data GlyphMSDF = GlyphMSDF
   , bearingY :: Double
   , bbox :: BBox
   , bitmap :: MSDFBitmap
+  , vertical :: Maybe VerticalMetrics
+  , placement :: Maybe GlyphPlacement
+  } deriving (Eq, Show)
+
+-- | Optional vertical metrics for vertical writing.
+data VerticalMetrics = VerticalMetrics
+  { advance :: Double
+  , topSideBearing :: Double
+  } deriving (Eq, Show)
+
+-- | Glyph placement inside an atlas (pixel and UV space).
+data GlyphPlacement = GlyphPlacement
+  { x :: Int
+  , y :: Int
+  , width :: Int
+  , height :: Int
+  , u0 :: Double
+  , v0 :: Double
+  , u1 :: Double
+  , v1 :: Double
+  } deriving (Eq, Show)
+
+-- | Packed atlas image (RGB).
+data AtlasImage = AtlasImage
+  { width :: Int
+  , height :: Int
+  , pixels :: UArray Int Word8
   } deriving (Eq, Show)
 
 -- | Glyph bounding box in pixels.
@@ -112,16 +183,42 @@ instance NFData CodepointMapEntry where
 instance NFData KerningPair where
   rnf (KerningPair a b c) = a `seq` b `seq` c `seq` ()
 
+instance NFData Anchor where
+  rnf (Anchor a b) = a `seq` b `seq` ()
+
+instance NFData MarkGlyph where
+  rnf (MarkGlyph a b) = a `seq` b `seq` ()
+
+instance NFData BaseGlyph where
+  rnf (BaseGlyph a) = rnf a
+
+instance NFData MarkToBase where
+  rnf (MarkToBase c m b) = c `seq` rnf m `seq` rnf b `seq` ()
+
+instance NFData MarkToMark where
+  rnf (MarkToMark c m1 m2) = c `seq` rnf m1 `seq` rnf m2 `seq` ()
+
 instance NFData MSDFBitmap where
   rnf (MSDFBitmap w h ox oy px) = w `seq` h `seq` ox `seq` oy `seq` px `seq` ()
 
 instance NFData GlyphMSDF where
-  rnf (GlyphMSDF i cps adv bx by bb bm) =
-    i `seq` cps `seq` adv `seq` bx `seq` by `seq` bb `seq` bm `seq` ()
+  rnf (GlyphMSDF i cps adv bx by bb bm vm pl) =
+    i `seq` cps `seq` adv `seq` bx `seq` by `seq` bb `seq` bm `seq` vm `seq` pl `seq` ()
+
+instance NFData VerticalMetrics where
+  rnf (VerticalMetrics a b) = a `seq` b `seq` ()
 
 instance NFData MSDFAtlas where
-  rnf (MSDFAtlas n u a d l p r s g c k) =
-    n `seq` u `seq` a `seq` d `seq` l `seq` p `seq` r `seq` s `seq` g `seq` c `seq` k `seq` ()
+  rnf (MSDFAtlas n u a d l va vd vg p r s pad at g c k mb mm) =
+    n `seq` u `seq` a `seq` d `seq` l `seq` va `seq` vd `seq` vg `seq` p `seq` r `seq` s `seq`
+    pad `seq` at `seq` g `seq` c `seq` k `seq` mb `seq` mm `seq` ()
+
+instance NFData GlyphPlacement where
+  rnf (GlyphPlacement a b c d e f g h) =
+    a `seq` b `seq` c `seq` d `seq` e `seq` f `seq` g `seq` h `seq` ()
+
+instance NFData AtlasImage where
+  rnf (AtlasImage w h px) = w `seq` h `seq` px `seq` ()
 
 lookupCodepoint :: MSDFAtlas -> Int -> Maybe Int
 lookupCodepoint atlas cp =

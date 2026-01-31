@@ -2,8 +2,10 @@ module MSDF.TTF.Parser
   ( TTF(..)
   , Head(..)
   , Hhea(..)
+  , Vhea(..)
   , Maxp(..)
   , Hmtx(..)
+  , Vmtx(..)
   , Loca(..)
   , Cmap(..)
   , NameTable(..)
@@ -19,10 +21,11 @@ module MSDF.TTF.Parser
   , glyphBBoxRaw
   , glyphBBoxRawAt
   , compositeMetricsGlyph
+  , compositeComponentCount
   ) where
 
 import Control.Exception (SomeException, try)
-import Data.Array (Array, array, bounds, (!))
+import Data.Array (Array, array, bounds, inRange, (!))
 import Data.Bits (testBit, shiftL, (.|.), (.&.))
 import Data.Char (chr)
 import Data.Int (Int16)
@@ -30,7 +33,7 @@ import Data.List (sortOn)
 import Data.Word (Word8, Word16, Word32)
 import MSDF.Binary
 import MSDF.Outline (Point(..))
-import MSDF.TTF.GPOS (KerningPairRaw(..), parseGPOS)
+import MSDF.TTF.GPOS (KerningPairRaw(..), GPOSAll(..), GPOSMarksRaw(..), parseGPOSAll)
 import MSDF.TTF.Variations
 
 within :: ByteBuffer -> Int -> Int -> Bool
@@ -41,13 +44,16 @@ within bb off size =
 data TTF = TTF
   { head :: Head
   , hhea :: Hhea
+  , vhea :: Maybe Vhea
   , maxp :: Maxp
   , hmtx :: Hmtx
+  , vmtx :: Maybe Vmtx
   , loca :: Loca
   , glyf :: ByteBuffer
   , cmap :: Cmap
   , kern :: [KerningPairRaw]
   , gpos :: [KerningPairRaw]
+  , gposMarks :: GPOSMarksRaw
   , name :: NameTable
   , variations :: Maybe Variations
   }
@@ -72,6 +78,14 @@ data Hhea = Hhea
   , numberOfHMetrics :: Int
   }
 
+-- | vhea table
+data Vhea = Vhea
+  { ascent :: Int
+  , descent :: Int
+  , lineGap :: Int
+  , numberOfVMetrics :: Int
+  }
+
 -- | maxp table
 
 data Maxp = Maxp
@@ -83,6 +97,12 @@ data Maxp = Maxp
 data Hmtx = Hmtx
   { advances :: Array Int Int
   , lsb :: Array Int Int
+  }
+
+-- | vmtx table
+data Vmtx = Vmtx
+  { advances :: Array Int Int
+  , tsb :: Array Int Int
   }
 
 -- | loca table
@@ -125,6 +145,8 @@ parseTTFUnsafe path = do
       hheaTbl = requireTable "hhea" tables bb
       maxpTbl = requireTable "maxp" tables bb
       hmtxTbl = requireTable "hmtx" tables bb
+      vheaTbl = optionalTable "vhea" tables bb
+      vmtxTbl = optionalTable "vmtx" tables bb
       locaTbl = requireTable "loca" tables bb
       glyfTbl = requireTable "glyf" tables bb
       cmapTbl = requireTable "cmap" tables bb
@@ -135,15 +157,22 @@ parseTTFUnsafe path = do
       avarTbl = optionalTable "avar" tables bb
       gvarTbl = optionalTable "gvar" tables bb
       hvarTbl = optionalTable "HVAR" tables bb
+      vvarTbl = optionalTable "VVAR" tables bb
       mvarTbl = optionalTable "MVAR" tables bb
       headInfo = parseHead headTbl
       hhea = parseHhea hheaTbl
+      vhea = fmap parseVhea vheaTbl
       maxp = parseMaxp maxpTbl
       hmtx = parseHmtx hmtxTbl hhea.numberOfHMetrics maxp.numGlyphs
+      vmtx = case (vhea, vmtxTbl) of
+               (Just vhea', Just vmtxTable) -> Just (parseVmtx vmtxTable vhea'.numberOfVMetrics maxp.numGlyphs)
+               _ -> Nothing
       loca = parseLoca locaTbl headInfo.indexToLocFormat maxp.numGlyphs
       cmap = parseCmap cmapTbl
       kern = maybe [] parseKern kernTbl
-      gpos = maybe [] (parseGPOS maxp.numGlyphs) gposTbl
+      gposAll = maybe (GPOSAll [] (GPOSMarksRaw [] [])) (parseGPOSAll maxp.numGlyphs) gposTbl
+      gpos = gposAll.kernPairs
+      gposMarks = gposAll.marks
       name = maybe (NameTable "" "") parseName nameTbl
       variations =
         case fvarTbl of
@@ -153,18 +182,22 @@ parseTTFUnsafe path = do
                 avar = fmap parseAvar avarTbl
                 gvar = fmap (parseGvar maxp.numGlyphs) gvarTbl
                 hvar = hvarTbl >>= parseHvar
+                vvar = vvarTbl >>= parseVvar
                 mvar = mvarTbl >>= parseMvar
-            in Just (Variations fvar avar gvar hvar mvar)
+            in Just (Variations fvar avar gvar hvar vvar mvar)
   pure TTF
     { head = headInfo
     , hhea = hhea
+    , vhea = vhea
     , maxp = maxp
     , hmtx = hmtx
+    , vmtx = vmtx
     , loca = loca
     , glyf = glyfTbl
     , cmap = cmap
     , kern = kern
     , gpos = gpos
+    , gposMarks = gposMarks
     , name = name
     , variations = variations
     }
@@ -216,6 +249,14 @@ parseHhea bb =
       numberOfHMetrics = fromIntegral (readU16BE bb 34)
   in Hhea ascent descent lineGap numberOfHMetrics
 
+parseVhea :: ByteBuffer -> Vhea
+parseVhea bb =
+  let ascent = fromIntegral (readS16BE bb 4)
+      descent = fromIntegral (readS16BE bb 6)
+      lineGap = fromIntegral (readS16BE bb 8)
+      numberOfVMetrics = fromIntegral (readU16BE bb 34)
+  in Vhea ascent descent lineGap numberOfVMetrics
+
 -- maxp ---------------------------------------------------------------------
 
 parseMaxp :: ByteBuffer -> Maxp
@@ -227,25 +268,38 @@ parseMaxp bb =
 
 parseHmtx :: ByteBuffer -> Int -> Int -> Hmtx
 parseHmtx bb numberOfHMetrics numGlyphs =
-  let metricsCount0 = min numberOfHMetrics numGlyphs
-      maxMetrics = min metricsCount0 (bb.len `div` 4)
-      metrics = [ (fromIntegral (readU16BE bb (i * 4)), fromIntegral (readS16BE bb (i * 4 + 2)))
-                | i <- [0 .. maxMetrics - 1] ]
-      advances = map fst metrics
-      lsbs = map snd metrics
-      lastAdvance = if null advances then 0 else last advances
-      remaining = max 0 (numGlyphs - maxMetrics)
-      extraOff = maxMetrics * 4
-      maxExtra = if extraOff >= bb.len then 0 else min remaining ((bb.len - extraOff) `div` 2)
-      extraLsbs = [ fromIntegral (readS16BE bb (extraOff + i * 2))
-                  | i <- [0 .. maxExtra - 1] ]
-      extraLsbsAll = extraLsbs ++ replicate (remaining - maxExtra) 0
-      advancesAll = advances ++ replicate remaining lastAdvance
-      lsbAll = lsbs ++ extraLsbsAll
+  let (advancesAll, lsbAll) = parseMetrics bb numberOfHMetrics numGlyphs
   in Hmtx
      { advances = array (0, numGlyphs - 1) (zip [0..] advancesAll)
      , lsb = array (0, numGlyphs - 1) (zip [0..] lsbAll)
      }
+
+parseVmtx :: ByteBuffer -> Int -> Int -> Vmtx
+parseVmtx bb numberOfVMetrics numGlyphs =
+  let (advancesAll, tsbAll) = parseMetrics bb numberOfVMetrics numGlyphs
+  in Vmtx
+     { advances = array (0, numGlyphs - 1) (zip [0..] advancesAll)
+     , tsb = array (0, numGlyphs - 1) (zip [0..] tsbAll)
+     }
+
+parseMetrics :: ByteBuffer -> Int -> Int -> ([Int], [Int])
+parseMetrics bb numberOfMetrics numGlyphs =
+  let metricsCount0 = min numberOfMetrics numGlyphs
+      maxMetrics = min metricsCount0 (bb.len `div` 4)
+      metrics = [ (fromIntegral (readU16BE bb (i * 4)), fromIntegral (readS16BE bb (i * 4 + 2)))
+                | i <- [0 .. maxMetrics - 1] ]
+      advances = map fst metrics
+      sideBearings = map snd metrics
+      lastAdvance = if null advances then 0 else last advances
+      remaining = max 0 (numGlyphs - maxMetrics)
+      extraOff = maxMetrics * 4
+      maxExtra = if extraOff >= bb.len then 0 else min remaining ((bb.len - extraOff) `div` 2)
+      extraSideBearings = [ fromIntegral (readS16BE bb (extraOff + i * 2))
+                          | i <- [0 .. maxExtra - 1] ]
+      extraAll = extraSideBearings ++ replicate (remaining - maxExtra) 0
+      advancesAll = advances ++ replicate remaining lastAdvance
+      sideBearingsAll = sideBearings ++ extraAll
+  in (advancesAll, sideBearingsAll)
 
 -- loca ---------------------------------------------------------------------
 
@@ -510,13 +564,24 @@ glyphContoursAtVar loc ttf glyphIndex depth =
        in if end <= start || end > glyf.len
          then ([], (0,0,0,0))
          else
-           let baseContours = parseGlyphContours loc glyf start (end - start) depth ttf glyphIndex
-           in case (loc, ttf.variations) of
-                (Just loc', Just vars) ->
-                  case vars.gvar of
-                    Just gv -> applyGvarToContours gv loc' glyphIndex baseContours
-                    Nothing -> (baseContours, (0,0,0,0))
-                _ -> (baseContours, (0,0,0,0))
+           let bb = slice glyf start (end - start)
+               numContours = if bb.len < 2 then 0 else fromIntegral (readS16BE bb 0) :: Int
+               gvarMaybe = case ttf.variations of
+                             Just vars -> vars.gvar
+                             Nothing -> Nothing
+           in if bb.len < 2
+              then ([], (0,0,0,0))
+              else if numContours >= 0
+                   then
+                     let baseContours = parseSimpleGlyph bb numContours
+                     in case (loc, gvarMaybe) of
+                          (Just loc', Just gv) -> applyGvarToContours gv loc' glyphIndex baseContours
+                          _ -> (baseContours, (0,0,0,0))
+                   else if depth > 16
+                        then ([], (0,0,0,0))
+                        else
+                          let baseContours = parseCompositeGlyph loc gvarMaybe bb depth ttf glyphIndex
+                          in (baseContours, (0,0,0,0))
 
 -- | Raw bounding box for a glyph (font units).
 glyphBBoxRaw :: TTF -> Int -> (Int, Int, Int, Int)
@@ -550,19 +615,6 @@ glyphBBoxRawAt loc ttf glyphIndex =
               Just _ ->
                 let (contours, _) = glyphContoursAtVar loc ttf glyphIndex 0
                 in bboxFromContours contours
-
-parseGlyphContours :: Maybe VariationLocation -> ByteBuffer -> Int -> Int -> Int -> TTF -> Int -> [[Point]]
-parseGlyphContours loc glyf off len depth ttf glyphIndex =
-  let bb = slice glyf off len
-  in if bb.len < 2
-     then []
-     else
-       let numContours = fromIntegral (readS16BE bb 0) :: Int
-       in if numContours >= 0
-          then parseSimpleGlyph bb numContours
-          else if depth > 16
-               then []
-               else parseCompositeGlyph loc bb depth ttf glyphIndex
 
 parseSimpleGlyph :: ByteBuffer -> Int -> [[Point]]
 parseSimpleGlyph bb numContours =
@@ -608,12 +660,13 @@ readFlags bb off count = reverse (go off count [])
       then acc
       else
         let flag = readU8 bb idx
-            repeatCount = if testBit flag 3 && within bb (idx + 1) 1
+            hasRepeat = testBit flag 3 && within bb (idx + 1) 1
+            repeatCount = if hasRepeat
                           then fromIntegral (readU8 bb (idx + 1))
                           else 0
             toTake = min n (repeatCount + 1)
             acc' = replicate toTake flag ++ acc
-            idx' = idx + 1 + if repeatCount > 0 then 1 else 0
+            idx' = idx + 1 + if hasRepeat then 1 else 0
         in go idx' (n - toTake) acc'
 
 readCoords :: ByteBuffer -> Int -> [Word8] -> Bool -> ([Int], Int)
@@ -651,44 +704,87 @@ splitContours points endPts =
       let (a, b) = splitAt n pts
       in a : go b (map (subtract n) ns)
 
-parseCompositeGlyph :: Maybe VariationLocation -> ByteBuffer -> Int -> TTF -> Int -> [[Point]]
-parseCompositeGlyph loc bb depth ttf _glyphIndex =
-  let flagsOff = 10
-  in go flagsOff []
+data CompositeComponent = CompositeComponent
+  { compFlags :: Word16
+  , compGlyph :: Int
+  , arg1 :: Int
+  , arg2 :: Int
+  , compTransform :: (Double, Double, Double, Double)
+  }
+
+parseCompositeGlyph :: Maybe VariationLocation -> Maybe Gvar -> ByteBuffer -> Int -> TTF -> Int -> [[Point]]
+parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
+  let components = readCompositeComponents bb
+      compCount = length components
+      deltas = case (loc, gvar) of
+        (Just loc', Just gv) | compCount > 0 -> Just (componentDeltas gv loc' glyphIndex compCount)
+        _ -> Nothing
+  in if depth > 16
+     then []
+     else buildContours components deltas
+  where
+    buildContours comps deltas =
+      let go _ acc [] = acc
+          go idx acc (c:cs) =
+            let (contours, _) = glyphContoursAtVar loc ttf c.compGlyph (depth + 1)
+                transformedNoTrans = map (map (applyTransform c.compTransform 0 0)) contours
+                argsAreXY = testBit c.compFlags 1
+                (dx0, dy0) =
+                  if argsAreXY
+                  then
+                    let (deltaX, deltaY) = componentDeltaAt deltas idx
+                        rawDx = fromIntegral c.arg1 + deltaX
+                        rawDy = fromIntegral c.arg2 + deltaY
+                    in applyComponentOffset c.compFlags c.compTransform (rawDx, rawDy)
+                  else pointMatchOffset acc transformedNoTrans c.arg1 c.arg2
+                (dx1, dy1) =
+                  if testBit c.compFlags 2
+                  then (fromIntegral (round dx0 :: Int), fromIntegral (round dy0 :: Int))
+                  else (dx0, dy0)
+                transformed = map (map (applyTransform c.compTransform dx1 dy1)) contours
+                acc' = acc ++ transformed
+            in go (idx + 1) acc' cs
+      in go 0 [] comps
+
+    componentDeltaAt Nothing _ = (0, 0)
+    componentDeltaAt (Just (dxs, dys, _phantom)) i =
+      let dx = if inRange (bounds dxs) i then dxs ! i else 0
+          dy = if inRange (bounds dys) i then dys ! i else 0
+      in (dx, dy)
+
+readCompositeComponents :: ByteBuffer -> [CompositeComponent]
+readCompositeComponents bb = go 10 []
   where
     go off acc =
       if not (within bb off 4)
-      then acc
+      then reverse acc
       else
         let flags = readU16BE bb off
             glyphIndex = fromIntegral (readU16BE bb (off + 2))
             argsAreWords = testBit flags 0
             argsLen = if argsAreWords then 4 else 2
         in if not (within bb (off + 4) argsLen)
-           then acc
+           then reverse acc
            else
-             let (arg1, arg2, offArgs) =
+             let (arg1', arg2', offArgs) =
                    if argsAreWords
                    then (fromIntegral (readS16BE bb (off + 4)), fromIntegral (readS16BE bb (off + 6)), off + 8)
                    else (fromIntegral (readU8 bb (off + 4)), fromIntegral (readU8 bb (off + 5)), off + 6)
                  transLen = transformSize flags
              in if not (within bb offArgs transLen)
-                then acc
+                then reverse acc
                 else
                   let (transform, offTrans) = readTransform bb offArgs flags
-                      (contours, _) = glyphContoursAtVar loc ttf glyphIndex (depth + 1)
-                      transformedNoTrans = map (map (applyTransform transform 0 0)) contours
-                      (dx, dy) = if testBit flags 1
-                                 then applyComponentOffset flags transform (fromIntegral arg1, fromIntegral arg2)
-                                 else pointMatchOffset acc transformedNoTrans arg1 arg2
-                      (dx', dy') = if testBit flags 2
-                                   then (fromIntegral (round dx :: Int), fromIntegral (round dy :: Int))
-                                   else (dx, dy)
-                      transformed = map (map (applyTransform transform dx' dy')) contours
-                      acc' = acc ++ transformed
+                      comp = CompositeComponent
+                        { compFlags = flags
+                        , compGlyph = glyphIndex
+                        , arg1 = arg1'
+                        , arg2 = arg2'
+                        , compTransform = transform
+                        }
                   in if testBit flags 5 && offTrans <= bb.len
-                     then go offTrans acc'
-                     else acc'
+                     then go offTrans (comp : acc)
+                     else reverse (comp : acc)
 
 readTransform :: ByteBuffer -> Int -> Word16 -> ((Double, Double, Double, Double), Int)
 readTransform bb off flags
@@ -769,6 +865,30 @@ compositeMetricsGlyph ttf glyphIndex =
                  in if numContours >= 0
                     then Nothing
                     else compositeUseMyMetrics bb
+
+compositeComponentCount :: TTF -> Int -> Int
+compositeComponentCount ttf glyphIndex =
+  let numGlyphs = ttf.maxp.numGlyphs
+      glyf = ttf.glyf
+      offsets = ttf.loca.offsets
+      (offLo, offHi) = bounds offsets
+  in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
+        || glyphIndex < offLo || glyphIndex + 1 > offHi
+     then 0
+     else
+       let start = offsets ! glyphIndex
+           end = offsets ! (glyphIndex + 1)
+       in if end <= start || end > glyf.len
+          then 0
+          else
+            let bb = slice glyf start (end - start)
+            in if bb.len < 2
+               then 0
+               else
+                 let numContours = fromIntegral (readS16BE bb 0) :: Int
+                 in if numContours >= 0
+                    then 0
+                    else length (readCompositeComponents bb)
 
 compositeUseMyMetrics :: ByteBuffer -> Maybe Int
 compositeUseMyMetrics bb = go 10

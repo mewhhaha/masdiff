@@ -8,7 +8,9 @@ Pure Haskell MSDF generator for TrueType fonts. It parses `glyf/loca/cmap` outli
 - TrueType outline parsing (simple + composite glyphs).
 - MSDF raster generation per glyph (packed RGB bytes).
 - Kerning support via `kern` and GPOS pair adjustment (lookup type 2).
-- Variable font support (fvar/avar/gvar + HVAR/MVAR for horizontal metrics).
+- Vertical metrics via `vhea/vmtx` when present.
+- Variable font support (fvar/avar/gvar + HVAR/VVAR/MVAR for metrics).
+- Optional atlas packing with per-glyph UV placement.
 
 ## Usage
 
@@ -44,11 +46,22 @@ main = do
         , MSDF.glyphSet = GlyphSetCodepoints [65,66,67]
         , MSDF.parallelism = 64 -- optional: chunk size for parallel rendering
         , MSDF.variations = [("wght", 700)] -- optional: variable font axes
+        , MSDF.packAtlas = True
+        , MSDF.atlasPadding = 1
         }
   result <- generateMSDFWithConfig cfg "path/to/font.ttf"
   case result of
     Left err -> putStrLn (err.context ++ ": " ++ err.message)
     Right atlas -> print (length (atlas.glyphs))
+```
+
+Variable font example (Inter Variable, weight 400 vs 700):
+
+```haskell
+let cfgRegular = defaultMSDFConfig { MSDF.variations = [("wght", 400)] }
+let cfgBold = defaultMSDFConfig { MSDF.variations = [("wght", 700)] }
+atlasRegular <- generateMSDFWithConfig cfgRegular "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
+atlasBold <- generateMSDFWithConfig cfgBold "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
 ```
 
 ## Tests
@@ -61,20 +74,29 @@ cabal test msdf-tests
 
 See `docs/api.md` for a concise overview of the public modules, data ordering
 invariants, and determinism guarantees.
+See `docs/render_guide.md` for a concrete MSDF rendering reference (GLSL/WGSL).
+See `docs/reference_renderer.md` for a minimal rendering sample.
+See `docs/versioning.md` for versioning and changelog policy.
 
 ## Pseudocode: rendering MSDF glyphs
 
 This is a high-level sketch of how to use the generated MSDF data to render text.
 It assumes you have a shader that decodes MSDF and outputs alpha.
+Helper utilities are available in `MSDF.Render` (`glyphQuad`, `glyphUV`, `pixelRange`).
+If you render the same glyphs at multiple sizes, use `MSDF.MSDF.prepareGlyphCache`
+and `renderGlyphMSDFCached` to reuse parsed outlines.
 
 ```
 atlas = generateMSDFOrThrow("path/to/font.ttf")
 
--- Build a glyph texture for each glyph (or pack into an atlas).
-for glyph in atlas.glyphs:
-  if glyph.bitmap.width == 0:
-    continue
-  uploadTexture(glyph.index, glyph.bitmap.width, glyph.bitmap.height, glyph.bitmap.pixelsRGB)
+-- Build a glyph texture for each glyph (or use packed atlas).
+if atlas.atlas != None:
+  uploadTexture("atlas", atlas.atlas.width, atlas.atlas.height, atlas.atlas.pixelsRGB)
+else:
+  for glyph in atlas.glyphs:
+    if glyph.bitmap.width == 0:
+      continue
+    uploadTexture(glyph.index, glyph.bitmap.width, glyph.bitmap.height, glyph.bitmap.pixelsRGB)
 
 -- Layout text.
 penX = 0
@@ -96,11 +118,13 @@ for codepoint in text:
   y1 = y0 + glyph.bitmap.height
 
   -- Draw quad textured with the glyph's MSDF bitmap.
-  drawQuad(
-    texture = glyph.index,
-    position = (x0, y0, x1, y1),
+  if glyph.placement != None:
+    uv = (glyph.placement.u0, glyph.placement.v0, glyph.placement.u1, glyph.placement.v1)
+    texture = "atlas"
+  else:
     uv = (0,0,1,1)
-  )
+    texture = glyph.index
+  drawQuad(texture = texture, position = (x0, y0, x1, y1), uv = uv)
 
   -- Advance pen.
   penX += glyph.advance
@@ -174,9 +198,17 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 ## Limitations
 
 - TrueType outlines only (no CFF).
-- Variable fonts support glyf variations and horizontal metrics (HVAR/MVAR).
-  VVAR and most other MVAR tags are not implemented.
-- GPOS support is limited to Pair Adjustment lookups (format 1/2).
+- Variable fonts support glyf variations and metrics via HVAR/VVAR/MVAR.
+  Most other MVAR tags are not implemented.
+- GPOS support includes Pair Adjustment (format 1/2), MarkToBase (type 4), and MarkToMark (type 6).
+  Other lookups (mark-to-ligature, contextual, device/variation anchors) are not implemented.
+- Edge-coloring correction is heuristic and not a full msdfgen parity pass.
+
+## Benchmarks
+
+```
+cabal run msdf-bench -- --pixel-size 32 --glyphs 256
+```
 
 Glyph selection:
 

@@ -5,8 +5,9 @@ This document tracks known gaps vs. the TrueType/OpenType specs.
 ## TrueType tables
 
 - CFF/OTF outlines are not supported (glyf only).
-- Variable fonts (glyf) are supported via fvar/avar/gvar, plus HVAR/MVAR for horizontal metrics
-  (advance/LSB/RSB and hhea ascent/descent/lineGap). Other MVAR tags and VVAR are not implemented.
+- Variable fonts (glyf) are supported via fvar/avar/gvar, plus HVAR/VVAR/MVAR for metrics
+  (advance/LSB/RSB, advanceHeight/TSB/BSB, and hhea/vhea ascent/descent/lineGap). Other MVAR tags
+  are not implemented.
 - Hinting instructions are ignored.
 
 ## Composite glyphs
@@ -16,10 +17,12 @@ This document tracks known gaps vs. the TrueType/OpenType specs.
 
 ## GPOS
 
-- Only Pair Adjustment lookups (type 2) and Extension lookups (type 9) are supported.
+- Pair Adjustment (type 2) plus MarkToBase (type 4) and MarkToMark (type 6) are supported
+  (including Extension lookups type 9). Mark-to-ligature and contextual lookups are not.
 - ValueRecord fields other than xAdvance are ignored.
+- Anchor device/variation tables are ignored (static x/y only).
 
 ## MSDF
 
-- Output is per-glyph; no atlas packing.
-- No edge-coloring correction/median fix beyond per-channel distances.
+- Atlas packing is implemented with a skyline packer; no optimal packing or rotation.
+- Edge-coloring correction is heuristic; no full msdfgen conflict/repair pipeline.

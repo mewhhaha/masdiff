@@ -12,12 +12,22 @@ import System.Exit (exitFailure)
 import System.IO (hFlush, hPutStrLn, stdout, stderr)
 
 import MSDF.Generated (generateMSDFWithConfig)
-import MSDF.MSDF (MSDFConfig(..), defaultMSDFConfig, renderGlyphMSDF, glyphMetricsOnly, GlyphSet(..))
+import MSDF.MSDF
+  ( MSDFConfig(..)
+  , defaultMSDFConfig
+  , renderGlyphMSDF
+  , renderGlyphMSDFCached
+  , prepareGlyphCache
+  , glyphMetricsOnly
+  , GlyphSet(..)
+  )
 import qualified MSDF.MSDF as MSDF
+import MSDF.Render (glyphQuad, glyphUV)
 import MSDF.Binary (ByteBuffer, readS16BE, readU16BE, slice)
 import MSDF.Outline (Point(..))
+import MSDF.TTF.GPOS (GPOSMarksRaw(..), MarkToBaseRaw(..), MarkToMarkRaw(..), MarkGlyphRaw(..), BaseGlyphRaw(..))
 import MSDF.TTF.Parser
-import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), applyGvarToContours, hvarDeltas, mvarHheaDeltas)
+import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), applyGvarToContours, hvarDeltas, vvarDeltas, mvarHheaDeltas, mvarVheaDeltas)
 import MSDF.Types
 import Paths_masdiff (getDataFileName)
 
@@ -41,12 +51,17 @@ main = do
     , runTest "render glyph MSDF" (testRenderGlyph ttf cfgSmall)
     , runTest "variable font axes" (testVariableFont ttf)
     , runTest "gvar default safe" (testGvarDefaultSafe ttf)
+    , runTest "gpos marks" (testGposMarks ttf)
     , runTest "subset atlas" (testGenerateSubset subsetAtlas)
+    , runTest "atlas packing" (testAtlasPacking subsetAtlas)
+    , runTest "render helpers" (testRenderHelpers subsetAtlas)
     , runTest "kerning sorted" (testKerningSorted subsetAtlas)
     , runTest "codepoint index sorted" (testCodepointIndexSorted subsetAtlas)
     , runTest "lookup codepoint" (testLookupCodepoint subsetAtlas ttf)
     , runTest "parallelism deterministic" (testParallelismDeterministic ttf subsetAtlas parallelAtlas)
+    , runTest "glyph cache" (testGlyphCache ttf cfgSmall)
     , runTest "metrics only" (testMetricsOnly ttf cfgSmall)
+    , runTest "vertical metrics" (testVerticalMetrics ttf cfgSmall)
     , runTest "composite point match" (testCompositePointMatch ttf)
     ]
   if and results
@@ -123,6 +138,52 @@ testCompositePointMatch ttf = do
       let contours = glyphOutline ttf g
       assert (not (null contours)) "point-match composite has no contours"
 
+testGposMarks :: TTF -> IO ()
+testGposMarks ttf = do
+  let numGlyphs = ttf.maxp.numGlyphs
+      marks = ttf.gposMarks
+      GPOSMarksRaw markToBase' markToMark' = marks
+  mapM_ (checkMarkToBase numGlyphs) markToBase'
+  mapM_ (checkMarkToMark numGlyphs) markToMark'
+
+checkMarkToBase :: Int -> MarkToBaseRaw -> IO ()
+checkMarkToBase numGlyphs (MarkToBaseRaw classCount marks bases) = do
+  assertArrayBounds numGlyphs marks "markToBase marks bounds"
+  assertArrayBounds numGlyphs bases "markToBase bases bounds"
+  mapM_ (checkMarkClass classCount) (elems marks)
+  mapM_ (checkBaseAnchors classCount) (elems bases)
+
+checkMarkToMark :: Int -> MarkToMarkRaw -> IO ()
+checkMarkToMark numGlyphs (MarkToMarkRaw classCount marks1 marks2) = do
+  assertArrayBounds numGlyphs marks1 "markToMark marks1 bounds"
+  assertArrayBounds numGlyphs marks2 "markToMark marks2 bounds"
+  mapM_ (checkMarkClass classCount) (elems marks1)
+  mapM_ (checkBaseAnchors classCount) (elems marks2)
+
+checkMarkClass :: Int -> Maybe MarkGlyphRaw -> IO ()
+checkMarkClass classCount entry =
+  case entry of
+    Nothing -> pure ()
+    Just (MarkGlyphRaw cls _) ->
+      assert (cls >= 0 && cls < classCount) "mark class out of range"
+
+checkBaseAnchors :: Int -> Maybe BaseGlyphRaw -> IO ()
+checkBaseAnchors classCount entry =
+  case entry of
+    Nothing -> pure ()
+    Just (BaseGlyphRaw anchors) ->
+      let (lo, hi) = bounds anchors
+      in if classCount <= 0
+         then assert (lo > hi) "base anchors should be empty"
+         else assert (lo == 0 && hi == classCount - 1) "base anchors bounds mismatch"
+
+assertArrayBounds :: Int -> Array Int a -> String -> IO ()
+assertArrayBounds numGlyphs arr msg =
+  let (lo, hi) = bounds arr
+  in if numGlyphs <= 0
+     then assert (lo > hi) (msg ++ ": expected empty array")
+     else assert (lo == 0 && hi == numGlyphs - 1) (msg ++ ": bounds mismatch")
+
 
 testRenderGlyph :: TTF -> MSDFConfig -> IO ()
 testRenderGlyph ttf cfg = do
@@ -182,11 +243,18 @@ testVariableFont ttf = do
         Just hv -> do
           let (advDelta, lsbDelta, rsbDelta) = hvarDeltas hv loc gA
           assert (all isFinite [advDelta, lsbDelta, rsbDelta]) "HVAR deltas must be finite"
+      case vars.vvar of
+        Nothing -> pure ()
+        Just vv -> do
+          let (advDelta, tsbDelta, bsbDelta) = vvarDeltas vv loc gA
+          assert (all isFinite [advDelta, tsbDelta, bsbDelta]) "VVAR deltas must be finite"
       case vars.mvar of
         Nothing -> pure ()
         Just mv -> do
           let (dAsc, dDesc, dGap) = mvarHheaDeltas mv loc
           assert (all isFinite [dAsc, dDesc, dGap]) "MVAR deltas must be finite"
+          let (vAsc, vDesc, vGap) = mvarVheaDeltas mv loc
+          assert (all isFinite [vAsc, vDesc, vGap]) "MVAR vhea deltas must be finite"
       let maxGlyph = min (ttf.maxp.numGlyphs - 1) 200
       varies <- anyM (glyphVaries ttf loc) [0 .. maxGlyph]
       assert varies "variable font should alter at least one glyph outline"
@@ -249,6 +317,56 @@ testGenerateSubset atlas = do
         let glyphC = atlas.glyphs ! gC
         assert (glyphC.bitmap.width == 0) "glyph C bitmap should be empty in subset"
 
+testAtlasPacking :: MSDFAtlas -> IO ()
+testAtlasPacking atlas = do
+  case atlas.atlas of
+    Nothing -> assert False "atlas packing missing"
+    Just img -> do
+      assert (img.width > 0 && img.height > 0) "atlas image dimensions should be positive"
+      let (lo, hi) = bounds img.pixels
+          expected = img.width * img.height * 3
+      assert ((hi - lo + 1) == expected) "atlas pixel buffer size mismatch"
+      case lookupCodepoint atlas 65 of
+        Nothing -> assert False "atlas missing A placement"
+        Just gA -> do
+          let glyphA = atlas.glyphs ! gA
+          case glyphA.placement of
+            Nothing -> assert False "glyph A has no placement"
+            Just plA -> do
+              assert (plA.u0 >= 0 && plA.v0 >= 0 && plA.u1 <= 1 && plA.v1 <= 1) "glyph A UVs out of range"
+      case lookupCodepoint atlas 66 of
+        Nothing -> assert False "atlas missing B placement"
+        Just gB -> do
+          let glyphB = atlas.glyphs ! gB
+          case glyphB.placement of
+            Nothing -> assert False "glyph B has no placement"
+            Just plB -> do
+              assert (plB.u0 >= 0 && plB.v0 >= 0 && plB.u1 <= 1 && plB.v1 <= 1) "glyph B UVs out of range"
+      case (lookupCodepoint atlas 65, lookupCodepoint atlas 66) of
+        (Just gA, Just gB) ->
+          case ((atlas.glyphs ! gA).placement, (atlas.glyphs ! gB).placement) of
+            (Just plA, Just plB) ->
+              assert (not (rectsOverlap plA plB)) "glyph A/B overlap in atlas"
+            _ -> assert False "glyph A/B placement missing"
+        _ -> pure ()
+
+testRenderHelpers :: MSDFAtlas -> IO ()
+testRenderHelpers atlas = do
+  case lookupCodepoint atlas 65 of
+    Nothing -> assert False "atlas missing A for render helper test"
+    Just gA -> do
+      let glyphA = atlas.glyphs ! gA
+          bmp = glyphA.bitmap
+          (x0, y0, x1, y1) = glyphQuad glyphA (0, 0)
+      assert (x1 - x0 == fromIntegral bmp.width) "glyphQuad width mismatch"
+      assert (y1 - y0 == fromIntegral bmp.height) "glyphQuad height mismatch"
+      let (u0, v0, u1, v1) = glyphUV glyphA
+      case glyphA.placement of
+        Nothing -> do
+          assert (u0 == 0 && v0 == 0 && u1 == 1 && v1 == 1) "glyphUV default mismatch"
+        Just pl -> do
+          assert (u0 == pl.u0 && v0 == pl.v0 && u1 == pl.u1 && v1 == pl.v1) "glyphUV placement mismatch"
+
 
 testKerningSorted :: MSDFAtlas -> IO ()
 testKerningSorted atlas = do
@@ -300,6 +418,18 @@ testParallelismDeterministic ttf atlasSeq atlasPar = do
   assertEq "compare A" sigASeq sigAPar "parallelism changed glyph A"
   assertEq "compare B" sigBSeq sigBPar "parallelism changed glyph B"
 
+testGlyphCache :: TTF -> MSDFConfig -> IO ()
+testGlyphCache ttf cfg = do
+  let mappings = ttf.cmap.mappings
+      gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
+  assert (gA >= 0) "glyph index for A not found"
+  let cache = prepareGlyphCache cfg ttf
+      glyphCached = renderGlyphMSDFCached cache cfg ttf gA
+      glyphPlain = renderGlyphMSDF cfg ttf gA
+  sigCached <- glyphSignatureSafe "cache A" glyphCached
+  sigPlain <- glyphSignatureSafe "plain A" glyphPlain
+  assertEq "cache compare A" sigPlain sigCached "glyph cache changed output"
+
 
 testMetricsOnly :: TTF -> MSDFConfig -> IO ()
 testMetricsOnly ttf cfg = do
@@ -309,6 +439,21 @@ testMetricsOnly ttf cfg = do
   let glyph = glyphMetricsOnly cfg ttf gA
   assert (glyph.advance /= 0) "advance should be non-zero"
   assert (glyph.bitmap.width == 0) "metrics-only should have empty bitmap"
+
+testVerticalMetrics :: TTF -> MSDFConfig -> IO ()
+testVerticalMetrics ttf cfg = do
+  let mappings = ttf.cmap.mappings
+      gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
+  assert (gA >= 0) "glyph index for A not found"
+  let glyph = glyphMetricsOnly cfg ttf gA
+  case ttf.vmtx of
+    Nothing -> assert (glyph.vertical == Nothing) "vertical metrics should be absent when vmtx is missing"
+    Just _ ->
+      case glyph.vertical of
+        Nothing -> assert False "vertical metrics missing with vmtx present"
+        Just vm -> do
+          assert (isFinite vm.advance) "vertical advance must be finite"
+          assert (isFinite vm.topSideBearing) "vertical top side bearing must be finite"
 
 -- Helpers -------------------------------------------------------------------
 
@@ -345,6 +490,18 @@ safeIndex label arr idx = do
 tryAny :: IO a -> IO (Either SomeException a)
 tryAny = try
 
+rectsOverlap :: GlyphPlacement -> GlyphPlacement -> Bool
+rectsOverlap a b =
+  let ax0 = a.x
+      ay0 = a.y
+      ax1 = a.x + a.width
+      ay1 = a.y + a.height
+      bx0 = b.x
+      by0 = b.y
+      bx1 = b.x + b.width
+      by1 = b.y + b.height
+  in ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0
+
 assertEq :: (Eq a, Show a) => String -> a -> a -> String -> IO ()
 assertEq label a b msg = do
   result <- tryAny (evaluate (a == b))
@@ -352,24 +509,24 @@ assertEq label a b msg = do
     Left e -> error (label ++ ": " ++ show e)
     Right ok -> assert ok msg
 
-glyphSignatureSafe :: String -> GlyphMSDF -> IO (Double, Double, Double, BBox, Int, Int, Int)
+glyphSignatureSafe :: String -> GlyphMSDF -> IO (Double, Double, Double, BBox, Maybe VerticalMetrics, Int, Int, Int, Maybe GlyphPlacement)
 glyphSignatureSafe label glyph = do
   result <- tryAny (evaluate (forceSignature (glyphSignature glyph)))
   case result of
     Left e -> error (label ++ ": " ++ show e)
     Right sig -> pure sig
 
-forceSignature :: (Double, Double, Double, BBox, Int, Int, Int)
-               -> (Double, Double, Double, BBox, Int, Int, Int)
-forceSignature sig@(adv, bx, by, bb, w, h, sumPx) =
+forceSignature :: (Double, Double, Double, BBox, Maybe VerticalMetrics, Int, Int, Int, Maybe GlyphPlacement)
+               -> (Double, Double, Double, BBox, Maybe VerticalMetrics, Int, Int, Int, Maybe GlyphPlacement)
+forceSignature sig@(adv, bx, by, bb, vm, w, h, sumPx, pl) =
   adv `seq` bx `seq` by `seq` w `seq` h `seq` sumPx `seq`
-  bb.xMin `seq` bb.yMin `seq` bb.xMax `seq` bb.yMax `seq` sig
+  bb.xMin `seq` bb.yMin `seq` bb.xMax `seq` bb.yMax `seq` vm `seq` pl `seq` sig
 
-glyphSignature :: GlyphMSDF -> (Double, Double, Double, BBox, Int, Int, Int)
+glyphSignature :: GlyphMSDF -> (Double, Double, Double, BBox, Maybe VerticalMetrics, Int, Int, Int, Maybe GlyphPlacement)
 glyphSignature glyph =
   let bmp = glyph.bitmap
       pixelsSum = foldl' (\acc w -> acc + fromIntegral w) 0 (UA.elems bmp.pixels)
-  in (glyph.advance, glyph.bearingX, glyph.bearingY, glyph.bbox, bmp.width, bmp.height, pixelsSum)
+  in (glyph.advance, glyph.bearingX, glyph.bearingY, glyph.bbox, glyph.vertical, bmp.width, bmp.height, pixelsSum, glyph.placement)
 
 findCompositePointMatchGlyph :: TTF -> Maybe Int
 findCompositePointMatchGlyph ttf = go 0

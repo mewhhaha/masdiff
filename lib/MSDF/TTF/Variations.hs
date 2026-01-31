@@ -6,6 +6,7 @@ module MSDF.TTF.Variations
   , AxisMap
   , Gvar(..)
   , Hvar(..)
+  , Vvar(..)
   , Mvar(..)
   , VariationIndex(..)
   , Variations(..)
@@ -14,13 +15,17 @@ module MSDF.TTF.Variations
   , parseAvar
   , parseGvar
   , parseHvar
+  , parseVvar
   , parseMvar
   , defaultLocation
   , normalizeLocation
   , applyGvarToContours
+  , componentDeltas
   , hvarDeltas
+  , vvarDeltas
   , mvarDelta
   , mvarHheaDeltas
+  , mvarVheaDeltas
   ) where
 
 import Data.Array (Array, array, accumArray, bounds, inRange, (!))
@@ -72,6 +77,13 @@ data Hvar = Hvar
   , rsbMap :: Maybe DeltaSetIndexMap
   }
 
+data Vvar = Vvar
+  { store :: ItemVariationStore
+  , advanceMap :: DeltaSetIndexMap
+  , tsbMap :: Maybe DeltaSetIndexMap
+  , bsbMap :: Maybe DeltaSetIndexMap
+  }
+
 data Mvar = Mvar
   { store :: ItemVariationStore
   , records :: [(String, VariationIndex)]
@@ -82,6 +94,7 @@ data Variations = Variations
   , avar :: Maybe Avar
   , gvar :: Maybe Gvar
   , hvar :: Maybe Hvar
+  , vvar :: Maybe Vvar
   , mvar :: Maybe Mvar
   }
 
@@ -222,6 +235,25 @@ parseHvar bb =
              rsbMap' = if rsbOff == 0 then Nothing else Just (parseDeltaSetIndexMap (slice bb rsbOff (bb.len - rsbOff)))
          in Just (Hvar store' advMap lsbMap' rsbMap')
 
+parseVvar :: ByteBuffer -> Maybe Vvar
+parseVvar bb =
+  if bb.len < 20
+  then Nothing
+  else
+    let storeOff = fromIntegral (readU32BE bb 4)
+        advOff = fromIntegral (readU32BE bb 8)
+        tsbOff = fromIntegral (readU32BE bb 12)
+        bsbOff = fromIntegral (readU32BE bb 16)
+        valid off = off >= 0 && off <= bb.len
+    in if not (valid storeOff && valid advOff && valid tsbOff && valid bsbOff)
+       then Nothing
+       else
+         let store' = parseItemVariationStore (slice bb storeOff (bb.len - storeOff))
+             advMap = parseDeltaSetIndexMap (slice bb advOff (bb.len - advOff))
+             tsbMap' = if tsbOff == 0 then Nothing else Just (parseDeltaSetIndexMap (slice bb tsbOff (bb.len - tsbOff)))
+             bsbMap' = if bsbOff == 0 then Nothing else Just (parseDeltaSetIndexMap (slice bb bsbOff (bb.len - bsbOff)))
+         in Just (Vvar store' advMap tsbMap' bsbMap')
+
 parseMvar :: ByteBuffer -> Maybe Mvar
 parseMvar bb =
   if bb.len < 12
@@ -318,6 +350,24 @@ applyGvarToContours gvar loc glyphIndex contours =
         else (0, 0, 0, 0)
       contours' = applyDeltas contours dxs dys
   in (contours', (dLeft, dRight, dTop, dBottom))
+
+componentDeltas :: Gvar -> VariationLocation -> Int -> Int -> (Array Int Double, Array Int Double, (Double, Double, Double, Double))
+componentDeltas gvar loc glyphIndex componentCount =
+  let pointCount = max 0 (componentCount + 4)
+      (dxs, dys) = glyphDeltas gvar loc glyphIndex pointCount
+      bounds' = if componentCount <= 0 then (0, -1) else (0, componentCount - 1)
+      indices = if componentCount <= 0 then [] else [0 .. componentCount - 1]
+      dxs' = array bounds' [ (i, arrAt dxs i) | i <- indices ]
+      dys' = array bounds' [ (i, arrAt dys i) | i <- indices ]
+      phantom =
+        if pointCount >= 4
+        then (arrAt dxs (pointCount - 4), arrAt dxs (pointCount - 3), arrAt dys (pointCount - 2), arrAt dys (pointCount - 1))
+        else (0, 0, 0, 0)
+  in (dxs', dys', phantom)
+  where
+    arrAt arr i =
+      let (lo, hi) = bounds arr
+      in if i < lo || i > hi then 0 else arr ! i
 
 applyDeltas :: [[Point]] -> Array Int Double -> Array Int Double -> [[Point]]
 applyDeltas contours dxs dys = go 0 contours
@@ -774,6 +824,18 @@ hvarDeltas hvar loc glyphIndex =
         Just m -> variationStoreDelta hvar.store loc (deltaForMap m glyphIndex)
   in (adv, lsb, rsb)
 
+vvarDeltas :: Vvar -> VariationLocation -> Int -> (Double, Double, Double)
+vvarDeltas vvar loc glyphIndex =
+  let advIdx = deltaForMap vvar.advanceMap glyphIndex
+      adv = variationStoreDelta vvar.store loc advIdx
+      tsb = case vvar.tsbMap of
+        Nothing -> 0
+        Just m -> variationStoreDelta vvar.store loc (deltaForMap m glyphIndex)
+      bsb = case vvar.bsbMap of
+        Nothing -> 0
+        Just m -> variationStoreDelta vvar.store loc (deltaForMap m glyphIndex)
+  in (adv, tsb, bsb)
+
 mvarDelta :: Mvar -> VariationLocation -> String -> Double
 mvarDelta mvar loc tag =
   case lookup tag mvar.records of
@@ -785,4 +847,11 @@ mvarHheaDeltas mvar loc =
   ( mvarDelta mvar loc "hasc"
   , mvarDelta mvar loc "hdes"
   , mvarDelta mvar loc "hlgp"
+  )
+
+mvarVheaDeltas :: Mvar -> VariationLocation -> (Double, Double, Double)
+mvarVheaDeltas mvar loc =
+  ( mvarDelta mvar loc "vasc"
+  , mvarDelta mvar loc "vdes"
+  , mvarDelta mvar loc "vlgp"
   )
