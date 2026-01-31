@@ -14,6 +14,7 @@ invariants for masdiff.
   - `MSDFConfig` (render configuration)
   - `GlyphSet` (glyph selection)
   - `GlyphCache`, `prepareGlyphCache`, `renderGlyphMSDFCached`
+  - `GlyphCacheLazy`, `prepareGlyphCacheLazy`, `renderGlyphMSDFCachedLazy` (on-demand outline caching)
   - `defaultMSDFConfig`
   - `renderGlyphMSDF` / `glyphMetricsOnly`
 - `MSDF.Render`

@@ -21,7 +21,9 @@ import MSDF.MSDF
   , defaultMSDFConfig
   , renderGlyphMSDF
   , renderGlyphMSDFCached
+  , renderGlyphMSDFCachedLazy
   , prepareGlyphCache
+  , prepareGlyphCacheLazy
   , glyphMetricsOnly
   , GlyphSet(..)
   )
@@ -100,6 +102,7 @@ main = do
     , runTest "lookup codepoint" (testLookupCodepoint subsetAtlas ttf)
     , runTest "parallelism deterministic" (testParallelismDeterministic ttf subsetAtlas parallelAtlas)
     , runTest "glyph cache" (testGlyphCache ttf cfgSmall)
+    , runTest "glyph cache lazy" (testGlyphCacheLazy ttf cfgSmall)
     , runTest "bitmap hash" (testBitmapHash ttf cfgSmall)
     , runTest "bitmap hash variable" (testBitmapHashVariable ttf)
     , runTest "bitmap hash italic" (testBitmapHashItalic ttfItalic)
@@ -702,6 +705,21 @@ testGlyphCache ttf cfg = do
   sigCached <- glyphSignatureSafe "cache A" glyphCached
   sigPlain <- glyphSignatureSafe "plain A" glyphPlain
   assertEq "cache compare A" sigPlain sigCached "glyph cache changed output"
+
+testGlyphCacheLazy :: TTF -> MSDFConfig -> IO ()
+testGlyphCacheLazy ttf cfg = do
+  let mappings = ttf.cmap.mappings
+      gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
+  assert (gA >= 0) "glyph index for A not found"
+  cache <- prepareGlyphCacheLazy cfg ttf
+  glyphCached <- renderGlyphMSDFCachedLazy cache cfg ttf gA
+  glyphCached2 <- renderGlyphMSDFCachedLazy cache cfg ttf gA
+  let glyphPlain = renderGlyphMSDF cfg ttf gA
+  sigCached <- glyphSignatureSafe "cache lazy A" glyphCached
+  sigCached2 <- glyphSignatureSafe "cache lazy A second" glyphCached2
+  sigPlain <- glyphSignatureSafe "plain A" glyphPlain
+  assertEq "cache lazy compare A" sigPlain sigCached "lazy glyph cache changed output"
+  assertEq "cache lazy repeat" sigCached sigCached2 "lazy glyph cache changed between calls"
 
 testBitmapHash :: TTF -> MSDFConfig -> IO ()
 testBitmapHash ttf cfg = do

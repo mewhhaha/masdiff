@@ -219,13 +219,17 @@ requireTable :: String -> TableDirectory -> ByteBuffer -> ByteBuffer
 requireTable tag tables bb =
   case lookup tag tables of
     Nothing -> error ("Missing table: " ++ tag)
-    Just (off, len) -> slice bb off len
+    Just (off, len) ->
+      let bb' = slice bb off len
+      in bb' `seq` bb'
 
 optionalTable :: String -> TableDirectory -> ByteBuffer -> Maybe ByteBuffer
 optionalTable tag tables bb =
   case lookup tag tables of
     Nothing -> Nothing
-    Just (off, len) -> Just (slice bb off len)
+    Just (off, len) ->
+      let bb' = slice bb off len
+      in bb' `seq` Just bb'
 
 -- head ---------------------------------------------------------------------
 

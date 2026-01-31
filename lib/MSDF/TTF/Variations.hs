@@ -190,7 +190,7 @@ parseAvar bb =
 parseGvar :: Int -> ByteBuffer -> Gvar
 parseGvar glyphCount bb =
   if bb.len < 20
-  then Gvar 0 [] (array (0, -1) []) 0 0 bb
+  then error "gvar: table too short"
   else
     let axisCount' = fromIntegral (readU16BE bb 4)
         sharedTupleCount = fromIntegral (readU16BE bb 6)
@@ -206,10 +206,22 @@ parseGvar glyphCount bb =
         maxOffsets = if offsetsOff >= bb.len
                      then 0
                      else min offsetsCount ((bb.len - offsetsOff) `div` offsetsSize)
+        _ = if sharedTupleOffset < 0 || sharedTupleOffset > bb.len
+            then error "gvar: shared tuple offset out of bounds"
+            else ()
+        _ = if dataOffset' < 0 || dataOffset' > bb.len
+            then error "gvar: data offset out of bounds"
+            else ()
+        _ = if maxOffsets < offsetsCount
+            then error "gvar: offsets table truncated"
+            else ()
         offsetsList =
           if longOffsets
           then [ fromIntegral (readU32BE bb (offsetsOff + i * 4)) | i <- [0 .. maxOffsets - 1] ]
           else [ fromIntegral (readU16BE bb (offsetsOff + i * 2)) * 2 | i <- [0 .. maxOffsets - 1] ]
+        _ = if not (nonDecreasing offsetsList)
+            then error "gvar: offsets not monotonic"
+            else ()
         offsetsArr = if null offsetsList
                      then array (0, -1) []
                      else array (0, length offsetsList - 1) (zip [0..] offsetsList)
@@ -423,7 +435,13 @@ parseGlyphData bb gvar loc pointCount =
         tupleCount = fromIntegral (tupleCountRaw .&. 0x0FFF) :: Int
         tupleFlags = tupleCountRaw .&. 0xF000
         dataOffset = fromIntegral (readU16BE bb 2)
+        _ = if tupleCount > ((bb.len - 4) `div` 6)
+            then error "gvar: tuple count exceeds header capacity"
+            else ()
         (headers, headersEnd) = readTupleHeaders bb 4 tupleCount gvar
+        _ = if dataOffset < headersEnd || dataOffset > bb.len
+            then error "gvar: data offset overlaps headers or out of bounds"
+            else ()
         (sharedPoints, _) =
           if testBit tupleFlags 15
           then readPackedPoints bb headersEnd pointCount
@@ -661,6 +679,13 @@ f2dot14 v =
 
 clamp :: Ord a => a -> a -> a -> a
 clamp lo hi v = max lo (min hi v)
+
+nonDecreasing :: Ord a => [a] -> Bool
+nonDecreasing [] = True
+nonDecreasing (x:xs) = go x xs
+  where
+    go _ [] = True
+    go prev (y:ys) = if prev <= y then go y ys else False
 
 parseItemVariationStore :: ByteBuffer -> ItemVariationStore
 parseItemVariationStore bb =

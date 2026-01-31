@@ -2,16 +2,21 @@ module MSDF.MSDF
   ( MSDFConfig(..)
   , GlyphSet(..)
   , GlyphCache(..)
+  , GlyphCacheLazy(..)
   , defaultMSDFConfig
   , prepareGlyphCache
+  , prepareGlyphCacheLazy
   , renderGlyphMSDF
   , renderGlyphMSDFCached
+  , renderGlyphMSDFCachedLazy
   , glyphMetricsOnly
   ) where
 
 import Data.Array (Array, array, accumArray, bounds, (!) )
 import Data.Array.Unboxed (UArray, listArray)
 import Data.List (sort)
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
+import qualified Data.IntMap.Strict as IntMap
 import Data.Word (Word8)
 import MSDF.Outline
 import MSDF.TTF.Parser
@@ -44,6 +49,11 @@ data GlyphCache = GlyphCache
   { location :: Maybe VariationLocation
   , contours :: Array Int [[Point]]
   } deriving (Eq, Show)
+
+data GlyphCacheLazy = GlyphCacheLazy
+  { location :: Maybe VariationLocation
+  , contoursRef :: IORef (IntMap.IntMap [[Point]])
+  }
 
 instance Semigroup GlyphSet where
   GlyphSetAll <> _ = GlyphSetAll
@@ -130,6 +140,11 @@ prepareGlyphCache cfg ttf =
         [ (i, normalizeContours (glyphOutlineAt loc ttf i)) | i <- [0 .. numGlyphs - 1] ]
   in GlyphCache loc outlines
 
+prepareGlyphCacheLazy :: MSDFConfig -> TTF -> IO GlyphCacheLazy
+prepareGlyphCacheLazy cfg ttf = do
+  ref <- newIORef IntMap.empty
+  pure (GlyphCacheLazy (variationLocation cfg ttf) ref)
+
 renderGlyphMSDFCached :: GlyphCache -> MSDFConfig -> TTF -> Int -> GlyphMSDF
 renderGlyphMSDFCached cache cfg ttf glyphIndex =
   let loc = variationLocation cfg ttf
@@ -137,6 +152,21 @@ renderGlyphMSDFCached cache cfg ttf glyphIndex =
   in if loc == cache.location && glyphIndex >= lo && glyphIndex <= hi
      then renderGlyphMSDFWithContours loc cfg ttf glyphIndex (cache.contours ! glyphIndex)
      else renderGlyphMSDF cfg ttf glyphIndex
+
+renderGlyphMSDFCachedLazy :: GlyphCacheLazy -> MSDFConfig -> TTF -> Int -> IO GlyphMSDF
+renderGlyphMSDFCachedLazy cache cfg ttf glyphIndex = do
+  let loc = variationLocation cfg ttf
+  if loc /= cache.location
+    then pure (renderGlyphMSDF cfg ttf glyphIndex)
+    else do
+      stored <- readIORef cache.contoursRef
+      case IntMap.lookup glyphIndex stored of
+        Just contours ->
+          pure (renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours)
+        Nothing -> do
+          let contours = normalizeContours (glyphOutlineAt loc ttf glyphIndex)
+          modifyIORef' cache.contoursRef (IntMap.insert glyphIndex contours)
+          pure (renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours)
 
 glyphMetricsOnly :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 glyphMetricsOnly cfg ttf glyphIndex =
