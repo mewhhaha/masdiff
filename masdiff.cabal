@@ -1,6 +1,6 @@
 cabal-version:      3.14
 name:               masdiff
-version:            0.2.0.0
+version:            0.2.0.1
 synopsis:           Pure Haskell MSDF generator for TrueType fonts
 description:
     Pure Haskell MSDF generator that parses TrueType fonts (glyf/loca/cmap)

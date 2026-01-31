@@ -630,8 +630,7 @@ parseSimpleGlyph bb numContours =
        in if flagsOff > bb.len
           then []
           else
-            let flags = readFlags bb flagsOff numPoints
-                xOff = flagsOff + length flags
+            let (flags, xOff) = readFlags bb flagsOff numPoints
                 (xs, yOff) = readCoords bb xOff flags True
                 (ys, _) = readCoords bb yOff flags False
                 points = [ Point (fromIntegral (xs !! i)) (fromIntegral (ys !! i)) (testBit (flags !! i) 0)
@@ -651,13 +650,15 @@ bboxFromContours contours =
           yMax' = ceiling (maximum ys)
       in (xMin', yMin', xMax', yMax')
 
-readFlags :: ByteBuffer -> Int -> Int -> [Word8]
-readFlags bb off count = reverse (go off count [])
+readFlags :: ByteBuffer -> Int -> Int -> ([Word8], Int)
+readFlags bb off count =
+  let (flags, next) = go off count []
+  in (reverse flags, next)
   where
-    go _ 0 acc = acc
+    go idx 0 acc = (acc, idx)
     go idx n acc =
       if not (within bb idx 1)
-      then acc
+      then (acc, idx)
       else
         let flag = readU8 bb idx
             hasRepeat = testBit flag 3 && within bb (idx + 1) 1

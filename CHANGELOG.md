@@ -2,12 +2,18 @@
 
 ## Unreleased
 
+* (No changes yet.)
+
+## 0.2.0.1 -- 2026-01-31
+
 * Added GPOS mark-to-base/mark-to-mark parsing and exposed anchors in `MSDFAtlas`.
 * Applied gvar component deltas for composite glyph offsets and phantom points.
 * Added an edge spatial index for faster MSDF distance queries.
 * Added render guide and versioning policy docs.
 * Added per-glyph outline caching APIs for repeated renders.
 * Added `msdf-bench` for basic generation/packing timing.
+* Fixed glyf repeat-flag parsing offset to avoid misaligned coordinates.
+* Added repeat-flag regression coverage for simple glyph parsing.
 
 ## 0.2.0.0 -- 2026-01-30
 
