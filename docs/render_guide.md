@@ -15,8 +15,40 @@ Helper utilities in `MSDF.Render`:
 
 - `glyphQuad` computes `(x0, y0, x1, y1)` quad bounds from a pen position.
 - `glyphUV` returns `(u0, v0, u1, v1)` based on the atlas placement.
+- `glyphQuadYDown` / `glyphUVTopLeft` handle common coordinate flips.
 - `pixelRange` converts a font MSDF `range` and screen scale to a shader value.
 - `scaleForPixelSize` and `pixelRangeForAtlas` help normalize for a target pixel size.
+
+## Coordinate conventions (explicit)
+
+masdiff uses **font-style, y-up** math for glyph metrics and quads:
+
+- `GlyphMSDF.bbox`, `advance`, and `bearingX/bearingY` are in pixel space with **+Y up**.
+- `glyphQuad` returns a quad in **y-up** coordinates for a given baseline `(penX, penY)`.
+
+Bitmap/atlas coordinates are consistent with that y-up convention:
+
+- The MSDF bitmap row `y = 0` corresponds to the **lowest** glyph-space Y.
+- `GlyphPlacement.x/y` and `glyphUV` use a **bottom-left** origin (`v` increases upward).
+
+If your renderer expects **top-left UVs** (D3D/Metal/WGPU-style), flip V:
+
+```
+let (u0, v0, u1, v1) = glyphUV glyph
+let uvTopLeft = (u0, 1 - v1, u1, 1 - v0)
+-- or use glyphUVTopLeft
+```
+
+If your screen space is **y-down**, reflect the quad around the baseline:
+
+```
+let (x0, y0, x1, y1) = glyphQuad glyph (penX, penY)
+let quadYDown = (x0, 2*penY - y1, x1, 2*penY - y0)
+-- or use glyphQuadYDown
+```
+
+These conversions are deterministic; mixing y-up and y-down conventions is the
+most common source of “random letters” when sampling a packed atlas.
 
 ## Pixel-range factor
 

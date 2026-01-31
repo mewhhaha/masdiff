@@ -78,6 +78,40 @@ See `docs/render_guide.md` for a concrete MSDF rendering reference (GLSL/WGSL).
 See `docs/reference_renderer.md` for a minimal rendering sample.
 See `docs/versioning.md` for versioning and changelog policy.
 
+## Coordinate conventions (very explicit)
+
+masdiff uses **font-style, y-up** math for glyph metrics and quads:
+
+- `GlyphMSDF.bbox`, `advance`, `bearingX/bearingY` are in pixel space with **+Y up**.
+- `glyphQuad` returns a quad in **y-up** coordinates for a given baseline `(penX, penY)`.
+- The MSDF bitmap row `y = 0` corresponds to the **lowest** glyph-space Y.
+- `GlyphPlacement.x/y` and `glyphUV` use a **bottom-left** UV origin (`v` increases upward).
+
+If your renderer expects **top-left UVs** (D3D/Metal/WGPU-style), flip V or use
+`glyphUVTopLeft`. If your screen space is **y-down**, reflect the quad around the
+baseline or use `glyphQuadYDown`.
+
+Practical recipes:
+
+**OpenGL-style (y-up, UV bottom-left)**
+
+```
+(x0, y0, x1, y1) = glyphQuad(glyph, (penX, penY))
+(u0, v0, u1, v1) = glyphUV(glyph)
+drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
+```
+
+**WGPU/D3D/Metal-style (y-down, UV top-left)**
+
+```
+(x0, y0, x1, y1) = glyphQuadYDown(glyph, (penX, penY))
+(u0, v0, u1, v1) = glyphUVTopLeft(glyph)
+drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
+```
+
+Sampler guidance is available in `MSDF.Render.msdfSamplerHints` and coordinate
+metadata is exposed via `atlasOrigin`, `uvOrigin`, and `glyphQuadSpace`.
+
 ## Pseudocode: rendering MSDF glyphs
 
 This is a high-level sketch of how to use the generated MSDF data to render text.

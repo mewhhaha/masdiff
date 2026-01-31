@@ -15,7 +15,7 @@ import Foreign.Storable (pokeByteOff)
 import System.Exit (exitFailure)
 import System.IO (hFlush, hPutStrLn, stdout, stderr, withBinaryFile, IOMode(WriteMode), hPutBuf)
 
-import MSDF.Generated (generateMSDFWithConfig)
+import MSDF.Generated (generateMSDFWithConfig, generateMSDFFromTTF)
 import MSDF.MSDF
   ( MSDFConfig(..)
   , defaultMSDFConfig
@@ -94,12 +94,14 @@ main = do
     , runTest "atlas packing" (testAtlasPacking subsetAtlas)
     , runTest "atlas placement bounds" (testAtlasPlacementBounds subsetAtlas)
     , runTest "atlas power of two" (testAtlasPowerOfTwo subsetAtlas)
+    , runTest "atlas non power of two" (testAtlasNonPowerOfTwo ttf)
     , runTest "render helpers" (testRenderHelpers subsetAtlas)
     , runTest "render scale helpers" (testRenderScaleHelpers subsetAtlas)
     , runTest "unpacked atlas" (testUnpackedAtlas unpackedAtlas)
     , runTest "kerning sorted" (testKerningSorted subsetAtlas)
     , runTest "codepoint index sorted" (testCodepointIndexSorted subsetAtlas)
     , runTest "lookup codepoint" (testLookupCodepoint subsetAtlas ttf)
+    , runTest "glyph set dedupes codepoints" (testGlyphSetDedupesCodepoints ttf)
     , runTest "parallelism deterministic" (testParallelismDeterministic ttf subsetAtlas parallelAtlas)
     , runTest "glyph cache" (testGlyphCache ttf cfgSmall)
     , runTest "glyph cache lazy" (testGlyphCacheLazy ttf cfgSmall)
@@ -606,6 +608,24 @@ testAtlasPowerOfTwo atlas =
     Just img -> do
       assert (isPow2 img.width && isPow2 img.height) "atlas dimensions should be power of two"
 
+testAtlasNonPowerOfTwo :: TTF -> IO ()
+testAtlasNonPowerOfTwo ttf = do
+  let cfg = defaultMSDFConfig
+        { MSDF.pixelSize = 16
+        , MSDF.glyphSet = GlyphSetCodepoints [65, 66]
+        , MSDF.packAtlas = True
+        , MSDF.atlasPowerOfTwo = False
+        , MSDF.atlasMinSize = 300
+        , MSDF.atlasMaxSize = 300
+        , MSDF.atlasPadding = 1
+        }
+      atlas = generateMSDFFromTTF cfg ttf
+  case atlas.atlas of
+    Nothing -> assert False "non-power-of-two atlas should pack at fixed size"
+    Just img -> do
+      assert (img.width == 300) "expected non-power-of-two atlas width"
+      assert (img.height > 0 && img.height <= 300) "atlas height out of bounds"
+
 testRenderHelpers :: MSDFAtlas -> IO ()
 testRenderHelpers atlas = do
   case lookupCodepoint atlas 65 of
@@ -672,6 +692,28 @@ testLookupCodepoint atlas ttf = do
     [] -> pure ()
     gs ->
       assert (lookupCodepoint atlas cpA == Just (minimum gs)) "lookupCodepoint mismatch for A"
+
+testGlyphSetDedupesCodepoints :: TTF -> IO ()
+testGlyphSetDedupesCodepoints ttf = do
+  let mappings = ttf.cmap.mappings
+      mA = lookupCodepointList 65 mappings
+      mB = lookupCodepointList 66 mappings
+  case (mA, mB) of
+    (Just gA, Just gB)
+      | gA /= gB -> do
+          let dupMappings = (65, gB) : mappings
+              ttfDup = ttf { cmap = Cmap dupMappings }
+              cfg = defaultMSDFConfig
+                { MSDF.pixelSize = 16
+                , MSDF.glyphSet = GlyphSetCodepoints [65]
+                , MSDF.packAtlas = False
+                }
+              atlas = generateMSDFFromTTF cfg ttfDup
+              glyphA = atlas.glyphs ! gA
+              glyphB = atlas.glyphs ! gB
+          assert (glyphA.bitmap.width > 0) "glyph A bitmap should be rendered"
+          assert (glyphB.bitmap.width == 0) "duplicate mapping should not render non-canonical glyph"
+    _ -> pure ()
 
 testParallelismDeterministic :: TTF -> MSDFAtlas -> MSDFAtlas -> IO ()
 testParallelismDeterministic ttf atlasSeq atlasPar = do

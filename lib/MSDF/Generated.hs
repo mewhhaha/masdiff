@@ -5,6 +5,8 @@ module MSDF.Generated
   , generateMSDFOrThrow
   ) where
 
+import Control.Exception (SomeException, evaluate, try)
+import Control.DeepSeq (deepseq)
 import Control.Monad (forM_)
 import Control.Parallel.Strategies (parListChunk, rdeepseq, withStrategy)
 import Data.Array (Array, array, listArray, accumArray, bounds, (!), (//))
@@ -37,7 +39,12 @@ generateMSDFWithConfig cfg path = do
   parsed <- parseTTF path
   case parsed of
     Left err -> pure (Left err)
-    Right ttf -> pure (Right (buildAtlas cfg ttf))
+    Right ttf -> do
+      result <- try (evaluate (forceAtlas (buildAtlas cfg ttf)))
+      case result of
+        Left (e :: SomeException) ->
+          pure (Left (ParseError { context = "buildAtlas", message = show e }))
+        Right atlas -> pure (Right atlas)
 
 -- | Generate an MSDF atlas from a parsed TTF.
 generateMSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas
@@ -50,6 +57,9 @@ generateMSDFOrThrow path = do
     Left err -> error (err.context ++ ": " ++ err.message)
     Right atlas -> pure atlas
 
+forceAtlas :: MSDFAtlas -> MSDFAtlas
+forceAtlas atlas = atlas `deepseq` atlas
+
 buildAtlas :: MSDFConfig -> TTF -> MSDFAtlas
 buildAtlas cfg ttf =
   let numGlyphs = ttf.maxp.numGlyphs
@@ -60,10 +70,10 @@ buildAtlas cfg ttf =
         Just vars -> Just (normalizeLocation vars.fvar vars.avar cfg.variations)
       mappings = ttf.cmap.mappings
       mappingsUnique = dedupeMappings mappings
-      codepointArr = accumCodepoints numGlyphs mappings
+      codepointArr = accumCodepoints numGlyphs mappingsUnique
       codepointEntries = map (uncurry CodepointMapEntry) mappingsUnique
       codepointIndex = arrayFromList codepointEntries
-      selector = glyphSelector cfg.glyphSet mappings
+      selector = glyphSelector cfg.glyphSet mappingsUnique
       glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
       (glyphsPacked, atlasImage) = if cfg.packAtlas
                                    then packAtlas cfg glyphs
@@ -337,7 +347,7 @@ chooseAtlasSize cfg rects =
       minDim = if cfg.atlasPowerOfTwo then nextPow2 minDim0 else minDim0
       sizes = if cfg.atlasPowerOfTwo
               then takeWhile (<= maxDim) (iterate (*2) minDim)
-              else takeWhile (<= maxDim) (iterate (*2) minDim)
+              else [minDim .. maxDim]
       sorted = sortOn (\r -> (-r.slotH, -r.slotW, r.glyphIndex)) rects
       trySize [] = Nothing
       trySize (w:ws) =

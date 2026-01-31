@@ -21,7 +21,8 @@ for codepoint in text:
     penX += lookupKerning(atlas, prev, glyphIndex)
 
   quad = glyphQuad(glyph, (penX, penY))
-  uv = glyphUV(glyph)
+  uv = glyphUV(glyph)  -- bottom-left UV origin
+  -- If your renderer uses top-left UVs, use glyphUVTopLeft instead.
 
   pushInstance(quad, uv, glyphIndex)
   penX += glyph.advance

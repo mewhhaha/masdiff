@@ -18,10 +18,13 @@ invariants for masdiff.
   - `defaultMSDFConfig`
   - `renderGlyphMSDF` / `glyphMetricsOnly`
 - `MSDF.Render`
+  - `Origin`, `YAxis` (coordinate conventions)
+  - `SamplerHints` (recommended sampling settings)
+  - `atlasOrigin`, `uvOrigin`, `glyphQuadSpace`, `msdfSamplerHints`
   - `pixelRange` (screen-space range factor)
   - `scaleForPixelSize` / `pixelRangeForAtlas` (size/normalization helpers)
-  - `glyphQuad` (quad bounds from pen position)
-  - `glyphUV` (atlas UVs or default)
+  - `glyphQuad` / `glyphQuadYDown` (quad bounds from pen position)
+  - `glyphUV` / `glyphUVTopLeft` (atlas UVs or default)
 - `MSDF.Types`
   - `MSDFAtlas`, `GlyphMSDF`, `VerticalMetrics`, `MSDFBitmap`, `BBox`, `KerningPair`
   - `Anchor`, `MarkGlyph`, `BaseGlyph`, `MarkToBase`, `MarkToMark`
