@@ -33,7 +33,7 @@ Bitmap/atlas coordinates are consistent with that y-up convention:
 
 If your renderer expects **top-left UVs** (D3D/Metal/WGPU-style), flip V:
 
-```
+```text
 let (u0, v0, u1, v1) = glyphUV glyph
 let uvTopLeft = (u0, 1 - v1, u1, 1 - v0)
 -- or use glyphUVTopLeft
@@ -41,7 +41,7 @@ let uvTopLeft = (u0, 1 - v1, u1, 1 - v0)
 
 If your screen space is **y-down**, reflect the quad around the baseline:
 
-```
+```text
 let (x0, y0, x1, y1) = glyphQuad glyph (penX, penY)
 let quadYDown = (x0, 2*penY - y1, x1, 2*penY - y0)
 -- or use glyphQuadYDown
@@ -55,7 +55,7 @@ most common source of “random letters” when sampling a packed atlas.
 If MSDFs were generated with `range = 4`, and you scale glyphs on screen by `S`,
 a typical pixel-range value is:
 
-```
+```text
 pxRange = pixelRange range S
 ```
 
@@ -109,7 +109,7 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 
 ### WESL (fragment)
 
-```
+```wesl
 @group(0) @binding(0) var msdfTex : texture_2d<f32>;
 @group(0) @binding(1) var msdfSampler : sampler;
 @group(0) @binding(2) var<uniform> uTextColor : vec4<f32>;

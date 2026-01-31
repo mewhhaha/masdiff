@@ -6,7 +6,7 @@ render guide.
 
 ## CPU-side layout (pseudocode)
 
-```
+```text
 penX = 0
 penY = baseline
 prev = None

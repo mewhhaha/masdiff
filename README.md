@@ -1,10 +1,10 @@
-# masdiff
+# masdiff (cringe vibes)
 
-Pure Haskell MSDF generator for TrueType fonts. It parses `glyf/loca/cmap` outlines and produces per‑glyph MSDF bitmaps plus metrics and kerning (legacy `kern` and GPOS pair adjustments).
+ok so this is a cozy pure Haskell MSDF generator for TrueType fonts with terminal-gremlin energy. it parses `glyf/loca/cmap` outlines and produces per‑glyph MSDF bitmaps plus metrics and kerning (legacy `kern` and GPOS pair adjustments). yes, it’s real.
 
-## Features
+## Features (cringe but real)
 
-- Pure Haskell pipeline (no external CLI/tools).
+- Pure Haskell pipeline (no external CLI/tools), comfy and deterministic (i promise).
 - TrueType outline parsing (simple + composite glyphs).
 - MSDF raster generation per glyph (packed RGB bytes).
 - Kerning support via `kern` and GPOS pair adjustment (lookup type 2).
@@ -12,7 +12,7 @@ Pure Haskell MSDF generator for TrueType fonts. It parses `glyf/loca/cmap` outli
 - Variable font support (fvar/avar/gvar + HVAR/VVAR/MVAR for metrics).
 - Optional atlas packing with per-glyph UV placement.
 
-## Usage
+## Usage (pls)
 
 ```haskell
 import MSDF.Generated (generateMSDF, generateMSDFOrThrow)
@@ -70,7 +70,7 @@ atlasBold <- generateMSDFWithConfig cfgBold "assets/Inter/Inter-VariableFont_ops
 cabal test msdf-tests
 ```
 
-## API overview
+## API overview (quick peek)
 
 See `docs/api.md` for a concise overview of the public modules, data ordering
 invariants, and determinism guarantees.
@@ -78,7 +78,7 @@ See `docs/render_guide.md` for a concrete MSDF rendering reference (GLSL/WGSL).
 See `docs/reference_renderer.md` for a minimal rendering sample.
 See `docs/versioning.md` for versioning and changelog policy.
 
-## Coordinate conventions (very explicit)
+## Coordinate conventions (very explicit, pls read)
 
 masdiff uses **font-style, y-up** math for glyph metrics and quads:
 
@@ -95,7 +95,7 @@ Practical recipes:
 
 **OpenGL-style (y-up, UV bottom-left)**
 
-```
+```text
 (x0, y0, x1, y1) = glyphQuad(glyph, (penX, penY))
 (u0, v0, u1, v1) = glyphUV(glyph)
 drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
@@ -103,7 +103,7 @@ drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
 
 **WGPU/D3D/Metal-style (y-down, UV top-left)**
 
-```
+```text
 (x0, y0, x1, y1) = glyphQuadYDown(glyph, (penX, penY))
 (u0, v0, u1, v1) = glyphUVTopLeft(glyph)
 drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
@@ -112,7 +112,7 @@ drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
 Sampler guidance is available in `MSDF.Render.msdfSamplerHints` and coordinate
 metadata is exposed via `atlasOrigin`, `uvOrigin`, and `glyphQuadSpace`.
 
-## Pseudocode: rendering MSDF glyphs
+## Pseudocode: rendering MSDF glyphs (pls dont mess it up)
 
 This is a high-level sketch of how to use the generated MSDF data to render text.
 It assumes you have a shader that decodes MSDF and outputs alpha.
@@ -120,7 +120,7 @@ Helper utilities are available in `MSDF.Render` (`glyphQuad`, `glyphUV`, `pixelR
 If you render the same glyphs at multiple sizes, use `MSDF.MSDF.prepareGlyphCache`
 and `renderGlyphMSDFCached` to reuse parsed outlines.
 
-```
+```text
 atlas = generateMSDFOrThrow("path/to/font.ttf")
 
 -- Build a glyph texture for each glyph (or use packed atlas).
@@ -162,19 +162,19 @@ for codepoint in text:
 
   -- Advance pen.
   penX += glyph.advance
-  prevGlyphIndex = glyphIndex
+prevGlyphIndex = glyphIndex
 ```
 
 MSDF shader idea (pseudocode):
 
-```
+```text
 sample = texture(msdfTex, uv).rgb
 sd = median(sample.r, sample.g, sample.b)
 alpha = clamp((sd - 0.5) * pxRange + 0.5, 0, 1)
 output = vec4(textColor.rgb, textColor.a * alpha)
 ```
 
-### Shader expectations (example)
+### Shader expectations (example, yes im serious)
 
 When rendering MSDF glyphs, the shader is expected to:
 
@@ -186,7 +186,7 @@ When rendering MSDF glyphs, the shader is expected to:
 
 Example GLSL-like fragment shader:
 
-```
+```glsl
 uniform sampler2D msdfTex;
 uniform vec4 textColor;
 uniform float pxRange;  // screen-space pixel range, e.g. (atlasRange * scale)
@@ -210,7 +210,7 @@ Notes:
 
 Example WESL fragment shader:
 
-```
+```wesl
 @group(0) @binding(0) var msdfTex : texture_2d<f32>;
 @group(0) @binding(1) var msdfSampler : sampler;
 @group(0) @binding(2) var<uniform> uTextColor : vec4<f32>;
@@ -229,7 +229,7 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 }
 ```
 
-## Limitations
+## Limitations (sad but true)
 
 - TrueType outlines only (no CFF).
 - Variable fonts support glyf variations and metrics via HVAR/VVAR/MVAR.
@@ -238,9 +238,11 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   Other lookups (mark-to-ligature, contextual, device/variation anchors) are not implemented.
 - Edge-coloring correction is heuristic and not a full msdfgen parity pass.
 
+ok thats it. happy rendering, dont break it.
+
 ## Benchmarks
 
-```
+```sh
 cabal run msdf-bench -- --pixel-size 32 --glyphs 256
 ```
 
