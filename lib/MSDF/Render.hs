@@ -89,8 +89,8 @@ pixelRangeForAtlas atlas targetPx =
 glyphQuad :: GlyphMSDF -> (Double, Double) -> (Double, Double, Double, Double)
 glyphQuad glyph (penX, penY) =
   let bmp = glyph.bitmap
-      x0 = penX + glyph.bbox.xMin - bmp.offsetX
-      y0 = penY - glyph.bbox.yMax - bmp.offsetY
+      x0 = penX + bmp.offsetX
+      y0 = penY + bmp.offsetY
       x1 = x0 + fromIntegral bmp.width
       y1 = y0 + fromIntegral bmp.height
   in (x0, y0, x1, y1)

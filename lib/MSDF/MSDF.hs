@@ -610,8 +610,9 @@ renderBitmap width height offsetX offsetY range correction (edgesR, edgesG, edge
                      dB0 = signedDistance inside idxB p
                      dAll = signedDistance inside idxAll p
                      sd = median3 dR0 dG0 dB0
+                     spread = max (abs (dR0 - dG0)) (max (abs (dR0 - dB0)) (abs (dG0 - dB0)))
                      (dR, dG, dB) =
-                       if correction > 0 && abs (sd - dAll) > correction
+                       if correction > 0 && (abs (sd - dAll) > correction || spread > correction)
                        then (dAll, dAll, dAll)
                        else (dR0, dG0, dB0)
                , channelValue <- [ distanceToByte range dR

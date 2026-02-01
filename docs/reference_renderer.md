@@ -50,10 +50,10 @@ fn vs_main(in: VertexIn) -> VertexOut {
   return out;
 }
 
-@group(0) @binding(0) var msdfTex : texture_2d<f32>;
-@group(0) @binding(1) var msdfSampler : sampler;
-@group(0) @binding(2) var<uniform> uTextColor : vec4<f32>;
-@group(0) @binding(3) var<uniform> uPxRange : f32;
+@group(2) @binding(0) var msdfTex : texture_2d<f32>;
+@group(2) @binding(1) var msdfSampler : sampler;
+@group(3) @binding(0) var<uniform> uTextColor : vec4<f32>;
+@group(3) @binding(1) var<uniform> uPxRange : f32;
 
 fn median(r: f32, g: f32, b: f32) -> f32 {
   return max(min(r, g), min(max(r, g), b));
@@ -62,8 +62,10 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 @fragment
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
-  let sd = median(sample.r, sample.g, sample.b) - 0.5;
-  let alpha = clamp(sd * uPxRange + 0.5, 0.0, 1.0);
+  let sd = 0.5 - median(sample.r, sample.g, sample.b);
+  let dist = sd * uPxRange;
+  let w = fwidth(dist);
+  let alpha = smoothstep(-w, w, dist);
   return vec4<f32>(uTextColor.rgb, uTextColor.a * alpha);
 }
 ```

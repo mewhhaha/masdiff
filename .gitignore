@@ -1,5 +1,6 @@
 dist-newstyle/
 .ghc.environment.*
+.cabal
 *.hi
 *.o
 *.dyn_o
@@ -8,3 +9,5 @@ dist-newstyle/
 *.hp
 *.eventlog
 .stack-work/
+examples/sdl_gpu_wesl/out/*
+!examples/sdl_gpu_wesl/out/screenshot.png

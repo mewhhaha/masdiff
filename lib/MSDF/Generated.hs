@@ -459,7 +459,8 @@ buildAtlasImage :: Int -> Int -> Int -> [PackPlacement] -> [GlyphMSDF] -> AtlasI
 buildAtlasImage width height pad placements glyphs =
   let total = width * height * 3
       pixels = runST $ do
-        arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
+        -- Fill with white so padding represents "outside" (positive distance).
+        arr <- (newArray (0, total - 1) 255 :: ST s (STUArray s Int Word8))
         let glyphMap = array (0, length glyphs - 1) (zip [0..] glyphs)
         forM_ placements $ \p -> do
           let glyph = glyphMap ! p.glyphIndex

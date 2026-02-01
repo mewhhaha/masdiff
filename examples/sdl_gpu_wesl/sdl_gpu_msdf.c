@@ -1,0 +1,549 @@
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_gpu.h>
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct Vertex {
+  float x, y;
+  float u, v;
+} Vertex;
+
+typedef struct FragUniforms {
+  float textColor[4];
+  float params[4]; /* params.x = pxRange */
+} FragUniforms;
+
+static void die(const char *msg) {
+  SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "%s: %s", msg, SDL_GetError());
+  exit(1);
+}
+
+static int file_exists(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (f) {
+    fclose(f);
+    return 1;
+  }
+  return 0;
+}
+
+static const char *resolve_out_dir(void) {
+  if (file_exists("out/meta.txt")) {
+    return "out";
+  }
+  if (file_exists("examples/sdl_gpu_wesl/out/meta.txt")) {
+    return "examples/sdl_gpu_wesl/out";
+  }
+  return NULL;
+}
+
+static void make_path(char *dst, size_t cap, const char *dir, const char *file) {
+  SDL_snprintf(dst, cap, "%s/%s", dir, file);
+}
+
+static int write_tga(const char *path, int w, int h, const void *data, SDL_GPUTextureFormat fmt) {
+  const Uint8 *bytes = (const Uint8 *) data;
+  bool is_bgra = fmt == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM ||
+                 fmt == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+  bool is_rgba = fmt == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM ||
+                 fmt == SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB;
+
+  if (!is_bgra && !is_rgba) {
+    return -1;
+  }
+
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    return -1;
+  }
+
+  Uint8 header[18] = {0};
+  header[2] = 2; /* uncompressed truecolor */
+  header[12] = (Uint8) (w & 0xFF);
+  header[13] = (Uint8) ((w >> 8) & 0xFF);
+  header[14] = (Uint8) (h & 0xFF);
+  header[15] = (Uint8) ((h >> 8) & 0xFF);
+  header[16] = 32; /* bpp */
+  header[17] = 0x20; /* top-left origin */
+  fwrite(header, 1, sizeof(header), f);
+
+  if (is_bgra) {
+    fwrite(bytes, 1, (size_t) w * (size_t) h * 4u, f);
+  } else {
+    for (int y = 0; y < h; y++) {
+      const Uint8 *row = bytes + (size_t) y * (size_t) w * 4u;
+      for (int x = 0; x < w; x++) {
+        const Uint8 *px = row + (size_t) x * 4u;
+        Uint8 out[4] = { px[2], px[1], px[0], px[3] }; /* RGBA -> BGRA */
+        fwrite(out, 1, 4, f);
+      }
+    }
+  }
+
+  fclose(f);
+  return 0;
+}
+
+static int load_meta(const char *path, int *w, int *h, int *screenW, int *screenH, float *pxRange) {
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    return -1;
+  }
+  char key[64];
+  double val = 0.0;
+  while (fscanf(f, "%63s %lf", key, &val) == 2) {
+    if (strcmp(key, "atlasWidth") == 0) {
+      *w = (int) val;
+    } else if (strcmp(key, "atlasHeight") == 0) {
+      *h = (int) val;
+    } else if (strcmp(key, "screenWidth") == 0) {
+      *screenW = (int) val;
+    } else if (strcmp(key, "screenHeight") == 0) {
+      *screenH = (int) val;
+    } else if (strcmp(key, "pxRange") == 0) {
+      *pxRange = (float) val;
+    }
+  }
+  fclose(f);
+  return (*w > 0 && *h > 0) ? 0 : -1;
+}
+
+int main(int argc, char **argv) {
+  (void) argc; (void) argv;
+
+  bool forceHeadless = SDL_getenv("SDL_MSDF_HEADLESS") != NULL;
+  if (forceHeadless) {
+    SDL_setenv_unsafe("SDL_VIDEODRIVER", "dummy", 0);
+    SDL_setenv_unsafe("SDL_HIDAPI_UDEV", "0", 0);
+    SDL_setenv_unsafe("SDL_JOYSTICK_HIDAPI", "0", 0);
+    SDL_setenv_unsafe("SDL_AUTO_UPDATE_JOYSTICKS", "0", 0);
+  }
+  int screenshotDelayMs = 0;
+  const char *delayEnv = SDL_getenv("SDL_MSDF_SCREENSHOT_DELAY_MS");
+  if (delayEnv && delayEnv[0] != '\0') {
+    screenshotDelayMs = atoi(delayEnv);
+  }
+
+  if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+    die("SDL_Init");
+  }
+
+  SDL_Window *window = NULL;
+  bool headless = forceHeadless;
+  if (!headless) {
+    window = SDL_CreateWindow("masdiff SDL_gpu", 1280, 720, 0);
+    if (!window) {
+      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow failed: %s (falling back to headless)", SDL_GetError());
+      headless = true;
+    }
+  }
+
+  int driverCount = SDL_GetNumGPUDrivers();
+  if (driverCount > 0) {
+    SDL_Log("SDL GPU drivers:");
+    for (int i = 0; i < driverCount; i++) {
+      const char *name = SDL_GetGPUDriver(i);
+      SDL_Log("  - %s", name ? name : "(null)");
+    }
+  }
+
+  const char *backendEnv = SDL_getenv("SDL_GPU_DRIVER");
+  const char *backend = (backendEnv && backendEnv[0] != '\0')
+                          ? backendEnv
+                          : (headless ? "vulkan" : NULL);
+  SDL_GPUDevice *gpu = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, backend);
+  if (!gpu && backend) {
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateGPUDevice(%s) failed: %s (retrying default)",
+                backend, SDL_GetError());
+    gpu = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, NULL);
+  }
+  if (!gpu) {
+    die("SDL_CreateGPUDevice");
+  }
+  if (window) {
+    if (!SDL_ClaimWindowForGPUDevice(gpu, window)) {
+      die("SDL_ClaimWindowForGPUDevice");
+    }
+  }
+
+  const char *outDir = resolve_out_dir();
+  if (!outDir) {
+    die("could not locate out/meta.txt");
+  }
+
+  bool wantScreenshot = SDL_getenv("SDL_MSDF_SCREENSHOT") != NULL;
+  bool captured = false;
+  SDL_GPUTransferBuffer *readback = NULL;
+  Uint32 readbackSize = 0;
+  SDL_GPUTextureFormat swapFmt = window ? SDL_GetGPUSwapchainTextureFormat(gpu, window)
+                                        : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+  if (headless) {
+    wantScreenshot = true;
+  }
+
+  int atlasW = 0;
+  int atlasH = 0;
+  int screenW = 1280;
+  int screenH = 720;
+  float pxRange = 4.0f;
+  char path[256];
+  make_path(path, sizeof(path), outDir, "meta.txt");
+  if (load_meta(path, &atlasW, &atlasH, &screenW, &screenH, &pxRange) < 0) {
+    die("load meta.txt");
+  }
+
+  size_t atlasSize = 0;
+  make_path(path, sizeof(path), outDir, "atlas.rgba");
+  void *atlasData = SDL_LoadFile(path, &atlasSize);
+  if (!atlasData) {
+    die("load atlas.rgba");
+  }
+  if (atlasSize != (size_t) atlasW * (size_t) atlasH * 4u) {
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "atlas size mismatch");
+    return 1;
+  }
+
+  size_t vertSize = 0;
+  make_path(path, sizeof(path), outDir, "vertices.bin");
+  void *vertData = SDL_LoadFile(path, &vertSize);
+  if (!vertData) {
+    die("load vertices.bin");
+  }
+  if (vertSize % sizeof(Vertex) != 0) {
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex size mismatch");
+    return 1;
+  }
+  Uint32 vertexCount = (Uint32) (vertSize / sizeof(Vertex));
+
+  size_t vsSize = 0;
+  make_path(path, sizeof(path), outDir, "msdf.vert.spv");
+  void *vsCode = SDL_LoadFile(path, &vsSize);
+  if (!vsCode) {
+    die("load msdf.vert.spv");
+  }
+  size_t fsSize = 0;
+  make_path(path, sizeof(path), outDir, "msdf.frag.spv");
+  void *fsCode = SDL_LoadFile(path, &fsSize);
+  if (!fsCode) {
+    die("load msdf.frag.spv");
+  }
+
+  SDL_GPUShader *vs = SDL_CreateGPUShader(gpu, &(SDL_GPUShaderCreateInfo){
+    .code = (const Uint8 *) vsCode,
+    .code_size = vsSize,
+    .entrypoint = "vs_main",
+    .format = SDL_GPU_SHADERFORMAT_SPIRV,
+    .stage = SDL_GPU_SHADERSTAGE_VERTEX,
+    .num_samplers = 0,
+    .num_storage_textures = 0,
+    .num_storage_buffers = 0,
+    .num_uniform_buffers = 0
+  });
+  if (!vs) {
+    die("create vertex shader");
+  }
+
+  SDL_GPUShader *fs = SDL_CreateGPUShader(gpu, &(SDL_GPUShaderCreateInfo){
+    .code = (const Uint8 *) fsCode,
+    .code_size = fsSize,
+    .entrypoint = "fs_main",
+    .format = SDL_GPU_SHADERFORMAT_SPIRV,
+    .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+    .num_samplers = 1,
+    .num_storage_textures = 0,
+    .num_storage_buffers = 0,
+    .num_uniform_buffers = 1
+  });
+  if (!fs) {
+    die("create fragment shader");
+  }
+
+  SDL_GPUVertexBufferDescription vb = {
+    .slot = 0,
+    .pitch = sizeof(Vertex),
+    .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX
+  };
+
+  SDL_GPUVertexAttribute attrs[2] = {
+    { .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0 },
+    { .location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = sizeof(float) * 2 }
+  };
+
+  SDL_GPUColorTargetBlendState blend = {
+    .src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+    .dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+    .color_blend_op = SDL_GPU_BLENDOP_ADD,
+    .src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE,
+    .dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+    .alpha_blend_op = SDL_GPU_BLENDOP_ADD,
+    .color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G |
+                        SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A,
+    .enable_blend = true,
+    .enable_color_write_mask = true
+  };
+
+  SDL_GPUTextureFormat targetFmt = swapFmt;
+  SDL_GPUTexture *renderTarget = NULL;
+  Uint32 offW = (Uint32) screenW;
+  Uint32 offH = (Uint32) screenH;
+
+  if (headless) {
+    targetFmt = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+  }
+
+  SDL_GPUColorTargetDescription colorDesc = { 0 };
+  colorDesc.format = targetFmt;
+  colorDesc.blend_state = blend;
+
+  SDL_GPURasterizerState rs = { 0 };
+  rs.fill_mode = SDL_GPU_FILLMODE_FILL;
+  rs.cull_mode = SDL_GPU_CULLMODE_NONE;
+  rs.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+  rs.enable_depth_clip = true;
+
+  SDL_GPUMultisampleState ms = { 0 };
+  ms.sample_count = SDL_GPU_SAMPLECOUNT_1;
+
+  SDL_GPUDepthStencilState ds = { 0 };
+  ds.enable_depth_test = false;
+  ds.enable_depth_write = false;
+
+  SDL_GPUGraphicsPipelineCreateInfo pipeInfo = { 0 };
+  pipeInfo.vertex_shader = vs;
+  pipeInfo.fragment_shader = fs;
+  pipeInfo.vertex_input_state.vertex_buffer_descriptions = &vb;
+  pipeInfo.vertex_input_state.num_vertex_buffers = 1;
+  pipeInfo.vertex_input_state.vertex_attributes = attrs;
+  pipeInfo.vertex_input_state.num_vertex_attributes = 2;
+  pipeInfo.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+  pipeInfo.rasterizer_state = rs;
+  pipeInfo.multisample_state = ms;
+  pipeInfo.depth_stencil_state = ds;
+  pipeInfo.target_info.color_target_descriptions = &colorDesc;
+  pipeInfo.target_info.num_color_targets = 1;
+  pipeInfo.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID;
+  pipeInfo.target_info.has_depth_stencil_target = false;
+
+  SDL_GPUGraphicsPipeline *pipeline = SDL_CreateGPUGraphicsPipeline(gpu, &pipeInfo);
+  if (!pipeline) {
+    die("create pipeline");
+  }
+
+  if (headless) {
+    renderTarget = SDL_CreateGPUTexture(gpu, &(SDL_GPUTextureCreateInfo){
+      .type = SDL_GPU_TEXTURETYPE_2D,
+      .format = targetFmt,
+      .usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+      .width = offW,
+      .height = offH,
+      .layer_count_or_depth = 1,
+      .num_levels = 1,
+      .sample_count = SDL_GPU_SAMPLECOUNT_1
+    });
+    if (!renderTarget) {
+      die("create offscreen render target");
+    }
+  }
+
+  SDL_GPUTexture *atlasTex = SDL_CreateGPUTexture(gpu, &(SDL_GPUTextureCreateInfo){
+    .type = SDL_GPU_TEXTURETYPE_2D,
+    .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+    .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+    .width = (Uint32) atlasW,
+    .height = (Uint32) atlasH,
+    .layer_count_or_depth = 1,
+    .num_levels = 1,
+    .sample_count = SDL_GPU_SAMPLECOUNT_1
+  });
+  if (!atlasTex) {
+    die("create atlas texture");
+  }
+
+  SDL_GPUSampler *sampler = SDL_CreateGPUSampler(gpu, &(SDL_GPUSamplerCreateInfo){
+    .min_filter = SDL_GPU_FILTER_LINEAR,
+    .mag_filter = SDL_GPU_FILTER_LINEAR,
+    .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+    .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+    .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+    .address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE
+  });
+  if (!sampler) {
+    die("create sampler");
+  }
+
+  SDL_GPUBuffer *vertexBuffer = SDL_CreateGPUBuffer(gpu, &(SDL_GPUBufferCreateInfo){
+    .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
+    .size = (Uint32) vertSize
+  });
+  if (!vertexBuffer) {
+    die("create vertex buffer");
+  }
+
+  SDL_GPUTransferBuffer *texUpload = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
+    .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+    .size = (Uint32) atlasSize
+  });
+  SDL_GPUTransferBuffer *vtxUpload = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
+    .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+    .size = (Uint32) vertSize
+  });
+  if (!texUpload || !vtxUpload) {
+    die("create transfer buffers");
+  }
+
+  bool uploaded = false;
+  bool running = true;
+  while (running) {
+    SDL_Event ev;
+    if (window) {
+      while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_EVENT_QUIT) {
+          running = false;
+        }
+      }
+    }
+
+    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(gpu);
+    if (!cmd) {
+      die("acquire command buffer");
+    }
+
+    if (!uploaded) {
+      void *mappedTex = SDL_MapGPUTransferBuffer(gpu, texUpload, false);
+      SDL_memcpy(mappedTex, atlasData, atlasSize);
+      SDL_UnmapGPUTransferBuffer(gpu, texUpload);
+
+      void *mappedVtx = SDL_MapGPUTransferBuffer(gpu, vtxUpload, false);
+      SDL_memcpy(mappedVtx, vertData, vertSize);
+      SDL_UnmapGPUTransferBuffer(gpu, vtxUpload);
+
+      SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+      SDL_UploadToGPUTexture(copy,
+        &(SDL_GPUTextureTransferInfo){ texUpload, 0, (Uint32) atlasW, (Uint32) atlasH },
+        &(SDL_GPUTextureRegion){ atlasTex, 0, 0, 0, 0, 0, (Uint32) atlasW, (Uint32) atlasH, 1 },
+        false);
+      SDL_UploadToGPUBuffer(copy,
+        &(SDL_GPUTransferBufferLocation){ vtxUpload, 0 },
+        &(SDL_GPUBufferRegion){ vertexBuffer, 0, (Uint32) vertSize },
+        false);
+      SDL_EndGPUCopyPass(copy);
+      uploaded = true;
+    }
+
+    SDL_GPUTexture *swapchainTex = NULL;
+    Uint32 swapW = 0, swapH = 0;
+    if (window) {
+      if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, window, &swapchainTex, &swapW, &swapH)) {
+        SDL_SubmitGPUCommandBuffer(cmd);
+        continue;
+      }
+    } else {
+      swapchainTex = renderTarget;
+      swapW = offW;
+      swapH = offH;
+    }
+
+    if (wantScreenshot && readback == NULL) {
+      readbackSize = swapW * swapH * 4u;
+      readback = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
+        .usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+        .size = readbackSize
+      });
+      if (!readback) {
+        die("create readback buffer");
+      }
+    }
+
+    SDL_GPUColorTargetInfo colorTarget = { 0 };
+    colorTarget.texture = swapchainTex;
+    colorTarget.load_op = SDL_GPU_LOADOP_CLEAR;
+    colorTarget.store_op = SDL_GPU_STOREOP_STORE;
+    colorTarget.clear_color = (SDL_FColor){ 0.f, 0.f, 0.f, 1.f };
+
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &colorTarget, 1, NULL);
+    SDL_BindGPUGraphicsPipeline(pass, pipeline);
+
+    SDL_GPUViewport vp = { 0.f, 0.f, (float) swapW, (float) swapH, 0.f, 1.f };
+    SDL_SetGPUViewport(pass, &vp);
+    SDL_Rect scissor = { 0, 0, (int) swapW, (int) swapH };
+    SDL_SetGPUScissor(pass, &scissor);
+
+    SDL_GPUBufferBinding vbind = { vertexBuffer, 0 };
+    SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
+
+    SDL_GPUTextureSamplerBinding sbind = { atlasTex, sampler };
+    SDL_BindGPUFragmentSamplers(pass, 0, &sbind, 1);
+
+    FragUniforms fu = { { 1.f, 1.f, 1.f, 1.f }, { pxRange, 0.f, 0.f, 0.f } };
+    SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
+
+    SDL_DrawGPUPrimitives(pass, vertexCount, 1, 0, 0);
+    SDL_EndGPURenderPass(pass);
+
+    SDL_GPUFence *fence = NULL;
+    if (wantScreenshot && !captured) {
+      SDL_GPUCopyPass *copy2 = SDL_BeginGPUCopyPass(cmd);
+      SDL_DownloadFromGPUTexture(copy2,
+        &(SDL_GPUTextureRegion){ swapchainTex, 0, 0, 0, 0, 0, swapW, swapH, 1 },
+        &(SDL_GPUTextureTransferInfo){ readback, 0, 0, 0 });
+      SDL_EndGPUCopyPass(copy2);
+      fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    } else {
+      SDL_SubmitGPUCommandBuffer(cmd);
+    }
+
+    if (fence) {
+      SDL_GPUFence *fences[1] = { fence };
+      SDL_WaitForGPUFences(gpu, true, fences, 1);
+      SDL_ReleaseGPUFence(gpu, fence);
+      void *mapped = SDL_MapGPUTransferBuffer(gpu, readback, false);
+      if (mapped) {
+        char shotPath[256];
+        make_path(shotPath, sizeof(shotPath), outDir, "screenshot.tga");
+        if (write_tga(shotPath, (int) swapW, (int) swapH, mapped, swapFmt) == 0) {
+          SDL_Log("wrote %s", shotPath);
+        } else {
+          SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "failed to write screenshot");
+        }
+        SDL_UnmapGPUTransferBuffer(gpu, readback);
+      }
+      if (screenshotDelayMs > 0 && window) {
+        SDL_Delay((Uint32) screenshotDelayMs);
+      }
+      captured = true;
+      running = false;
+    }
+    if (!window && !wantScreenshot) {
+      running = false;
+    }
+  }
+
+  SDL_free(atlasData);
+  SDL_free(vertData);
+  SDL_free(vsCode);
+  SDL_free(fsCode);
+
+  SDL_ReleaseGPUTransferBuffer(gpu, texUpload);
+  SDL_ReleaseGPUTransferBuffer(gpu, vtxUpload);
+  if (readback) {
+    SDL_ReleaseGPUTransferBuffer(gpu, readback);
+  }
+  SDL_ReleaseGPUBuffer(gpu, vertexBuffer);
+  SDL_ReleaseGPUTexture(gpu, atlasTex);
+  if (renderTarget) {
+    SDL_ReleaseGPUTexture(gpu, renderTarget);
+  }
+  SDL_ReleaseGPUSampler(gpu, sampler);
+  SDL_ReleaseGPUGraphicsPipeline(gpu, pipeline);
+  SDL_ReleaseGPUShader(gpu, vs);
+  SDL_ReleaseGPUShader(gpu, fs);
+  SDL_DestroyGPUDevice(gpu);
+  if (window) {
+    SDL_DestroyWindow(window);
+  }
+  SDL_Quit();
+  return 0;
+}

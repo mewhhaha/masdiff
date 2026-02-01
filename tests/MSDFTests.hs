@@ -28,7 +28,7 @@ import MSDF.MSDF
   , GlyphSet(..)
   )
 import qualified MSDF.MSDF as MSDF
-import MSDF.Render (glyphQuad, glyphUV, scaleForPixelSize, pixelRangeForAtlas)
+import MSDF.Render (glyphQuad, glyphUV, glyphUVTopLeft, scaleForPixelSize, pixelRangeForAtlas)
 import MSDF.Binary (ByteBuffer(..), readByteBuffer, readS16BE, readU16BE, readU8, readTag, slice)
 import MSDF.Outline (Point(..))
 import MSDF.TTF.GPOS (AnchorRaw(..), GPOSMarksRaw(..), MarkToBaseRaw(..), MarkToMarkRaw(..), MarkGlyphRaw(..), BaseGlyphRaw(..))
@@ -97,6 +97,7 @@ main = do
     , runTest "atlas non power of two" (testAtlasNonPowerOfTwo ttf)
     , runTest "render helpers" (testRenderHelpers subsetAtlas)
     , runTest "render scale helpers" (testRenderScaleHelpers subsetAtlas)
+    , runTest "SDL atlas interop" (testSDLAtlasInterop subsetAtlas)
     , runTest "unpacked atlas" (testUnpackedAtlas unpackedAtlas)
     , runTest "kerning sorted" (testKerningSorted subsetAtlas)
     , runTest "codepoint index sorted" (testCodepointIndexSorted subsetAtlas)
@@ -651,6 +652,31 @@ testRenderScaleHelpers atlas = do
   assertApprox "scaleForPixelSize" 1.0 scale
   assertApprox "pixelRangeForAtlas" (fromIntegral atlas.range) range
 
+testSDLAtlasInterop :: MSDFAtlas -> IO ()
+testSDLAtlasInterop atlas = do
+  case atlas.atlas of
+    Nothing -> assert False "atlas packing missing"
+    Just img -> do
+      let rgb = img.pixels
+          rgbLen = rangeSize (bounds rgb)
+      assert (rgbLen `mod` 3 == 0) "atlas RGB length should be multiple of 3"
+      let rgba = rgbToRgba rgb
+          rgbaLen = rangeSize (bounds rgba)
+      assert (rgbaLen == (rgbLen `div` 3) * 4) "atlas RGBA length mismatch"
+      if rgbaLen >= 4
+        then assert (rgba UA.! 3 == 255) "atlas RGBA alpha should be 255"
+        else assert False "atlas RGBA empty"
+  case lookupCodepoint atlas 65 of
+    Nothing -> pure ()
+    Just gA -> do
+      let glyphA = atlas.glyphs ! gA
+          (u0, v0, u1, v1) = glyphUV glyphA
+          (tu0, tv0, tu1, tv1) = glyphUVTopLeft glyphA
+      assertApprox "glyphUVTopLeft u0" u0 tu0
+      assertApprox "glyphUVTopLeft u1" u1 tu1
+      assertApprox "glyphUVTopLeft v0" (1 - v1) tv0
+      assertApprox "glyphUVTopLeft v1" (1 - v0) tv1
+
 testUnpackedAtlas :: MSDFAtlas -> IO ()
 testUnpackedAtlas atlas = do
   assert (isNothing atlas.atlas) "unpacked atlas should not include atlas image"
@@ -1007,6 +1033,17 @@ assertApprox label expected actual =
   let eps = 1e-9
       ok = abs (expected - actual) <= eps
   in assert ok (label ++ ": expected " ++ show expected ++ " got " ++ show actual)
+
+rgbToRgba :: UA.UArray Int Word8 -> UA.UArray Int Word8
+rgbToRgba rgb =
+  let rgbaList = go (UA.elems rgb)
+  in if null rgbaList
+     then UA.listArray (0, -1) []
+     else UA.listArray (0, length rgbaList - 1) rgbaList
+  where
+    go (r:g:b:rest) = r:g:b:255:go rest
+    go [] = []
+    go _ = error "rgbToRgba: invalid RGB length"
 
 glyphSignatureSafe :: String -> GlyphMSDF -> IO (Double, Double, Double, BBox, Maybe VerticalMetrics, Int, Int, Int, Maybe GlyphPlacement)
 glyphSignatureSafe label glyph = do
