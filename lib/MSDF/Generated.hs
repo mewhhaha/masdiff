@@ -3,6 +3,10 @@ module MSDF.Generated
   , generateMSDFWithConfig
   , generateMSDFFromTTF
   , generateMSDFOrThrow
+  , generateMTSDF
+  , generateMTSDFWithConfig
+  , generateMTSDFFromTTF
+  , generateMTSDFOrThrow
   ) where
 
 import Control.Exception (SomeException, evaluate, try)
@@ -53,6 +57,25 @@ generateMSDFFromTTF cfg ttf = buildAtlas cfg ttf
 generateMSDFOrThrow :: FilePath -> IO MSDFAtlas
 generateMSDFOrThrow path = do
   result <- generateMSDF path
+  case result of
+    Left err -> error (err.context ++ ": " ++ err.message)
+    Right atlas -> pure atlas
+
+-- | Generate an MTSDF atlas from a TTF file with default config.
+generateMTSDF :: FilePath -> IO (Either ParseError MSDFAtlas)
+generateMTSDF = generateMSDFWithConfig (defaultMSDFConfig { outputFormat = BitmapMTSDF })
+
+-- | Generate an MTSDF atlas from a TTF file with a custom config.
+generateMTSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)
+generateMTSDFWithConfig cfg = generateMSDFWithConfig (cfg { outputFormat = BitmapMTSDF })
+
+-- | Generate an MTSDF atlas from a parsed TTF.
+generateMTSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas
+generateMTSDFFromTTF cfg = generateMSDFFromTTF (cfg { outputFormat = BitmapMTSDF })
+
+generateMTSDFOrThrow :: FilePath -> IO MSDFAtlas
+generateMTSDFOrThrow path = do
+  result <- generateMTSDF path
   case result of
     Left err -> error (err.context ++ ": " ++ err.message)
     Right atlas -> pure atlas
@@ -308,7 +331,7 @@ packAtlas cfg glyphs =
          Just (atlasW, atlasH, placements) ->
            let placementArr = placementsToArray (length glyphs) atlasW atlasH pad placements
                glyphs' = [ applyPlacement g (placementArr ! i) | (i, g) <- zip [0..] glyphs ]
-               atlasImage = buildAtlasImage atlasW atlasH pad placements glyphs
+               atlasImage = buildAtlasImage cfg.outputFormat atlasW atlasH pad placements glyphs
            in (glyphs', Just atlasImage)
 
 applyPlacement :: GlyphMSDF -> Maybe GlyphPlacement -> GlyphMSDF
@@ -455,12 +478,13 @@ nextPow2 n
   where
     go k = if k >= n then k else go (k * 2)
 
-buildAtlasImage :: Int -> Int -> Int -> [PackPlacement] -> [GlyphMSDF] -> AtlasImage
-buildAtlasImage width height pad placements glyphs =
-  let total = width * height * 3
+buildAtlasImage :: BitmapFormat -> Int -> Int -> Int -> [PackPlacement] -> [GlyphMSDF] -> AtlasImage
+buildAtlasImage fmt width height pad placements glyphs =
+  let channels = bitmapChannels fmt
+      total = width * height * channels
       pixels = runST $ do
-        -- Fill with white so padding represents "outside" (positive distance).
-        arr <- (newArray (0, total - 1) 255 :: ST s (STUArray s Int Word8))
+        -- Fill with black so padding represents "outside" (negative distance).
+        arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
         let glyphMap = array (0, length glyphs - 1) (zip [0..] glyphs)
         forM_ placements $ \p -> do
           let glyph = glyphMap ! p.glyphIndex
@@ -470,16 +494,12 @@ buildAtlasImage width height pad placements glyphs =
               dstY = p.slotY + pad
           forM_ [0 .. p.bmpH - 1] $ \y -> do
             forM_ [0 .. p.bmpW - 1] $ \x -> do
-              let srcBase = (y * p.bmpW + x) * 3
-                  dstBase = ((dstY + y) * width + (dstX + x)) * 3
-                  r = src UA.! srcBase
-                  g = src UA.! (srcBase + 1)
-                  b = src UA.! (srcBase + 2)
-              writeArray arr dstBase r
-              writeArray arr (dstBase + 1) g
-              writeArray arr (dstBase + 2) b
+              let srcBase = (y * p.bmpW + x) * channels
+                  dstBase = ((dstY + y) * width + (dstX + x)) * channels
+              forM_ [0 .. channels - 1] $ \c ->
+                writeArray arr (dstBase + c) (src UA.! (srcBase + c))
         freeze arr
-  in AtlasImage { width = width, height = height, pixels = pixels }
+  in AtlasImage { width = width, height = height, format = fmt, pixels = pixels }
 
 memberSorted :: Maybe (Array Int Int) -> Int -> Bool
 memberSorted Nothing _ = False

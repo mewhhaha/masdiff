@@ -10,6 +10,10 @@ invariants for masdiff.
   - `generateMSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)`
   - `generateMSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas`
   - `generateMSDFOrThrow :: FilePath -> IO MSDFAtlas`
+  - `generateMTSDF :: FilePath -> IO (Either ParseError MSDFAtlas)`
+  - `generateMTSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)`
+  - `generateMTSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas`
+  - `generateMTSDFOrThrow :: FilePath -> IO MSDFAtlas`
 - `MSDF.MSDF`
   - `MSDFConfig` (render configuration)
   - `GlyphSet` (glyph selection)
@@ -26,7 +30,7 @@ invariants for masdiff.
   - `glyphQuad` / `glyphQuadYDown` (quad bounds from pen position)
   - `glyphUV` / `glyphUVTopLeft` (atlas UVs or default)
 - `MSDF.Types`
-  - `MSDFAtlas`, `GlyphMSDF`, `VerticalMetrics`, `MSDFBitmap`, `BBox`, `KerningPair`
+  - `MSDFAtlas`, `GlyphMSDF`, `VerticalMetrics`, `MSDFBitmap`, `BitmapFormat`, `BBox`, `KerningPair`
   - `Anchor`, `MarkGlyph`, `BaseGlyph`, `MarkToBase`, `MarkToMark`
   - `AtlasImage`, `GlyphPlacement` (packed atlas support)
   - `lookupCodepoint`, `lookupKerning`
@@ -39,7 +43,7 @@ invariants for masdiff.
 
 - `pixelSize`: output pixel size (used for scaling from font units).
 - `range`: MSDF pixel range (see shader expectations in README).
-- `cornerThreshold`: edge coloring threshold in radians.
+- `cornerThreshold`: edge coloring threshold in degrees (msdfgen-style).
 - `glyphSet`: which glyphs to rasterize (others get metrics only).
 - `parallelism`: `0` disables parallel rendering, otherwise chunk size for `parListChunk`.
 - `variations`: axis settings like `[("wght", 700)]` (user-space values).
@@ -48,6 +52,10 @@ invariants for masdiff.
 - `atlasMinSize`/`atlasMaxSize`: atlas size bounds (power‑of‑two when enabled).
 - `atlasPowerOfTwo`: round atlas dimensions to next power‑of‑two.
 - `msdfCorrectionThreshold`: correction threshold for MSDF error smoothing.
+- `outputFormat`: `BitmapMSDF` (RGB) or `BitmapMTSDF` (RGBA with alpha SDF).
+- `windingFlatness`: curve flatness used for inside/outside winding (lower = more accurate, slower).
+- `speckleThreshold`: fix isolated sign speckles near edges when > 0 (distance threshold in pixels).
+- `edgeConflictThreshold`: recolor edges when different-colored edges are within this distance.
 
 ## Determinism and ordering
 

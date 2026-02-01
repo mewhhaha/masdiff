@@ -5,6 +5,8 @@ module MSDF.Types
   , VerticalMetrics(..)
   , AtlasImage(..)
   , MSDFBitmap(..)
+  , BitmapFormat(..)
+  , bitmapChannels
   , BBox(..)
   , BBoxUnion(..)
   , bboxUnion
@@ -24,6 +26,15 @@ import Control.DeepSeq (NFData(..))
 import Data.Array (Array, (!), bounds)
 import Data.Array.Unboxed (UArray)
 import Data.Word (Word8)
+
+data BitmapFormat
+  = BitmapMSDF
+  | BitmapMTSDF
+  deriving (Eq, Show)
+
+bitmapChannels :: BitmapFormat -> Int
+bitmapChannels BitmapMSDF = 3
+bitmapChannels BitmapMTSDF = 4
 
 -- | Complete MSDF data for a font.
 type GlyphIndex = Int
@@ -122,10 +133,11 @@ data GlyphPlacement = GlyphPlacement
   , v1 :: Double
   } deriving (Eq, Show)
 
--- | Packed atlas image (RGB).
+-- | Packed atlas image (RGB for MSDF, RGBA for MTSDF).
 data AtlasImage = AtlasImage
   { width :: Int
   , height :: Int
+  , format :: BitmapFormat
   , pixels :: UArray Int Word8
   } deriving (Eq, Show)
 
@@ -162,12 +174,13 @@ instance Semigroup BBoxUnion where
 instance Monoid BBoxUnion where
   mempty = BBoxUnion Nothing
 
--- | Packed RGB bitmap data.
+-- | Packed bitmap data (RGB for MSDF, RGBA for MTSDF).
 data MSDFBitmap = MSDFBitmap
   { width :: Int
   , height :: Int
   , offsetX :: Double
   , offsetY :: Double
+  , format :: BitmapFormat
   , pixels :: UArray Int Word8
   } deriving (Eq, Show)
 
@@ -199,7 +212,7 @@ instance NFData MarkToMark where
   rnf (MarkToMark c m1 m2) = c `seq` rnf m1 `seq` rnf m2 `seq` ()
 
 instance NFData MSDFBitmap where
-  rnf (MSDFBitmap w h ox oy px) = w `seq` h `seq` ox `seq` oy `seq` px `seq` ()
+  rnf (MSDFBitmap w h ox oy fmt px) = w `seq` h `seq` ox `seq` oy `seq` fmt `seq` px `seq` ()
 
 instance NFData GlyphMSDF where
   rnf (GlyphMSDF i cps adv bx by bb bm vm pl) =
@@ -218,7 +231,7 @@ instance NFData GlyphPlacement where
     a `seq` b `seq` c `seq` d `seq` e `seq` f `seq` g `seq` h `seq` ()
 
 instance NFData AtlasImage where
-  rnf (AtlasImage w h px) = w `seq` h `seq` px `seq` ()
+  rnf (AtlasImage w h fmt px) = w `seq` h `seq` fmt `seq` px `seq` ()
 
 lookupCodepoint :: MSDFAtlas -> Int -> Maybe Int
 lookupCodepoint atlas cp =

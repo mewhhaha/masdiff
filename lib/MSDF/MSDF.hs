@@ -12,10 +12,14 @@ module MSDF.MSDF
   , glyphMetricsOnly
   ) where
 
+import Control.Monad (forM_, foldM)
+import Control.Monad.ST (ST, runST)
 import Data.Array (Array, array, accumArray, bounds, (!) )
+import Data.Array.ST (STUArray, newArray, readArray, writeArray, freeze)
 import Data.Array.Unboxed (UArray, listArray)
 import Data.List (sort)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
+import Data.STRef (newSTRef, readSTRef, writeSTRef)
 import qualified Data.IntMap.Strict as IntMap
 import Data.Word (Word8)
 import MSDF.Outline
@@ -37,6 +41,10 @@ data MSDFConfig = MSDFConfig
   , atlasMaxSize :: Int
   , atlasPowerOfTwo :: Bool
   , msdfCorrectionThreshold :: Double
+  , outputFormat :: BitmapFormat
+  , windingFlatness :: Double
+  , speckleThreshold :: Double
+  , edgeConflictThreshold :: Double
   }
 
 -- | Glyph subset selection.
@@ -79,7 +87,11 @@ defaultMSDFConfig = MSDFConfig
   , atlasMinSize = 256
   , atlasMaxSize = 4096
   , atlasPowerOfTwo = True
-  , msdfCorrectionThreshold = 0.5
+  , msdfCorrectionThreshold = 0.05
+  , outputFormat = BitmapMSDF
+  , windingFlatness = 0.02
+  , speckleThreshold = 1.0
+  , edgeConflictThreshold = 1.0
   }
 
 variationLocation :: MSDFConfig -> TTF -> Maybe VariationLocation
@@ -105,15 +117,20 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
   in if null contours
      then base
      else
-       let coloredEdges = concatMap (colorContourEdges cfg.cornerThreshold) (splitContoursEdges contours scale)
-           allLines = concatMap (flattenEdge 0.25) (map snd coloredEdges)
-           colorEdges = splitColoredEdges coloredEdges
+       let coloredEdges = concatMap (colorContourEdges cfg.cornerThreshold cfg.edgeConflictThreshold) (splitContoursEdges contours scale)
+           allEdges = map snd coloredEdges
+           segsAll = concatMap (flattenEdge cfg.windingFlatness) allEdges
+           boundaryEdges = filterBoundaryEdges 0.25 segsAll allEdges
+           coloredEdges' = filter (\(_, e) -> e `elem` boundaryEdges) coloredEdges
+           colorEdges = splitColoredEdges coloredEdges'
+           segsBoundary = concatMap (flattenEdge cfg.windingFlatness) boundaryEdges
+           segs = if null segsBoundary then segsAll else segsBoundary
            padding = fromIntegral (safeRange + 1) :: Double
            width = max 1 (ceiling ((bbox.xMax - bbox.xMin) + 2 * padding))
            height = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding))
            offsetX = bbox.xMin - padding
            offsetY = bbox.yMin - padding
-           pixels = renderBitmap width height offsetX offsetY safeRange correction colorEdges allLines
+           pixels = renderBitmap cfg.outputFormat cfg.speckleThreshold width height offsetX offsetY safeRange correction cfg.edgeConflictThreshold colorEdges segs
        in GlyphMSDF
            { index = glyphIndex
            , codepoints = []
@@ -126,6 +143,7 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
                , height = height
                , offsetX = offsetX
                , offsetY = offsetY
+               , format = cfg.outputFormat
                , pixels = pixels
                }
             , vertical = base.vertical
@@ -211,7 +229,7 @@ glyphMetricsOnlyAt loc cfg ttf glyphIndex =
       , bearingX = lsb
       , bearingY = bearingY
       , bbox = bbox
-      , bitmap = emptyBitmap
+      , bitmap = emptyBitmap cfg.outputFormat
       , vertical = verticalMetrics
       , placement = Nothing
       }
@@ -252,26 +270,19 @@ vvarAdjust loc ttf glyphIndex =
         Nothing -> (0, 0, 0)
     _ -> (0, 0, 0)
 
-emptyBitmap :: MSDFBitmap
-emptyBitmap = MSDFBitmap
+emptyBitmap :: BitmapFormat -> MSDFBitmap
+emptyBitmap fmt = MSDFBitmap
   { width = 0
   , height = 0
   , offsetX = 0
   , offsetY = 0
+  , format = fmt
   , pixels = listArray (0, -1) []
   }
 
 normalizeContours :: [[Point]] -> [[Point]]
 normalizeContours contours =
-  let cleaned = map normalizeContourRaw (filter (not . null) contours)
-      infos = map contourInfo cleaned
-      orient (idx, info) =
-        let depth = contourDepth idx info infos
-            desiredCCW = even depth
-            area = signedArea info.contour
-            isCCW = area >= 0
-        in if isCCW == desiredCCW then info.contour else reverseContour info.contour
-  in map orient (zip [0..] infos)
+  map normalizeContourRaw (filter (not . null) contours)
 
 normalizeContourRaw :: [Point] -> [Point]
 normalizeContourRaw pts =
@@ -283,61 +294,6 @@ normalizeContourRaw pts =
              xs = first : rest
              xs' = if samePoint first last' then init xs else xs
          in xs' ++ [first]
-
-data ContourInfo = ContourInfo
-  { contour :: [Point]
-  , samplePoint :: Vec2
-  , bbox :: BBox
-  , segments :: [LineSeg]
-  }
-
-contourInfo :: [Point] -> ContourInfo
-contourInfo pts =
-  let pts' = if null pts then [] else pts
-      (sx, sy) = case pts' of
-        (p:_) -> (p.x, p.y)
-        [] -> (0, 0)
-      bbox' = contourBBox pts'
-      segments' = contourSegments pts'
-  in ContourInfo
-     { contour = pts'
-     , samplePoint = (sx, sy)
-     , bbox = bbox'
-     , segments = segments'
-     }
-
-contourBBox :: [Point] -> BBox
-contourBBox pts =
-  case pts of
-    [] -> BBox 0 0 0 0
-    _ ->
-      let xs = map (\p -> p.x) pts
-          ys = map (\p -> p.y) pts
-      in BBox
-         { xMin = minimum xs
-         , yMin = minimum ys
-         , xMax = maximum xs
-         , yMax = maximum ys
-         }
-
-contourSegments :: [Point] -> [LineSeg]
-contourSegments pts =
-  let edges = contourToEdges pts
-  in concatMap (flattenEdge 0.25) edges
-
-contourDepth :: Int -> ContourInfo -> [ContourInfo] -> Int
-contourDepth idx info infos =
-  length
-    [ ()
-    | (j, other) <- zip [0..] infos
-    , j /= idx
-    , bboxContains other.bbox info.samplePoint
-    , windingNumber other.segments info.samplePoint /= 0
-    ]
-
-bboxContains :: BBox -> Vec2 -> Bool
-bboxContains bb (px', py') =
-  px' >= bb.xMin && px' <= bb.xMax && py' >= bb.yMin && py' <= bb.yMax
 
 dropDuplicatePoints :: [Point] -> [Point]
 dropDuplicatePoints [] = []
@@ -354,22 +310,6 @@ samePoint a b = a.x == b.x && a.y == b.y && a.on == b.on
 lastPoint :: Point -> [Point] -> Point
 lastPoint prev [] = prev
 lastPoint _ (x:xs) = lastPoint x xs
-
-reverseContour :: [Point] -> [Point]
-reverseContour pts =
-  case reverse pts of
-    [] -> []
-    xs -> xs
-
-signedArea :: [Point] -> Double
-signedArea pts =
-  case pts of
-    [] -> 0
-    [_] -> 0
-    _ ->
-      let pairs = zip pts (drop 1 pts)
-          sumCross = foldl' (\acc (a,b) -> acc + (a.x * b.y - b.x * a.y)) 0 pairs
-      in 0.5 * sumCross
 
 safeIndex :: Array Int Int -> Int -> Int
 safeIndex arr i =
@@ -391,34 +331,102 @@ splitContoursEdges contours scale =
   let toEdgeList pts = map (scaleEdge scale) (contourToEdges pts)
   in map toEdgeList contours
 
-colorContourEdges :: Double -> [Edge] -> [(Int, Edge)]
-colorContourEdges _ [] = []
-colorContourEdges cornerThreshold edges =
+colorContourEdges :: Double -> Double -> [Edge] -> [(Int, Edge)]
+colorContourEdges _ _ [] = []
+colorContourEdges cornerThreshold conflictThreshold edges =
   let n = length edges
-      joinCorners = [ isCorner (edges !! i) (edges !! ((i + 1) `mod` n)) cornerThreshold
-                    | i <- [0 .. n - 1] ]
+      joinCorners =
+        [ isCorner (edges !! i) (edges !! ((i + 1) `mod` n)) cornerThreshold
+        | i <- [0 .. n - 1]
+        ]
       cornerStarts = [ (i + 1) `mod` n | i <- [0 .. n - 1], joinCorners !! i ]
-  in if null cornerStarts
-     then resolveEdgeColorConflicts (zipWith (\i e -> (i `mod` 3, e)) [0..] edges)
-     else
-       let starts = uniqueSorted cornerStarts
-           segments = buildSegments edges starts
-           coloredSegments = zipWith (\c seg -> map (\e -> (c, e)) seg) (cycle [0,1,2]) segments
-       in resolveEdgeColorConflicts (concat coloredSegments)
+      starts = ensureMinSegments edges cornerStarts
+      segments = buildSegments edges starts
+      coloredSegments = zipWith (\c seg -> map (\e -> (c, e)) seg) (cycle [0,1,2]) segments
+  in resolveEdgeColorConflicts conflictThreshold (concat coloredSegments)
 
 isCorner :: Edge -> Edge -> Double -> Bool
-isCorner e1 e2 threshold =
+isCorner e1 e2 thresholdDeg =
   let (x1, y1) = edgeEndDir e1
       (x2, y2) = edgeStartDir e2
       dotp = x1 * x2 + y1 * y2
       len1 = sqrt (x1 * x1 + y1 * y1)
       len2 = sqrt (x2 * x2 + y2 * y2)
+      threshold = thresholdDeg * pi / 180
   in if len1 == 0 || len2 == 0
      then False
      else
        let cosang = max (-1) (min 1 (dotp / (len1 * len2)))
            ang = acos cosang
-       in ang < threshold
+       in ang > threshold
+
+ensureMinSegments :: [Edge] -> [Int] -> [Int]
+ensureMinSegments edges starts =
+  let n = length edges
+      base = uniqueSorted starts
+      minSegs = 3
+      anchor = case base of
+        (a:_) -> a
+        [] -> 0
+      merged =
+        if length base >= minSegs
+        then base
+        else uniqueSorted (base ++ splitByLengthFrom edges anchor minSegs)
+  in if n == 0
+     then []
+     else if length merged >= minSegs
+          then merged
+          else uniqueSorted (base ++ splitByIndexFrom anchor n minSegs)
+
+splitByLengthFrom :: [Edge] -> Int -> Int -> [Int]
+splitByLengthFrom edges anchor segments =
+  let n = length edges
+  in if n == 0 || segments <= 0
+     then []
+     else
+       let idxs = indicesFrom anchor n
+           lens = map (\i -> edgeLengthApprox (edges !! i)) idxs
+           total = sum lens
+       in if total <= 1e-6
+          then splitByIndexFrom anchor n segments
+          else
+            let step = total / fromIntegral segments
+                thresholds = [ step * fromIntegral k | k <- [1 .. segments - 1] ]
+                (hits, _cum, _ts) = foldl' accumThresholds ([], 0.0, thresholds) (zip idxs lens)
+            in uniqueSorted (anchor : hits)
+
+accumThresholds :: ([Int], Double, [Double]) -> (Int, Double) -> ([Int], Double, [Double])
+accumThresholds (acc, cum, ts) (idx, len) =
+  let cum' = cum + len
+      (hit, rest) = span (<= cum') ts
+      acc' = acc ++ replicate (length hit) idx
+  in (acc', cum', rest)
+
+splitByIndexFrom :: Int -> Int -> Int -> [Int]
+splitByIndexFrom anchor n segments =
+  let step = max 1 (n `div` segments)
+  in uniqueSorted
+       [ (anchor + i * step) `mod` n
+       | i <- [0 .. segments - 1]
+       ]
+
+indicesFrom :: Int -> Int -> [Int]
+indicesFrom anchor n =
+  take n (iterate (\i -> (i + 1) `mod` n) anchor)
+
+edgeLengthApprox :: Edge -> Double
+edgeLengthApprox (EdgeLine (x0, y0) (x1, y1)) =
+  let dx = x1 - x0
+      dy = y1 - y0
+  in sqrt (dx * dx + dy * dy)
+edgeLengthApprox (EdgeQuad (x0, y0) (x1, y1) (x2, y2)) =
+  let dx01 = x1 - x0
+      dy01 = y1 - y0
+      dx12 = x2 - x1
+      dy12 = y2 - y1
+      d01 = sqrt (dx01 * dx01 + dy01 * dy01)
+      d12 = sqrt (dx12 * dx12 + dy12 * dy12)
+  in d01 + d12
 
 uniqueSorted :: [Int] -> [Int]
 uniqueSorted xs =
@@ -452,8 +460,15 @@ splitColoredEdges colored =
   let edgesByColor c = [ e | (col,e) <- colored, col == c ]
   in (edgesByColor 0, edgesByColor 1, edgesByColor 2)
 
-resolveEdgeColorConflicts :: [(Int, Edge)] -> [(Int, Edge)]
-resolveEdgeColorConflicts colored =
+resolveEdgeColorConflicts :: Double -> [(Int, Edge)] -> [(Int, Edge)]
+resolveEdgeColorConflicts conflictThreshold colored =
+  let base = resolveAdjacentConflicts colored
+  in if conflictThreshold <= 0 || length base <= 1
+     then base
+     else recolorConflicts conflictThreshold base
+
+resolveAdjacentConflicts :: [(Int, Edge)] -> [(Int, Edge)]
+resolveAdjacentConflicts colored =
   let n = length colored
   in if n <= 1
      then colored
@@ -474,8 +489,77 @@ chooseColor cur prev next =
     (c:_) -> c
     [] -> (cur + 1) `mod` 3
 
--- | Line segment representation.
-type LineSeg = (Vec2, Vec2)
+recolorConflicts :: Double -> [(Int, Edge)] -> [(Int, Edge)]
+recolorConflicts conflictThreshold colored =
+  let passes = 5 :: Int
+      go i edges =
+        if i >= passes
+        then edges
+        else
+          let edges' = recolorOnce edges
+          in if edges' == edges then edges else go (i + 1) edges'
+  in go 0 colored
+  where
+    recolorOnce edges =
+      let (edges0, edges1, edges2) = splitColoredEdges edges
+          allEdges = edges0 ++ edges1 ++ edges2
+          (originX, originY, width, height) = gridForEdges allEdges
+          cellSize = max 1 conflictThreshold
+          idx0 = buildEdgeIndex cellSize originX originY width height edges0
+          idx1 = buildEdgeIndex cellSize originX originY width height edges1
+          idx2 = buildEdgeIndex cellSize originX originY width height edges2
+          distTo idx e = minimum (map (minDistanceIndexed idx) (edgeSamplePoints e))
+          d0 e = distTo idx0 e
+          d1 e = distTo idx1 e
+          d2 e = distTo idx2 e
+          chooseConflictColor c e =
+            case c of
+              0 ->
+                let dA = d1 e
+                    dB = d2 e
+                in if dA <= dB then 1 else 2
+              1 ->
+                let dA = d0 e
+                    dB = d2 e
+                in if dA <= dB then 0 else 2
+              _ ->
+                let dA = d0 e
+                    dB = d1 e
+                in if dA <= dB then 0 else 1
+      in
+      [ let conflict =
+              case c of
+                0 -> d1 e < conflictThreshold && d2 e < conflictThreshold
+                1 -> d0 e < conflictThreshold && d2 e < conflictThreshold
+                _ -> d0 e < conflictThreshold && d1 e < conflictThreshold
+        in if conflict
+           then (chooseConflictColor c e, e)
+           else (c, e)
+      | (c, e) <- edges
+      ]
+
+gridForEdges :: [Edge] -> (Double, Double, Int, Int)
+gridForEdges edges =
+  case edges of
+    [] -> (0, 0, 1, 1)
+    (e:es) ->
+      let bb0 = edgeBBox e
+          bb = foldl' (\acc ed -> bboxUnion acc (edgeBBox ed)) bb0 es
+          w = max 1 (ceiling (bb.xMax - bb.xMin) + 1)
+          h = max 1 (ceiling (bb.yMax - bb.yMin) + 1)
+      in (bb.xMin, bb.yMin, w, h)
+
+edgeSamplePoints :: Edge -> [Vec2]
+edgeSamplePoints e =
+  case e of
+    EdgeLine _ _ -> map (edgePointAt e) [0.25, 0.5, 0.75]
+    EdgeQuad _ _ _ -> map (edgePointAt e) [0.2, 0.5, 0.8]
+
+edgePointAt :: Edge -> Double -> Vec2
+edgePointAt (EdgeLine (x0, y0) (x1, y1)) t =
+  (x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+edgePointAt (EdgeQuad p0 p1 p2) t =
+  bezier p0 p1 p2 t
 
 data EdgeIndex = EdgeIndex
   { cellSize :: Double
@@ -516,6 +600,70 @@ buildEdgeIndex cellSize' originX originY width height edgesList =
        , edges = edgesArr
        }
 
+-- | Line segment representation for winding tests.
+type LineSeg = (Vec2, Vec2)
+
+windingNumber :: [LineSeg] -> Vec2 -> Int
+windingNumber segs (px', py') =
+  foldl' step 0 segs
+  where
+    step wn ((x0, y0), (x1, y1))
+      | y0 <= py' =
+          if y1 > py' && isLeft (x0, y0) (x1, y1) (px', py') > 0
+          then wn + 1
+          else wn
+      | y1 <= py' =
+          if isLeft (x0, y0) (x1, y1) (px', py') < 0
+          then wn - 1
+          else wn
+      | otherwise = wn
+
+isLeft :: Vec2 -> Vec2 -> Vec2 -> Double
+isLeft (x0,y0) (x1,y1) (px',py') =
+  (x1 - x0) * (py' - y0) - (px' - x0) * (y1 - y0)
+
+filterBoundaryEdges :: Double -> [LineSeg] -> [Edge] -> [Edge]
+filterBoundaryEdges eps segs = filter (edgeIsBoundary eps segs)
+
+edgeIsBoundary :: Double -> [LineSeg] -> Edge -> Bool
+edgeIsBoundary eps segs edge =
+  let ts = case edge of
+        EdgeLine _ _ -> [0.5]
+        EdgeQuad _ _ _ -> [0.2, 0.5, 0.8]
+      samples = [ sample t | t <- ts ]
+      valid = [ v | Just v <- samples ]
+  in case valid of
+       [] -> True
+       _ -> or valid
+  where
+    sample t =
+      case unitPerp (edgeTangentAt edge t) of
+        Nothing -> Nothing
+        Just n ->
+          let p = edgePointAt edge t
+              pOut = vecAdd p (vecScale eps n)
+              pIn = vecSub p (vecScale eps n)
+              insideOut = windingNumber segs pOut /= 0
+              insideIn = windingNumber segs pIn /= 0
+          in Just (insideOut /= insideIn)
+
+edgeTangentAt :: Edge -> Double -> Vec2
+edgeTangentAt (EdgeLine a b) _ = vecSub b a
+edgeTangentAt (EdgeQuad p0 p1 p2) t =
+  let mt = 1 - t
+      v0 = vecScale mt (vecSub p1 p0)
+      v1 = vecScale t (vecSub p2 p1)
+  in vecScale 2 (vecAdd v0 v1)
+
+unitPerp :: Vec2 -> Maybe Vec2
+unitPerp (x0, y0) =
+  let nx = -y0
+      ny = x0
+      len = sqrt (nx * nx + ny * ny)
+  in if len < 1e-12
+     then Nothing
+     else Just (nx / len, ny / len)
+
 edgeBBox :: Edge -> BBox
 edgeBBox (EdgeLine (x0, y0) (x1, y1)) =
   BBox
@@ -525,12 +673,30 @@ edgeBBox (EdgeLine (x0, y0) (x1, y1)) =
     , yMax = max y0 y1
     }
 edgeBBox (EdgeQuad (x0, y0) (x1, y1) (x2, y2)) =
-  BBox
-    { xMin = minimum [x0, x1, x2]
-    , yMin = minimum [y0, y1, y2]
-    , xMax = maximum [x0, x1, x2]
-    , yMax = maximum [y0, y1, y2]
-    }
+  let xs = [x0, x1, x2] ++ quadExtrema1D x0 x1 x2
+      ys = [y0, y1, y2] ++ quadExtrema1D y0 y1 y2
+  in BBox
+      { xMin = minimum xs
+      , yMin = minimum ys
+      , xMax = maximum xs
+      , yMax = maximum ys
+      }
+
+quadExtrema1D :: Double -> Double -> Double -> [Double]
+quadExtrema1D a0 a1 a2 =
+  let denom = a0 - 2 * a1 + a2
+  in if abs denom < 1e-12
+     then []
+     else
+       let t = (a0 - a1) / denom
+       in if t > 0 && t < 1
+          then [quadAt1D a0 a1 a2 t]
+          else []
+
+quadAt1D :: Double -> Double -> Double -> Double -> Double
+quadAt1D a0 a1 a2 t =
+  let mt = 1 - t
+  in mt * mt * a0 + 2 * mt * t * a1 + t * t * a2
 
 toCell :: Double -> Double -> Double -> Int
 toCell origin size v =
@@ -592,54 +758,261 @@ pointCell idx (px', py') =
       cy = clamp 0 (idx.gridH - 1) (toCell idx.originY idx.cellSize py')
   in (cx, cy)
 
-renderBitmap :: Int -> Int -> Double -> Double -> Int -> Double -> ([Edge], [Edge], [Edge]) -> [LineSeg] -> UArray Int Word8
-renderBitmap width height offsetX offsetY range correction (edgesR, edgesG, edgesB) allLines =
+renderBitmap :: BitmapFormat -> Double -> Int -> Int -> Double -> Double -> Int -> Double -> Double -> ([Edge], [Edge], [Edge]) -> [LineSeg] -> UArray Int Word8
+renderBitmap fmt speckleThreshold width height offsetX offsetY range correction conflictThreshold (edgesR, edgesG, edgesB) segs =
   let edgesAll = edgesR ++ edgesG ++ edgesB
       cellSz = max 4 (fromIntegral range)
       idxR = buildEdgeIndex cellSz offsetX offsetY width height edgesR
       idxG = buildEdgeIndex cellSz offsetX offsetY width height edgesG
       idxB = buildEdgeIndex cellSz offsetX offsetY width height edgesB
       idxAll = buildEdgeIndex cellSz offsetX offsetY width height edgesAll
-      pixels = [ channelValue
-               | y <- [0 .. height - 1]
-               , x <- [0 .. width - 1]
-               , let p = (offsetX + fromIntegral x + 0.5, offsetY + fromIntegral y + 0.5)
-                     inside = windingNumber allLines p /= 0
-                     dR0 = signedDistance inside idxR p
-                     dG0 = signedDistance inside idxG p
-                     dB0 = signedDistance inside idxB p
-                     dAll = signedDistance inside idxAll p
-                     sd = median3 dR0 dG0 dB0
-                     spread = max (abs (dR0 - dG0)) (max (abs (dR0 - dB0)) (abs (dG0 - dB0)))
-                     (dR, dG, dB) =
-                       if correction > 0 && (abs (sd - dAll) > correction || spread > correction)
-                       then (dAll, dAll, dAll)
-                       else (dR0, dG0, dB0)
-               , channelValue <- [ distanceToByte range dR
-                                 , distanceToByte range dG
-                                 , distanceToByte range dB ]
-               ]
-  in listArray (0, length pixels - 1) pixels
+      n = width * height
+      channels = bitmapChannels fmt
+  in runST (do
+       dRArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+       dGArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+       dBArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+       dAllArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+       (dAllArr0, insideLow) <-
+         if fmt == BitmapMTSDF
+         then do
+           (dAll, insideArr) <- trueSignedDistanceSupersampled width height offsetX offsetY segs range 8
+           pure (Just dAll, Just insideArr)
+         else pure (Nothing, Nothing)
+       forM_ [0 .. height - 1] $ \y -> do
+         forM_ [0 .. width - 1] $ \x -> do
+           let i = y * width + x
+               px' = offsetX + fromIntegral x + 0.5
+               py' = offsetY + fromIntegral y + 0.5 + 1e-6
+               p = (px', py')
+           inside <- case insideLow of
+             Just arr -> readArray arr i
+             Nothing -> pure (windingNumber segs p /= 0)
+           let sign = if inside then 1.0 else -1.0
+               dR0 = sign * minDistanceIndexed idxR p
+               dG0 = sign * minDistanceIndexed idxG p
+               dB0 = sign * minDistanceIndexed idxB p
+               dAll0 = sign * minDistanceIndexed idxAll p
+           writeArray dRArr i dR0
+           writeArray dGArr i dG0
+           writeArray dBArr i dB0
+           writeArray dAllArr i dAll0
+       let neighbors8 =
+             [ (-1, -1), (0, -1), (1, -1)
+             , (-1,  0),          (1,  0)
+             , (-1,  1), (0,  1), (1,  1)
+             ]
+       dAllArr0' <- case dAllArr0 of
+         Just arr -> pure arr
+         Nothing -> pure dAllArr
+       dAllArr' <- if speckleThreshold > 0
+        then do
+          let passes = 2 :: Int
+          let pass src = do
+                dst <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+                forM_ [0 .. height - 1] $ \y -> do
+                  forM_ [0 .. width - 1] $ \x -> do
+                    let i = y * width + x
+                    d <- readArray src i
+                    let sign :: Int
+                        sign = if d < 0 then -1 else 1
+                    (negCount, posCount, total) <-
+                      foldM
+                        (\(nC, pC, tC) (dx, dy) ->
+                          let nx = x + dx
+                              ny = y + dy
+                          in if nx < 0 || nx >= width || ny < 0 || ny >= height
+                             then pure (nC, pC, tC)
+                             else do
+                               let ni = ny * width + nx
+                               nd <- readArray src ni
+                               let s :: Int
+                                   s = if nd < 0 then -1 else 1
+                               pure (if s < 0 then (nC + 1, pC, tC + 1) else (nC, pC + 1, tC + 1))
+                        ) (0 :: Int, 0 :: Int, 0 :: Int) neighbors8
+                    let majoritySign
+                          | negCount >= 5 = -1
+                          | posCount >= 5 = 1
+                          | otherwise = sign
+                        d' =
+                          if total >= 5 && majoritySign /= sign && abs d < speckleThreshold
+                          then fromIntegral majoritySign * abs d
+                          else d
+                    writeArray dst i d'
+                pure dst
+          let loop i src =
+                if i <= 0
+                then pure src
+                else do
+                  dst <- pass src
+                  loop (i - 1) dst
+          loop passes dAllArr0'
+        else pure dAllArr0'
+       dAllArr'' <- pure dAllArr'
+       out <- newArray (0, n * channels - 1) 0 :: ST s (STUArray s Int Word8)
+       forM_ [0 .. height - 1] $ \y -> do
+         forM_ [0 .. width - 1] $ \x -> do
+           let i = y * width + x
+               base = i * channels
+           dR0 <- readArray dRArr i
+           dG0 <- readArray dGArr i
+           dB0 <- readArray dBArr i
+           dAll <- readArray dAllArr'' i
+           let sd = median3 dR0 dG0 dB0
+               spread = max (abs (dR0 - dG0)) (max (abs (dR0 - dB0)) (abs (dG0 - dB0)))
+               sameSign = sd * dAll >= 0
+               conflict =
+                 conflictThreshold > 0 &&
+                 ( (abs dR0 < conflictThreshold && abs dG0 < conflictThreshold)
+                || (abs dR0 < conflictThreshold && abs dB0 < conflictThreshold)
+                || (abs dG0 < conflictThreshold && abs dB0 < conflictThreshold)
+                 )
+               forceAll = conflict || (correction > 0 && (not sameSign || abs (sd - dAll) > correction || spread > correction))
+               (dR, dG, dB) =
+                 if forceAll
+                 then (dAll, dAll, dAll)
+                 else (dR0, dG0, dB0)
+               r = distanceToByte range dR
+               g = distanceToByte range dG
+               b = distanceToByte range dB
+           case fmt of
+             BitmapMSDF -> do
+               writeArray out base r
+               writeArray out (base + 1) g
+               writeArray out (base + 2) b
+             BitmapMTSDF -> do
+               writeArray out base r
+               writeArray out (base + 1) g
+               writeArray out (base + 2) b
+               writeArray out (base + 3) (distanceToByte range dAll)
+       freeze out)
+
+trueSignedDistanceSupersampled :: Int -> Int -> Double -> Double -> [LineSeg] -> Int -> Int -> ST s (STUArray s Int Double, STUArray s Int Bool)
+trueSignedDistanceSupersampled width height offsetX offsetY segs range ss = do
+  let pad = max 2 (range + 1)
+      hiW = (width + 2 * pad) * ss
+      hiH = (height + 2 * pad) * ss
+      hiN = hiW * hiH
+      inf = 1e20 :: Double
+      offX = offsetX - fromIntegral pad
+      offY = offsetY - fromIntegral pad
+  hiMask <- newArray (0, hiN - 1) False :: ST s (STUArray s Int Bool)
+  forM_ [0 .. hiH - 1] $ \hy -> do
+    forM_ [0 .. hiW - 1] $ \hx -> do
+      let px' = offX + (fromIntegral hx + 0.5) / fromIntegral ss + 1e-6
+          py' = offY + (fromIntegral hy + 0.5) / fromIntegral ss + 1e-6
+          inside = windingNumber segs (px', py') /= 0
+          i = hy * hiW + hx
+      writeArray hiMask i inside
+  let fOut i = do
+        inside <- readArray hiMask i
+        pure (if inside then inf else 0)
+      fIn i = do
+        inside <- readArray hiMask i
+        pure (if inside then 0 else inf)
+  distOut <- distanceTransform2D hiW hiH fOut
+  distIn <- distanceTransform2D hiW hiH fIn
+  let n = width * height
+  out <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+  insideLow <- newArray (0, n - 1) False :: ST s (STUArray s Int Bool)
+  let blockArea = ss * ss
+      insideThreshold = (blockArea `div` 2) + 1
+  forM_ [0 .. height - 1] $ \y -> do
+    forM_ [0 .. width - 1] $ \x -> do
+      let baseX = (x + pad) * ss
+          baseY = (y + pad) * ss
+          hiCenter = (baseY + ss `div` 2) * hiW + (baseX + ss `div` 2)
+          i = y * width + x
+      insideCount <- foldM
+        (\acc dy -> do
+          let row = (baseY + dy) * hiW
+          foldM
+            (\acc2 dx -> do
+              inside <- readArray hiMask (row + baseX + dx)
+              pure (acc2 + if inside then 1 else 0)
+            ) acc [0 .. ss - 1]
+        ) (0 :: Int) [0 .. ss - 1]
+      let inside = insideCount >= insideThreshold
+      dOut <- readArray distOut hiCenter
+      dIn <- readArray distIn hiCenter
+      let dAbs = sqrt (max dOut dIn)
+          d = (if inside then dAbs else -dAbs) / fromIntegral ss
+      writeArray insideLow i inside
+      writeArray out i d
+  pure (out, insideLow)
+
+distanceTransform2D :: Int -> Int -> (Int -> ST s Double) -> ST s (STUArray s Int Double)
+distanceTransform2D width height f = do
+  let n = width * height
+  tmp <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+  out <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+  forM_ [0 .. height - 1] $ \y -> do
+    let fRow x = f (y * width + x)
+    dRow <- distanceTransform1DST width fRow
+    forM_ [0 .. width - 1] $ \x -> do
+      d <- readArray dRow x
+      writeArray tmp (y * width + x) d
+  forM_ [0 .. width - 1] $ \x -> do
+    let fCol y = readArray tmp (y * width + x)
+    dCol <- distanceTransform1DST height fCol
+    forM_ [0 .. height - 1] $ \y -> do
+      d <- readArray dCol y
+      writeArray out (y * width + x) d
+  pure out
+
+distanceTransform1DST :: Int -> (Int -> ST s Double) -> ST s (STUArray s Int Double)
+distanceTransform1DST n f = do
+  v <- newArray (0, n - 1) 0 :: ST s (STUArray s Int Int)
+  z <- newArray (0, n) 0.0 :: ST s (STUArray s Int Double)
+  d <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+  let sq x = fromIntegral (x * x) :: Double
+      findK k s q = do
+        zk <- readArray z k
+        if s <= zk
+          then do
+            let k' = k - 1
+            vk' <- readArray v k'
+            fq <- f q
+            fvk <- f vk'
+            let s' = ((fq + sq q) - (fvk + sq vk')) / (2 * fromIntegral (q - vk'))
+            findK k' s' q
+          else pure (k, s)
+      advanceK kRef q = do
+        k <- readSTRef kRef
+        zk1 <- readArray z (k + 1)
+        if zk1 < fromIntegral q
+          then do
+            let k' = k + 1
+            writeSTRef kRef k'
+            advanceK kRef q
+          else pure k
+  writeArray v 0 0
+  writeArray z 0 (negate (1 / 0))
+  writeArray z 1 (1 / 0)
+  kRef <- newSTRef 0
+  forM_ [1 .. n - 1] $ \q -> do
+    k <- readSTRef kRef
+    vk <- readArray v k
+    fq <- f q
+    fvk <- f vk
+    let s0 = ((fq + sq q) - (fvk + sq vk)) / (2 * fromIntegral (q - vk))
+    (k', s') <- findK k s0 q
+    let k'' = k' + 1
+    writeArray v k'' q
+    writeArray z k'' s'
+    writeArray z (k'' + 1) (1 / 0)
+    writeSTRef kRef k''
+  kRef2 <- newSTRef 0
+  forM_ [0 .. n - 1] $ \q -> do
+    k <- advanceK kRef2 q
+    vk <- readArray v k
+    fvk <- f vk
+    let val = (fromIntegral (q - vk) ^ (2 :: Int)) + fvk
+    writeArray d q val
+  pure d
 
 median3 :: Double -> Double -> Double -> Double
 median3 a b c = max (min a b) (min (max a b) c)
-
-signedDistance :: Bool -> EdgeIndex -> Vec2 -> Double
-signedDistance inside idx p =
-  let dist = minDistanceIndexed idx p
-  in if inside then -dist else dist
-
-windingNumber :: [LineSeg] -> Vec2 -> Int
-windingNumber segs (px', py') =
-  foldl' (\wn ((x0,y0),(x1,y1)) ->
-    if y0 <= py'
-    then if y1 > py' && isLeft (x0,y0) (x1,y1) (px',py') > 0 then wn + 1 else wn
-    else if y1 <= py' && isLeft (x0,y0) (x1,y1) (px',py') < 0 then wn - 1 else wn
-  ) 0 segs
-
-isLeft :: Vec2 -> Vec2 -> Vec2 -> Double
-isLeft (x0,y0) (x1,y1) (px',py') =
-  (x1 - x0) * (py' - y0) - (px' - x0) * (y1 - y0)
 
 distanceSqPointLine :: Vec2 -> Vec2 -> Vec2 -> Double
 distanceSqPointLine (px', py') (x0, y0) (x1, y1) =

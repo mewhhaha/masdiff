@@ -1,12 +1,13 @@
-# masdiff (cringe vibes)
+# ma(t)sdiff (cringe vibes)
 
-ok so this is a cozy pure Haskell MSDF generator for TrueType fonts with terminal-gremlin energy. it parses `glyf/loca/cmap` outlines and produces per‑glyph MSDF bitmaps plus metrics and kerning (legacy `kern` and GPOS pair adjustments). yes, it’s real.
+ok so this is a cozy pure Haskell MSDF/MTSDF generator for TrueType fonts with terminal-gremlin energy. it parses `glyf/loca/cmap` outlines and produces per‑glyph MSDF (RGB) or MTSDF (RGBA, alpha = true SDF) bitmaps plus metrics and kerning (legacy `kern` and GPOS pair adjustments). yes, it’s real.
 
 ## Features (cringe but real)
 
 - Pure Haskell pipeline (no external CLI/tools), comfy and deterministic (i promise).
 - TrueType outline parsing (simple + composite glyphs).
 - MSDF raster generation per glyph (packed RGB bytes).
+- MTSDF output mode (RGBA, alpha channel = true signed distance).
 - Kerning support via `kern` and GPOS pair adjustment (lookup type 2).
 - Vertical metrics via `vhea/vmtx` when present.
 - Variable font support (fvar/avar/gvar + HVAR/VVAR/MVAR for metrics).
@@ -15,7 +16,7 @@ ok so this is a cozy pure Haskell MSDF generator for TrueType fonts with termina
 ## Usage (pls)
 
 ```haskell
-import MSDF.Generated (generateMSDF, generateMSDFOrThrow)
+import MSDF.Generated (generateMSDF, generateMSDFOrThrow, generateMTSDFOrThrow)
 import MSDF.TTF.Parser (ParseError(..))
 
 main :: IO ()
@@ -29,6 +30,11 @@ main = do
 main = do
   atlas <- generateMSDFOrThrow "path/to/font.ttf"
   print (atlas.fontName)
+
+-- MTSDF (RGBA, alpha = true SDF):
+main = do
+  atlas <- generateMTSDFOrThrow "path/to/font.ttf"
+  print (atlas.fontName)
 ```
 
 ### Custom config
@@ -37,6 +43,7 @@ main = do
 import MSDF.Generated (generateMSDFWithConfig)
 import MSDF.MSDF (defaultMSDFConfig, GlyphSet(..))
 import qualified MSDF.MSDF as MSDF
+import MSDF.Types (BitmapFormat(..))
 import MSDF.TTF.Parser (ParseError(..))
 
 main :: IO ()
@@ -48,6 +55,7 @@ main = do
         , MSDF.variations = [("wght", 700)] -- optional: variable font axes
         , MSDF.packAtlas = True
         , MSDF.atlasPadding = 1
+        , MSDF.outputFormat = BitmapMSDF -- or BitmapMTSDF
         }
   result <- generateMSDFWithConfig cfg "path/to/font.ttf"
   case result of
@@ -122,10 +130,10 @@ drawQuad((x0, y0, x1, y1), (u0, v0, u1, v1))
 Sampler guidance is available in `MSDF.Render.msdfSamplerHints` and coordinate
 metadata is exposed via `atlasOrigin`, `uvOrigin`, and `glyphQuadSpace`.
 
-## Pseudocode: rendering MSDF glyphs (pls dont mess it up)
+## Pseudocode: rendering MSDF/MTSDF glyphs (pls dont mess it up)
 
-This is a high-level sketch of how to use the generated MSDF data to render text.
-It assumes you have a shader that decodes MSDF and outputs alpha.
+This is a high-level sketch of how to use the generated MSDF/MTSDF data to render text.
+It assumes you have a shader that decodes MSDF (or MTSDF alpha) and outputs alpha.
 Helper utilities are available in `MSDF.Render` (`glyphQuad`, `glyphUV`, `pixelRange`).
 If you render the same glyphs at multiple sizes, use `MSDF.MSDF.prepareGlyphCache`
 and `renderGlyphMSDFCached` to reuse parsed outlines.
@@ -135,12 +143,13 @@ atlas = generateMSDFOrThrow("path/to/font.ttf")
 
 -- Build a glyph texture for each glyph (or use packed atlas).
 if atlas.atlas != None:
-  uploadTexture("atlas", atlas.atlas.width, atlas.atlas.height, atlas.atlas.pixelsRGB)
+  -- atlas.atlas.format is BitmapMSDF (RGB) or BitmapMTSDF (RGBA)
+  uploadTexture("atlas", atlas.atlas.width, atlas.atlas.height, atlas.atlas.pixels)
 else:
   for glyph in atlas.glyphs:
     if glyph.bitmap.width == 0:
       continue
-    uploadTexture(glyph.index, glyph.bitmap.width, glyph.bitmap.height, glyph.bitmap.pixelsRGB)
+    uploadTexture(glyph.index, glyph.bitmap.width, glyph.bitmap.height, glyph.bitmap.pixels)
 
 -- Layout text.
 penX = 0
@@ -179,7 +188,7 @@ MSDF shader idea (pseudocode):
 
 ```text
 sample = texture(msdfTex, uv).rgb
-sd = 0.5 - median(sample.r, sample.g, sample.b)
+sd = median(sample.r, sample.g, sample.b) - 0.5
 alpha = clamp(sd * pxRange + 0.5, 0, 1)
 output = vec4(textColor.rgb, textColor.a * alpha)
 ```
@@ -194,6 +203,9 @@ When rendering MSDF glyphs, the shader is expected to:
 - Use the **median** of RGB channels to get the signed distance.
 - Convert distance to alpha with a smooth range to avoid hard edges.
 
+If you generated **MTSDF** (`BitmapMTSDF`), the alpha channel already stores the
+true signed distance. In that case, use `sample.a` instead of the RGB median.
+
 Example GLSL-like fragment shader:
 
 ```glsl
@@ -207,10 +219,19 @@ float median(float r, float g, float b) {
 
 void main() {
   vec3 sample = texture(msdfTex, vUV).rgb;
-  float sd = 0.5 - median(sample.r, sample.g, sample.b);
+  float sd = median(sample.r, sample.g, sample.b) - 0.5;
   float alpha = clamp(sd * pxRange + 0.5, 0.0, 1.0);
   outColor = vec4(textColor.rgb, textColor.a * alpha);
 }
+```
+
+MTSDF variation (alpha channel is the true SDF):
+
+```glsl
+vec4 sample = texture(msdfTex, vUV);
+float sd = sample.a - 0.5;
+float alpha = clamp(sd * pxRange + 0.5, 0.0, 1.0);
+outColor = vec4(textColor.rgb, textColor.a * alpha);
 ```
 
 Notes:
@@ -233,7 +254,7 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 @fragment
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
-  let sd = 0.5 - median(sample.r, sample.g, sample.b);
+  let sd = median(sample.r, sample.g, sample.b) - 0.5;
   let dist = sd * uPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
@@ -347,7 +368,7 @@ fn vs_main(input: VSIn) -> VSOut {
 
 struct FragUniforms {
   textColor : vec4<f32>;
-  params : vec4<f32>; // params.x = pxRange
+  params : vec4<f32>; // params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF)
 };
 
 @group(2) @binding(0) var msdfTex : texture_2d<f32>;
@@ -360,8 +381,11 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 
 @fragment
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
-  let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
-  let sd = 0.5 - median(sample.r, sample.g, sample.b);
+  let sample = textureSample(msdfTex, msdfSampler, vUV);
+  var sd = median(sample.r, sample.g, sample.b) - 0.5;
+  if (uFrag.params.y > 0.5) {
+    sd = sample.a - 0.5;
+  }
   let alpha = clamp(sd * uFrag.params.x + 0.5, 0.0, 1.0);
   return vec4<f32>(uFrag.textColor.rgb, uFrag.textColor.a * alpha);
 }
@@ -377,7 +401,7 @@ typedef struct Vertex {
 
 typedef struct FragUniforms {
   float textColor[4];
-  float params[4]; /* params.x = pxRange */
+  float params[4]; /* params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF) */
 } FragUniforms;
 
 SDL_GPUDevice *gpu = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, NULL);
@@ -486,7 +510,7 @@ SDL_GPUBufferBinding vbind = { .buffer = vertexBuffer, .offset = 0 };
 SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
 SDL_GPUTextureSamplerBinding sbind = { .texture = atlasTex, .sampler = sampler };
 SDL_BindGPUFragmentSamplers(pass, 0, &sbind, 1);
-FragUniforms fu = { {1, 1, 1, 1}, {pxRange, 0, 0, 0} };
+FragUniforms fu = { {1, 1, 1, 1}, {pxRange, 0, 0, 0} }; /* set params.y=1 for MTSDF */
 SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
 SDL_DrawGPUPrimitives(pass, vertexCount, 1, 0, 0);
 SDL_EndGPURenderPass(pass);
@@ -500,7 +524,7 @@ Notes:
 - `glyphQuad` + `glyphUV` keeps the math consistent with SDL’s NDC (y-up) coords.
 - Full runnable example (Haskell generator + SDL renderer) lives in `examples/sdl_gpu_wesl` and uses spirdo to compile WESL → SPIR‑V.
 - From repo root, run `just demo` to build + capture a screenshot of the SDL example (see `examples/sdl_gpu_wesl/README.md`). Use `SDL_GPU_DRIVER=vulkan` if you need to force the backend.
-- If you see tiny specks at sharp corners, lower `msdfCorrectionThreshold` (try 0.2 → 0.1) or increase `range`/`atlasPadding`.
+- If you see tiny specks at sharp corners, lower `msdfCorrectionThreshold` (e.g. `0.05` → `0.02`), raise `speckleThreshold` (e.g. `1.0`), and increase `range`/`atlasPadding`.
 
 ## Limitations (sad but true)
 

@@ -1,6 +1,6 @@
 # SDL_gpu + masdiff + spirdo
 
-This example generates an MSDF atlas + SPIR-V shaders in Haskell (masdiff + spirdo), then renders them with SDL 3.4 GPU.
+This example generates an MSDF (or MTSDF) atlas + SPIR-V shaders in Haskell (masdiff + spirdo), then renders them with SDL 3.4 GPU.
 
 ## 1) Generate assets (atlas + SPIR-V)
 
@@ -16,6 +16,18 @@ To use a different font:
 cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --font /path/to/font.ttf
 ```
 
+If you see specks, try a more conservative generation setup:
+
+```sh
+cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --range 16 --padding 24 --correction 0.02 --speckle 1.0
+```
+
+To check whether artifacts are atlas-related, disable packing:
+
+```sh
+cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --no-pack
+```
+
 If you have `just` installed:
 
 ```sh
@@ -24,13 +36,13 @@ just demo-gen
 
 This writes (under `examples/sdl_gpu_wesl/out`):
 
-- `out/atlas.rgba`
-- `out/vertices.bin`
-- `out/meta.txt`
+- `out/atlas_msdf.rgba`, `out/vertices_msdf.bin`, `out/meta_msdf.txt`
+- `out/atlas_mtsdf.rgba`, `out/vertices_mtsdf.bin`, `out/meta_mtsdf.txt`
+- (compat) `out/atlas.rgba`, `out/vertices.bin`, `out/meta.txt` (MSDF only)
 - `out/msdf.vert.spv`
 - `out/msdf.frag.spv`
 
-`msdf-sdl-gen` compiles WESL via **spirdo** and builds the MSDF atlas via **masdiff**.
+`msdf-sdl-gen` compiles WESL via **spirdo** and builds the MSDF/MTSDF atlas via **masdiff**.
 
 ## 2) Build the SDL renderer
 
@@ -44,7 +56,7 @@ If your system uses `sdl3-config`, you can swap the pkg-config call for:
 cc sdl_gpu_msdf.c -o sdl_gpu_msdf $(sdl3-config --cflags --libs)
 ```
 
-## 3) Run
+## 3) Run (side-by-side MSDF + MTSDF)
 
 ```sh
 ./sdl_gpu_msdf

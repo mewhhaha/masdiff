@@ -87,3 +87,20 @@ executable msdf-bench
     default-extensions: DuplicateRecordFields
                         , NoFieldSelectors
                         , OverloadedRecordDot
+
+executable msdf-dump
+    import:           warnings
+    hs-source-dirs:   tools
+    main-is:          MSDFDump.hs
+    other-modules:    Paths_masdiff
+    autogen-modules:  Paths_masdiff
+    build-depends:    base ^>=4.21.0.0
+                    , array ^>=0.5.8.0
+                    , bytestring ^>=0.12.1.0
+                    , directory ^>=1.3.9.0
+                    , filepath ^>=1.5.4.0
+                    , masdiff
+    default-language: GHC2024
+    default-extensions: DuplicateRecordFields
+                        , NoFieldSelectors
+                        , OverloadedRecordDot

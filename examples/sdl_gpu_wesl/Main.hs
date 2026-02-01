@@ -9,19 +9,21 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, floatLE, word8, toLazyByteString)
 import qualified Data.ByteString.Lazy as BL
 import Data.Char (ord)
-import Data.List (foldl')
+import Data.List (foldl', isPrefixOf)
+import Data.Maybe (fromMaybe)
+import Control.Monad (when)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs)
-import System.Exit (exitFailure)
+import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>), takeBaseName, (<.>))
 import Data.Word (Word8)
 
 import qualified MSDF.MSDF as MSDF
 import MSDF.MSDF (GlyphSet(..))
-import MSDF.Generated (generateMSDFWithConfig)
+import MSDF.Generated (generateMSDFFromTTF)
 import MSDF.Render (glyphQuad, glyphUV, pixelRangeForAtlas)
-import MSDF.Types (AtlasImage(..), GlyphMSDF(..), MSDFAtlas(..), lookupCodepoint)
-import MSDF.TTF.Parser (ParseError(..))
+import MSDF.Types (AtlasImage(..), BitmapFormat(..), GlyphMSDF(..), MSDFAtlas(..), lookupCodepoint)
+import MSDF.TTF.Parser (ParseError(..), parseTTF, TTF)
 import Spirdo.Wesl (compile, renderCompileError, sourceFile, shaderSpirv)
 
 shaderDirName :: FilePath
@@ -37,6 +39,49 @@ screenH = 720
 sampleText :: String
 sampleText = "masdiff"
 
+data CliOptions = CliOptions
+  { fontPathOpt :: Maybe FilePath
+  , pixelSizeOpt :: Maybe Int
+  , rangeOpt :: Maybe Int
+  , paddingOpt :: Maybe Int
+  , correctionOpt :: Maybe Double
+  , speckleOpt :: Maybe Double
+  , conflictOpt :: Maybe Double
+  , flatnessOpt :: Maybe Double
+  , packAtlasOpt :: Maybe Bool
+  }
+
+defaultCliOptions :: CliOptions
+defaultCliOptions =
+  CliOptions
+    { fontPathOpt = Nothing
+    , pixelSizeOpt = Nothing
+    , rangeOpt = Nothing
+    , paddingOpt = Nothing
+    , correctionOpt = Nothing
+    , speckleOpt = Nothing
+    , conflictOpt = Nothing
+    , flatnessOpt = Nothing
+    , packAtlasOpt = Nothing
+    }
+
+data ParseResult
+  = ParseOk CliOptions
+  | ParseHelp
+  | CliParseError String
+
+usage :: String
+usage =
+  unlines
+    [ "msdf-sdl-gen [--font PATH] [--pixel-size N] [--range N] [--padding N]"
+    , "             [--correction X] [--speckle X] [--conflict X] [--flatness X]"
+    , "             [--no-pack]"
+    , ""
+    , "Examples:"
+    , "  msdf-sdl-gen --font /path/to/font.ttf"
+    , "  msdf-sdl-gen --range 16 --padding 24 --correction 0.02 --speckle 1.0"
+    ]
+
 main :: IO ()
 main = do
   baseDir <- resolveBaseDir
@@ -46,22 +91,41 @@ main = do
   compileWesl outDir (shaderDir </> "msdf.vert.wesl")
   compileWesl outDir (shaderDir </> "msdf.frag.wesl")
 
-  fontPath <- resolveFontPath baseDir
-  let cfg = MSDF.defaultMSDFConfig
-        { MSDF.pixelSize = 128
+  args <- getArgs
+  opts <- case parseArgs args defaultCliOptions of
+    ParseHelp -> do
+      putStrLn usage
+      exitSuccess
+    CliParseError msg -> do
+      putStrLn msg
+      putStrLn usage
+      exitFailure
+    ParseOk parsed -> pure parsed
+
+  fontPath <- resolveFontPath baseDir opts
+  let cfgBase = MSDF.defaultMSDFConfig
+        { MSDF.pixelSize = 256
         , MSDF.range = 12
         , MSDF.atlasPadding = 16
         , MSDF.msdfCorrectionThreshold = 0.05
+        , MSDF.windingFlatness = 0.02
+        , MSDF.speckleThreshold = 1.0
+        , MSDF.edgeConflictThreshold = 1.0
         , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
         , MSDF.packAtlas = True
         }
-  result <- generateMSDFWithConfig cfg fontPath
-  case result of
+      cfg = applyCliOverrides opts cfgBase
+  parsed <- parseTTF fontPath
+  case parsed of
     Left err -> do
       let ParseError { context = ctx, message = msg } = err
-      putStrLn ("generateMSDFWithConfig failed: " <> ctx <> ": " <> msg)
+      putStrLn ("parseTTF failed: " <> ctx <> ": " <> msg)
       exitFailure
-    Right atlas -> writeAtlas outDir atlas
+    Right ttf -> do
+      let outputs =
+            [ ("mtsdf", BitmapMTSDF, screenW * 0.5, False)
+            ]
+      mapM_ (writeAtlas outDir cfg ttf) outputs
 
 resolveBaseDir :: IO FilePath
 resolveBaseDir = do
@@ -78,15 +142,10 @@ resolveBaseDir = do
           putStrLn "could not locate shaders; run from repo root or examples/sdl_gpu_wesl"
           exitFailure
 
-resolveFontPath :: FilePath -> IO FilePath
-resolveFontPath baseDir = do
-  args <- getArgs
+resolveFontPath :: FilePath -> CliOptions -> IO FilePath
+resolveFontPath baseDir opts = do
   let defaultPath = baseDir </> ".." </> ".." </> "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
-      path =
-        case args of
-          ["--font", p] -> p
-          [p] -> p
-          _ -> defaultPath
+      path = fromMaybe defaultPath opts.fontPathOpt
   exists <- doesFileExist path
   if exists
     then pure path
@@ -107,45 +166,115 @@ compileWesl outDir src = do
       BS.writeFile outPath (shaderSpirv bundle)
       putStrLn ("wrote " <> outPath)
 
-writeAtlas :: FilePath -> MSDFAtlas -> IO ()
-writeAtlas outDir atlas =
+writeAtlas :: FilePath -> MSDF.MSDFConfig -> TTF -> (String, BitmapFormat, Double, Bool) -> IO ()
+writeAtlas outDir cfgBase ttf (label, fmt, centerX, writeDefault) =
+  let cfg = cfgBase { MSDF.outputFormat = fmt }
+      atlas = generateMSDFFromTTF cfg ttf
+  in
   case atlas of
     MSDFAtlas { atlas = Nothing } -> do
       putStrLn "atlas packing failed (packAtlas was true)"
       exitFailure
     MSDFAtlas { atlas = Just img, pixelSize = ps } -> do
-      let AtlasImage { width = aw, height = ah, pixels = px } = img
-          rgbaBytes = rgbToRgbaBytes px
+      let AtlasImage { width = aw, height = ah, format = fmtImg, pixels = px } = img
+          rgbaBytes = bitmapToRgbaBytes fmtImg px
           pxRange = pixelRangeForAtlas atlas (fromIntegral ps :: Double)
           bounds = textBounds atlas sampleText
-          penStart' = snapPen (centerPen (screenW, screenH) bounds)
+          penStart' = snapPen (penForCenter (centerX, screenH * 0.5) bounds)
           texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
           verts = buildTextVertices atlas (screenW, screenH) penStart' texel sampleText
-          verticesOut = outDir </> "vertices.bin"
-          atlasOut = outDir </> "atlas.rgba"
-          metaOut = outDir </> "meta.txt"
-      BS.writeFile atlasOut rgbaBytes
-      BL.writeFile verticesOut (toLazyByteString (floatListBuilder verts))
-      writeFile metaOut $ unlines
-        [ "atlasWidth " <> show aw
-        , "atlasHeight " <> show ah
-        , "pixelSize " <> show ps
-        , "pxRange " <> show pxRange
-        , "screenWidth " <> show screenW
-        , "screenHeight " <> show screenH
-        , "vertexCount " <> show (length verts `div` 4)
-        ]
+          verticesOut = outDir </> ("vertices_" <> label <.> "bin")
+          atlasOut = outDir </> ("atlas_" <> label <.> "rgba")
+          metaOut = outDir </> ("meta_" <> label <.> "txt")
+      writeOutputs atlasOut verticesOut metaOut aw ah ps pxRange verts rgbaBytes
+      when writeDefault $ do
+        let verticesOut' = outDir </> "vertices.bin"
+            atlasOut' = outDir </> "atlas.rgba"
+            metaOut' = outDir </> "meta.txt"
+        writeOutputs atlasOut' verticesOut' metaOut' aw ah ps pxRange verts rgbaBytes
       putStrLn ("wrote " <> atlasOut)
       putStrLn ("wrote " <> verticesOut)
       putStrLn ("wrote " <> metaOut)
 
-rgbToRgbaBytes :: UA.UArray Int Word8 -> BS.ByteString
-rgbToRgbaBytes arr =
+applyCliOverrides :: CliOptions -> MSDF.MSDFConfig -> MSDF.MSDFConfig
+applyCliOverrides opts cfg =
+  cfg
+    { MSDF.pixelSize = fromMaybe cfg.pixelSize opts.pixelSizeOpt
+    , MSDF.range = fromMaybe cfg.range opts.rangeOpt
+    , MSDF.atlasPadding = fromMaybe cfg.atlasPadding opts.paddingOpt
+    , MSDF.msdfCorrectionThreshold = fromMaybe cfg.msdfCorrectionThreshold opts.correctionOpt
+    , MSDF.speckleThreshold = fromMaybe cfg.speckleThreshold opts.speckleOpt
+    , MSDF.edgeConflictThreshold = fromMaybe cfg.edgeConflictThreshold opts.conflictOpt
+    , MSDF.windingFlatness = fromMaybe cfg.windingFlatness opts.flatnessOpt
+    , MSDF.packAtlas = fromMaybe cfg.packAtlas opts.packAtlasOpt
+    }
+
+parseArgs :: [String] -> CliOptions -> ParseResult
+parseArgs [] opts = ParseOk opts
+parseArgs ("--help":_) _ = ParseHelp
+parseArgs ("--font":p:rest) opts = parseArgs rest opts { fontPathOpt = Just p }
+parseArgs ("--pixel-size":n:rest) opts =
+  parseNumber "pixel size" n (\v -> opts { pixelSizeOpt = Just v }) rest
+parseArgs ("--range":n:rest) opts =
+  parseNumber "range" n (\v -> opts { rangeOpt = Just v }) rest
+parseArgs ("--padding":n:rest) opts =
+  parseNumber "padding" n (\v -> opts { paddingOpt = Just v }) rest
+parseArgs ("--correction":x:rest) opts =
+  parseDouble "correction" x (\v -> opts { correctionOpt = Just v }) rest
+parseArgs ("--speckle":x:rest) opts =
+  parseDouble "speckle" x (\v -> opts { speckleOpt = Just v }) rest
+parseArgs ("--conflict":x:rest) opts =
+  parseDouble "conflict" x (\v -> opts { conflictOpt = Just v }) rest
+parseArgs ("--flatness":x:rest) opts =
+  parseDouble "flatness" x (\v -> opts { flatnessOpt = Just v }) rest
+parseArgs ("--no-pack":rest) opts = parseArgs rest opts { packAtlasOpt = Just False }
+parseArgs (arg:rest) opts
+  | "-" `isPrefixOf` arg = CliParseError ("unknown option: " <> arg)
+  | otherwise =
+      case opts.fontPathOpt of
+        Nothing -> parseArgs rest opts { fontPathOpt = Just arg }
+        Just _ -> CliParseError ("unexpected positional argument: " <> arg)
+
+parseNumber :: String -> String -> (Int -> CliOptions) -> [String] -> ParseResult
+parseNumber label raw apply rest =
+  case readInt raw of
+    Just v -> parseArgs rest (apply v)
+    Nothing -> CliParseError ("invalid " <> label <> ": " <> raw)
+
+parseDouble :: String -> String -> (Double -> CliOptions) -> [String] -> ParseResult
+parseDouble label raw apply rest =
+  case readDouble raw of
+    Just v -> parseArgs rest (apply v)
+    Nothing -> CliParseError ("invalid " <> label <> ": " <> raw)
+
+readInt :: String -> Maybe Int
+readInt s =
+  case reads s of
+    [(v, "")] -> Just v
+    _ -> Nothing
+
+readDouble :: String -> Maybe Double
+readDouble s =
+  case reads s of
+    [(v, "")] -> Just v
+    _ -> Nothing
+
+bitmapToRgbaBytes :: BitmapFormat -> UA.UArray Int Word8 -> BS.ByteString
+bitmapToRgbaBytes fmt arr =
   BL.toStrict (toLazyByteString (go (UA.elems arr)))
   where
-    go (r:g:b:rest) = word8 r <> word8 g <> word8 b <> word8 255 <> go rest
-    go [] = mempty
-    go _ = error "rgbToRgbaBytes: invalid RGB length"
+    go xs =
+      case fmt of
+        BitmapMSDF ->
+          case xs of
+            (r:g:b:rest) -> word8 r <> word8 g <> word8 b <> word8 255 <> go rest
+            [] -> mempty
+            _ -> error "bitmapToRgbaBytes: invalid MSDF RGB length"
+        BitmapMTSDF ->
+          case xs of
+            (r:g:b:a:rest) -> word8 r <> word8 g <> word8 b <> word8 a <> go rest
+            [] -> mempty
+            _ -> error "bitmapToRgbaBytes: invalid MTSDF RGBA length"
 
 floatListBuilder :: [Float] -> Builder
 floatListBuilder = foldMap floatLE
@@ -211,13 +340,25 @@ textBounds atlas text =
        Just b -> b
        Nothing -> (0, 0, 0, 0)
 
-centerPen :: (Double, Double) -> (Double, Double, Double, Double) -> (Double, Double)
-centerPen (w, h) (minX, minY, maxX, maxY) =
-  let textW = maxX - minX
-      textH = maxY - minY
-      penX = (w - textW) * 0.5 - minX
-      penY = (h - textH) * 0.5 - minY
-  in (penX, penY)
+penForCenter :: (Double, Double) -> (Double, Double, Double, Double) -> (Double, Double)
+penForCenter (cx, cy) (minX, minY, maxX, maxY) =
+  let midX = (minX + maxX) * 0.5
+      midY = (minY + maxY) * 0.5
+  in (cx - midX, cy - midY)
 
 snapPen :: (Double, Double) -> (Double, Double)
 snapPen (x, y) = (fromIntegral (round x :: Int), fromIntegral (round y :: Int))
+
+writeOutputs :: FilePath -> FilePath -> FilePath -> Int -> Int -> Int -> Double -> [Float] -> BS.ByteString -> IO ()
+writeOutputs atlasOut verticesOut metaOut aw ah ps pxRange verts rgbaBytes = do
+  BS.writeFile atlasOut rgbaBytes
+  BL.writeFile verticesOut (toLazyByteString (floatListBuilder verts))
+  writeFile metaOut $ unlines
+    [ "atlasWidth " <> show aw
+    , "atlasHeight " <> show ah
+    , "pixelSize " <> show ps
+    , "pxRange " <> show pxRange
+    , "screenWidth " <> show screenW
+    , "screenHeight " <> show screenH
+    , "vertexCount " <> show (length verts `div` 4)
+    ]

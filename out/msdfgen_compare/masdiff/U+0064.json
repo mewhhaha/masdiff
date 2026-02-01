@@ -1,0 +1,16 @@
+{
+  "codepoint": 100,
+  "glyphIndex": 597,
+  "format": "mtsdf",
+  "width": 88,
+  "height": 121,
+  "channels": 4,
+  "offsetX": -6.5,
+  "offsetY": -14.5,
+  "pixelSize": 128,
+  "range": 12,
+  "unitsPerEm": 2048,
+  "scale": 6.25e-2,
+  "translateX": 104.0,
+  "translateY": 232.0
+}

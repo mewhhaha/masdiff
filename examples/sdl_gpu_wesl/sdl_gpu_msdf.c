@@ -13,7 +13,7 @@ typedef struct Vertex {
 
 typedef struct FragUniforms {
   float textColor[4];
-  float params[4]; /* params.x = pxRange */
+  float params[4]; /* params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF), params.z = debug */
 } FragUniforms;
 
 static void die(const char *msg) {
@@ -31,8 +31,20 @@ static int file_exists(const char *path) {
 }
 
 static const char *resolve_out_dir(void) {
+  if (file_exists("out/meta_msdf.txt")) {
+    return "out";
+  }
+  if (file_exists("out/meta_mtsdf.txt")) {
+    return "out";
+  }
   if (file_exists("out/meta.txt")) {
     return "out";
+  }
+  if (file_exists("examples/sdl_gpu_wesl/out/meta_msdf.txt")) {
+    return "examples/sdl_gpu_wesl/out";
+  }
+  if (file_exists("examples/sdl_gpu_wesl/out/meta_mtsdf.txt")) {
+    return "examples/sdl_gpu_wesl/out";
   }
   if (file_exists("examples/sdl_gpu_wesl/out/meta.txt")) {
     return "examples/sdl_gpu_wesl/out";
@@ -87,7 +99,30 @@ static int write_tga(const char *path, int w, int h, const void *data, SDL_GPUTe
   return 0;
 }
 
-static int load_meta(const char *path, int *w, int *h, int *screenW, int *screenH, float *pxRange) {
+typedef struct MetaInfo {
+  int atlasW;
+  int atlasH;
+  int screenW;
+  int screenH;
+  float pxRange;
+  Uint32 vertexCount;
+} MetaInfo;
+
+typedef struct DemoOutput {
+  const char *label;
+  float formatFlag;
+  MetaInfo meta;
+  void *atlasData;
+  size_t atlasSize;
+  void *vertData;
+  size_t vertSize;
+  SDL_GPUTexture *atlasTex;
+  SDL_GPUBuffer *vertexBuffer;
+  SDL_GPUTransferBuffer *texUpload;
+  SDL_GPUTransferBuffer *vtxUpload;
+} DemoOutput;
+
+static int load_meta(const char *path, MetaInfo *meta) {
   FILE *f = fopen(path, "r");
   if (!f) {
     return -1;
@@ -96,19 +131,21 @@ static int load_meta(const char *path, int *w, int *h, int *screenW, int *screen
   double val = 0.0;
   while (fscanf(f, "%63s %lf", key, &val) == 2) {
     if (strcmp(key, "atlasWidth") == 0) {
-      *w = (int) val;
+      meta->atlasW = (int) val;
     } else if (strcmp(key, "atlasHeight") == 0) {
-      *h = (int) val;
+      meta->atlasH = (int) val;
     } else if (strcmp(key, "screenWidth") == 0) {
-      *screenW = (int) val;
+      meta->screenW = (int) val;
     } else if (strcmp(key, "screenHeight") == 0) {
-      *screenH = (int) val;
+      meta->screenH = (int) val;
     } else if (strcmp(key, "pxRange") == 0) {
-      *pxRange = (float) val;
+      meta->pxRange = (float) val;
+    } else if (strcmp(key, "vertexCount") == 0) {
+      meta->vertexCount = (Uint32) val;
     }
   }
   fclose(f);
-  return (*w > 0 && *h > 0) ? 0 : -1;
+  return (meta->atlasW > 0 && meta->atlasH > 0) ? 0 : -1;
 }
 
 int main(int argc, char **argv) {
@@ -126,6 +163,8 @@ int main(int argc, char **argv) {
   if (delayEnv && delayEnv[0] != '\0') {
     screenshotDelayMs = atoi(delayEnv);
   }
+  bool debugAlphaOnly = SDL_getenv("SDL_MSDF_ALPHA_ONLY") != NULL;
+  bool forceNearest = SDL_getenv("SDL_MSDF_NEAREST") != NULL;
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0) {
     die("SDL_Init");
@@ -171,8 +210,14 @@ int main(int argc, char **argv) {
 
   const char *outDir = resolve_out_dir();
   if (!outDir) {
-    die("could not locate out/meta.txt");
+    die("could not locate out/meta_msdf.txt or out/meta.txt");
   }
+
+  const int outputTotal = 1;
+  DemoOutput outputs[1] = {
+    { .label = "mtsdf", .formatFlag = 1.f }
+  };
+  int outputCount = 0;
 
   bool wantScreenshot = SDL_getenv("SDL_MSDF_SCREENSHOT") != NULL;
   bool captured = false;
@@ -184,39 +229,91 @@ int main(int argc, char **argv) {
     wantScreenshot = true;
   }
 
-  int atlasW = 0;
-  int atlasH = 0;
   int screenW = 1280;
   int screenH = 720;
-  float pxRange = 4.0f;
   char path[256];
-  make_path(path, sizeof(path), outDir, "meta.txt");
-  if (load_meta(path, &atlasW, &atlasH, &screenW, &screenH, &pxRange) < 0) {
-    die("load meta.txt");
+  for (int i = 0; i < outputTotal; i++) {
+    DemoOutput *out = &outputs[i];
+    MetaInfo meta = {0};
+    bool metaOk = false;
+    if (out->label) {
+      SDL_snprintf(path, sizeof(path), "%s/meta_%s.txt", outDir, out->label);
+      if (load_meta(path, &meta) == 0) {
+        metaOk = true;
+      }
+    }
+    if (!metaOk && i == 0) {
+      make_path(path, sizeof(path), outDir, "meta.txt");
+      if (load_meta(path, &meta) == 0) {
+        metaOk = true;
+      }
+    }
+    if (!metaOk) {
+      continue;
+    }
+    if (meta.pxRange <= 0.f) {
+      meta.pxRange = 4.f;
+    }
+    out->meta = meta;
+    if (outputCount == 0) {
+      screenW = meta.screenW > 0 ? meta.screenW : screenW;
+      screenH = meta.screenH > 0 ? meta.screenH : screenH;
+    }
+
+    size_t atlasSize = 0;
+    void *atlasData = NULL;
+    if (out->label) {
+      SDL_snprintf(path, sizeof(path), "%s/atlas_%s.rgba", outDir, out->label);
+      atlasData = SDL_LoadFile(path, &atlasSize);
+    }
+    if (!atlasData && i == 0) {
+      make_path(path, sizeof(path), outDir, "atlas.rgba");
+      atlasData = SDL_LoadFile(path, &atlasSize);
+    }
+    if (!atlasData) {
+      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "load atlas for %s failed", out->label);
+      continue;
+    }
+    if (atlasSize != (size_t) meta.atlasW * (size_t) meta.atlasH * 4u) {
+      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "atlas size mismatch for %s", out->label);
+      SDL_free(atlasData);
+      continue;
+    }
+    out->atlasData = atlasData;
+    out->atlasSize = atlasSize;
+
+    size_t vertSize = 0;
+    void *vertData = NULL;
+    if (out->label) {
+      SDL_snprintf(path, sizeof(path), "%s/vertices_%s.bin", outDir, out->label);
+      vertData = SDL_LoadFile(path, &vertSize);
+    }
+    if (!vertData && i == 0) {
+      make_path(path, sizeof(path), outDir, "vertices.bin");
+      vertData = SDL_LoadFile(path, &vertSize);
+    }
+    if (!vertData) {
+      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "load vertices for %s failed", out->label);
+      SDL_free(atlasData);
+      out->atlasData = NULL;
+      continue;
+    }
+    if (vertSize % sizeof(Vertex) != 0) {
+      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex size mismatch for %s", out->label);
+      SDL_free(atlasData);
+      SDL_free(vertData);
+      out->atlasData = NULL;
+      continue;
+    }
+    out->vertData = vertData;
+    out->vertSize = vertSize;
+    out->meta.vertexCount = (Uint32) (vertSize / sizeof(Vertex));
+    outputCount++;
   }
 
-  size_t atlasSize = 0;
-  make_path(path, sizeof(path), outDir, "atlas.rgba");
-  void *atlasData = SDL_LoadFile(path, &atlasSize);
-  if (!atlasData) {
-    die("load atlas.rgba");
+  if (outputCount == 0) {
+    die("no demo outputs found (missing meta/atlas/vertices)");
   }
-  if (atlasSize != (size_t) atlasW * (size_t) atlasH * 4u) {
-    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "atlas size mismatch");
-    return 1;
-  }
-
-  size_t vertSize = 0;
-  make_path(path, sizeof(path), outDir, "vertices.bin");
-  void *vertData = SDL_LoadFile(path, &vertSize);
-  if (!vertData) {
-    die("load vertices.bin");
-  }
-  if (vertSize % sizeof(Vertex) != 0) {
-    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex size mismatch");
-    return 1;
-  }
-  Uint32 vertexCount = (Uint32) (vertSize / sizeof(Vertex));
 
   size_t vsSize = 0;
   make_path(path, sizeof(path), outDir, "msdf.vert.spv");
@@ -348,23 +445,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  SDL_GPUTexture *atlasTex = SDL_CreateGPUTexture(gpu, &(SDL_GPUTextureCreateInfo){
-    .type = SDL_GPU_TEXTURETYPE_2D,
-    .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-    .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
-    .width = (Uint32) atlasW,
-    .height = (Uint32) atlasH,
-    .layer_count_or_depth = 1,
-    .num_levels = 1,
-    .sample_count = SDL_GPU_SAMPLECOUNT_1
-  });
-  if (!atlasTex) {
-    die("create atlas texture");
-  }
-
   SDL_GPUSampler *sampler = SDL_CreateGPUSampler(gpu, &(SDL_GPUSamplerCreateInfo){
-    .min_filter = SDL_GPU_FILTER_LINEAR,
-    .mag_filter = SDL_GPU_FILTER_LINEAR,
+    .min_filter = forceNearest ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR,
+    .mag_filter = forceNearest ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR,
     .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
     .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
     .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
@@ -373,25 +456,42 @@ int main(int argc, char **argv) {
   if (!sampler) {
     die("create sampler");
   }
-
-  SDL_GPUBuffer *vertexBuffer = SDL_CreateGPUBuffer(gpu, &(SDL_GPUBufferCreateInfo){
-    .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
-    .size = (Uint32) vertSize
-  });
-  if (!vertexBuffer) {
-    die("create vertex buffer");
-  }
-
-  SDL_GPUTransferBuffer *texUpload = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
-    .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-    .size = (Uint32) atlasSize
-  });
-  SDL_GPUTransferBuffer *vtxUpload = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
-    .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-    .size = (Uint32) vertSize
-  });
-  if (!texUpload || !vtxUpload) {
-    die("create transfer buffers");
+  for (int i = 0; i < outputTotal; i++) {
+    DemoOutput *out = &outputs[i];
+    if (!out->atlasData || !out->vertData) {
+      continue;
+    }
+    out->atlasTex = SDL_CreateGPUTexture(gpu, &(SDL_GPUTextureCreateInfo){
+      .type = SDL_GPU_TEXTURETYPE_2D,
+      .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+      .usage = SDL_GPU_TEXTUREUSAGE_SAMPLER,
+      .width = (Uint32) out->meta.atlasW,
+      .height = (Uint32) out->meta.atlasH,
+      .layer_count_or_depth = 1,
+      .num_levels = 1,
+      .sample_count = SDL_GPU_SAMPLECOUNT_1
+    });
+    if (!out->atlasTex) {
+      die("create atlas texture");
+    }
+    out->vertexBuffer = SDL_CreateGPUBuffer(gpu, &(SDL_GPUBufferCreateInfo){
+      .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
+      .size = (Uint32) out->vertSize
+    });
+    if (!out->vertexBuffer) {
+      die("create vertex buffer");
+    }
+    out->texUpload = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
+      .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+      .size = (Uint32) out->atlasSize
+    });
+    out->vtxUpload = SDL_CreateGPUTransferBuffer(gpu, &(SDL_GPUTransferBufferCreateInfo){
+      .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+      .size = (Uint32) out->vertSize
+    });
+    if (!out->texUpload || !out->vtxUpload) {
+      die("create transfer buffers");
+    }
   }
 
   bool uploaded = false;
@@ -412,23 +512,29 @@ int main(int argc, char **argv) {
     }
 
     if (!uploaded) {
-      void *mappedTex = SDL_MapGPUTransferBuffer(gpu, texUpload, false);
-      SDL_memcpy(mappedTex, atlasData, atlasSize);
-      SDL_UnmapGPUTransferBuffer(gpu, texUpload);
-
-      void *mappedVtx = SDL_MapGPUTransferBuffer(gpu, vtxUpload, false);
-      SDL_memcpy(mappedVtx, vertData, vertSize);
-      SDL_UnmapGPUTransferBuffer(gpu, vtxUpload);
-
       SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
-      SDL_UploadToGPUTexture(copy,
-        &(SDL_GPUTextureTransferInfo){ texUpload, 0, (Uint32) atlasW, (Uint32) atlasH },
-        &(SDL_GPUTextureRegion){ atlasTex, 0, 0, 0, 0, 0, (Uint32) atlasW, (Uint32) atlasH, 1 },
-        false);
-      SDL_UploadToGPUBuffer(copy,
-        &(SDL_GPUTransferBufferLocation){ vtxUpload, 0 },
-        &(SDL_GPUBufferRegion){ vertexBuffer, 0, (Uint32) vertSize },
-        false);
+      for (int i = 0; i < outputTotal; i++) {
+        DemoOutput *out = &outputs[i];
+        if (!out->atlasData || !out->vertData) {
+          continue;
+        }
+        void *mappedTex = SDL_MapGPUTransferBuffer(gpu, out->texUpload, false);
+        SDL_memcpy(mappedTex, out->atlasData, out->atlasSize);
+        SDL_UnmapGPUTransferBuffer(gpu, out->texUpload);
+
+        void *mappedVtx = SDL_MapGPUTransferBuffer(gpu, out->vtxUpload, false);
+        SDL_memcpy(mappedVtx, out->vertData, out->vertSize);
+        SDL_UnmapGPUTransferBuffer(gpu, out->vtxUpload);
+
+        SDL_UploadToGPUTexture(copy,
+          &(SDL_GPUTextureTransferInfo){ out->texUpload, 0, (Uint32) out->meta.atlasW, (Uint32) out->meta.atlasH },
+          &(SDL_GPUTextureRegion){ out->atlasTex, 0, 0, 0, 0, 0, (Uint32) out->meta.atlasW, (Uint32) out->meta.atlasH, 1 },
+          false);
+        SDL_UploadToGPUBuffer(copy,
+          &(SDL_GPUTransferBufferLocation){ out->vtxUpload, 0 },
+          &(SDL_GPUBufferRegion){ out->vertexBuffer, 0, (Uint32) out->vertSize },
+          false);
+      }
       SDL_EndGPUCopyPass(copy);
       uploaded = true;
     }
@@ -471,16 +577,23 @@ int main(int argc, char **argv) {
     SDL_Rect scissor = { 0, 0, (int) swapW, (int) swapH };
     SDL_SetGPUScissor(pass, &scissor);
 
-    SDL_GPUBufferBinding vbind = { vertexBuffer, 0 };
-    SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
+    for (int i = 0; i < outputTotal; i++) {
+      DemoOutput *out = &outputs[i];
+      if (!out->atlasTex || !out->vertexBuffer) {
+        continue;
+      }
+      SDL_GPUBufferBinding vbind = { out->vertexBuffer, 0 };
+      SDL_BindGPUVertexBuffers(pass, 0, &vbind, 1);
 
-    SDL_GPUTextureSamplerBinding sbind = { atlasTex, sampler };
-    SDL_BindGPUFragmentSamplers(pass, 0, &sbind, 1);
+      SDL_GPUTextureSamplerBinding sbind = { out->atlasTex, sampler };
+      SDL_BindGPUFragmentSamplers(pass, 0, &sbind, 1);
 
-    FragUniforms fu = { { 1.f, 1.f, 1.f, 1.f }, { pxRange, 0.f, 0.f, 0.f } };
-    SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
+      float debugFlag = debugAlphaOnly ? 1.f : 0.f;
+      FragUniforms fu = { { 1.f, 1.f, 1.f, 1.f }, { out->meta.pxRange, out->formatFlag, debugFlag, 0.f } };
+      SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
 
-    SDL_DrawGPUPrimitives(pass, vertexCount, 1, 0, 0);
+      SDL_DrawGPUPrimitives(pass, out->meta.vertexCount, 1, 0, 0);
+    }
     SDL_EndGPURenderPass(pass);
 
     SDL_GPUFence *fence = NULL;
@@ -521,18 +634,33 @@ int main(int argc, char **argv) {
     }
   }
 
-  SDL_free(atlasData);
-  SDL_free(vertData);
   SDL_free(vsCode);
   SDL_free(fsCode);
 
-  SDL_ReleaseGPUTransferBuffer(gpu, texUpload);
-  SDL_ReleaseGPUTransferBuffer(gpu, vtxUpload);
   if (readback) {
     SDL_ReleaseGPUTransferBuffer(gpu, readback);
   }
-  SDL_ReleaseGPUBuffer(gpu, vertexBuffer);
-  SDL_ReleaseGPUTexture(gpu, atlasTex);
+  for (int i = 0; i < outputTotal; i++) {
+    DemoOutput *out = &outputs[i];
+    if (out->atlasData) {
+      SDL_free(out->atlasData);
+    }
+    if (out->vertData) {
+      SDL_free(out->vertData);
+    }
+    if (out->texUpload) {
+      SDL_ReleaseGPUTransferBuffer(gpu, out->texUpload);
+    }
+    if (out->vtxUpload) {
+      SDL_ReleaseGPUTransferBuffer(gpu, out->vtxUpload);
+    }
+    if (out->vertexBuffer) {
+      SDL_ReleaseGPUBuffer(gpu, out->vertexBuffer);
+    }
+    if (out->atlasTex) {
+      SDL_ReleaseGPUTexture(gpu, out->atlasTex);
+    }
+  }
   if (renderTarget) {
     SDL_ReleaseGPUTexture(gpu, renderTarget);
   }

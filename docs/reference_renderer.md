@@ -62,7 +62,7 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 @fragment
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
-  let sd = 0.5 - median(sample.r, sample.g, sample.b);
+  let sd = median(sample.r, sample.g, sample.b) - 0.5;
   let dist = sd * uPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
@@ -75,3 +75,4 @@ Notes:
 - Use linear sampling and disable sRGB for MSDF textures.
 - `uPxRange` should be computed using `pixelRange` or `pixelRangeForAtlas`.
 - Use atlas UVs (`GlyphPlacement`) when `MSDFConfig.packAtlas` is enabled.
+- For MTSDF output, use the alpha channel (`sample.a`) as the signed distance.

@@ -5,6 +5,7 @@ import Data.Array (Array, elems, (!))
 import Data.Array.IArray (bounds, rangeSize)
 import qualified Data.Array.Unboxed as UA
 import Data.Bits (testBit, (.&.), xor, shiftR)
+import Data.Char (ord)
 import Data.List (find)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word8, Word16, Word32, Word64)
@@ -81,6 +82,7 @@ main = do
     , runTest "repeat flags parsing" (testRepeatFlagsParsing ttf)
     , runTest "composite glyph" (testCompositeGlyph ttf)
     , runTest "render glyph MSDF" (testRenderGlyph ttf cfgSmall)
+    , runTest "render glyph MTSDF" (testRenderGlyphMTSDF ttf cfgSmall)
     , runTest "variable font axes" (testVariableFont ttf)
     , runTest "variation normalization" (testVariationNormalization ttf)
     , runTest "italic variable font" (testItalicVariableFont ttfItalic)
@@ -109,6 +111,8 @@ main = do
     , runTest "bitmap hash" (testBitmapHash ttf cfgSmall)
     , runTest "bitmap hash variable" (testBitmapHashVariable ttf)
     , runTest "bitmap hash italic" (testBitmapHashItalic ttfItalic)
+    , runTest "atlas speckle msdf" (testAtlasSpeckle ttf BitmapMSDF)
+    , runTest "atlas speckle mtsdf" (testAtlasSpeckle ttf BitmapMTSDF)
     , runTest "composite variation" (testCompositeVariation ttf)
     , runTest "metrics only" (testMetricsOnly ttf cfgSmall)
     , runTest "vertical metrics" (testVerticalMetrics ttf cfgSmall)
@@ -307,8 +311,21 @@ testRenderGlyph ttf cfg = do
   assert (bmp.width > 0 && bmp.height > 0) "bitmap should have positive dimensions"
   let (lo, hi) = bounds bmp.pixels
       size = rangeSize (lo, hi)
-      expected = bmp.width * bmp.height * 3
+      expected = bmp.width * bmp.height * bitmapChannels bmp.format
   assert (size == expected) "bitmap pixel buffer size mismatch"
+
+testRenderGlyphMTSDF :: TTF -> MSDFConfig -> IO ()
+testRenderGlyphMTSDF ttf cfg = do
+  let mappings = ttf.cmap.mappings
+      gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
+  assert (gA >= 0) "glyph index for A not found"
+  let glyph = renderGlyphMSDF (cfg { MSDF.outputFormat = BitmapMTSDF }) ttf gA
+      bmp = glyph.bitmap
+  assert (bmp.format == BitmapMTSDF) "bitmap format should be MTSDF"
+  let (lo, hi) = bounds bmp.pixels
+      size = rangeSize (lo, hi)
+      expected = bmp.width * bmp.height * 4
+  assert (size == expected) "MTSDF bitmap pixel buffer size mismatch"
 
 testVariableFont :: TTF -> IO ()
 testVariableFont ttf = do
@@ -657,14 +674,16 @@ testSDLAtlasInterop atlas = do
   case atlas.atlas of
     Nothing -> assert False "atlas packing missing"
     Just img -> do
-      let rgb = img.pixels
-          rgbLen = rangeSize (bounds rgb)
-      assert (rgbLen `mod` 3 == 0) "atlas RGB length should be multiple of 3"
-      let rgba = rgbToRgba rgb
+      let src = img.pixels
+          channels = bitmapChannels img.format
+          srcLen = rangeSize (bounds src)
+      assert (channels == 3 || channels == 4) "atlas channel count should be 3 or 4"
+      assert (srcLen `mod` channels == 0) "atlas pixel buffer size mismatch"
+      let rgba = bitmapToRgba img.format src
           rgbaLen = rangeSize (bounds rgba)
-      assert (rgbaLen == (rgbLen `div` 3) * 4) "atlas RGBA length mismatch"
+      assert (rgbaLen == (srcLen `div` channels) * 4) "atlas RGBA length mismatch"
       if rgbaLen >= 4
-        then assert (rgba UA.! 3 == 255) "atlas RGBA alpha should be 255"
+        then assert (rgba UA.! 3 == 255 || img.format == BitmapMTSDF) "atlas RGBA alpha should be 255 for MSDF"
         else assert False "atlas RGBA empty"
   case lookupCodepoint atlas 65 of
     Nothing -> pure ()
@@ -796,7 +815,7 @@ testBitmapHash ttf cfg = do
   assert (gA >= 0) "glyph index for A not found"
   let glyph = renderGlyphMSDF cfg ttf gA
       h = bitmapHash glyph
-      expected = 0xc6131c6820d910a0 :: Word64
+      expected = 0xbde2dab4c1d9394b :: Word64
   assertEq "bitmap hash" expected h ("bitmap hash changed: expected " ++ show expected ++ " got " ++ show h)
 
 testBitmapHashVariable :: TTF -> IO ()
@@ -810,7 +829,7 @@ testBitmapHashVariable ttf = do
         }
       glyph = renderGlyphMSDF cfgVar ttf gA
       h = bitmapHash glyph
-      expected = 0xc6131c6820d910a0 :: Word64
+      expected = 0xbde2dab4c1d9394b :: Word64
   assertEq "bitmap hash variable" expected h ("bitmap hash changed: expected " ++ show expected ++ " got " ++ show h)
 
 testBitmapHashItalic :: TTF -> IO ()
@@ -824,8 +843,26 @@ testBitmapHashItalic ttf = do
         }
       glyph = renderGlyphMSDF cfgVar ttf gA
       h = bitmapHash glyph
-      expected = 0xb409680f42ce96b0 :: Word64
+      expected = 0x73b6bbba545c5599 :: Word64
   assertEq "bitmap hash italic" expected h ("bitmap hash changed: expected " ++ show expected ++ " got " ++ show h)
+
+testAtlasSpeckle :: TTF -> BitmapFormat -> IO ()
+testAtlasSpeckle ttf fmt = do
+  let sampleText = "masdiff"
+      cfg = defaultMSDFConfig
+        { MSDF.pixelSize = 128
+        , MSDF.range = 12
+        , MSDF.atlasPadding = 16
+        , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
+        , MSDF.packAtlas = True
+        , MSDF.outputFormat = fmt
+        }
+      atlas = generateMSDFFromTTF cfg ttf
+  case atlas.atlas of
+    Nothing -> assert False "speckle test: atlas packing failed"
+    Just img -> do
+      let specks = findSpecklePixels img atlas.range
+      assert (null specks) ("speckle test: found " ++ show (length specks) ++ " pixels in " ++ show fmt ++ " (sample " ++ show (take 8 specks) ++ ")")
 
 testCompositeVariation :: TTF -> IO ()
 testCompositeVariation ttf =
@@ -1034,16 +1071,62 @@ assertApprox label expected actual =
       ok = abs (expected - actual) <= eps
   in assert ok (label ++ ": expected " ++ show expected ++ " got " ++ show actual)
 
-rgbToRgba :: UA.UArray Int Word8 -> UA.UArray Int Word8
-rgbToRgba rgb =
-  let rgbaList = go (UA.elems rgb)
+findSpecklePixels :: AtlasImage -> Int -> [(Int, Int)]
+findSpecklePixels img range =
+  let w = img.width
+      h = img.height
+      channels = bitmapChannels img.format
+      stableThreshold = 1 / fromIntegral (2 * max 1 range)
+      neighbors8 =
+        [ (-1, -1), (0, -1), (1, -1)
+        , (-1,  0),          (1,  0)
+        , (-1,  1), (0,  1), (1,  1)
+        ]
+      sdAt x y =
+        let base = (y * w + x) * channels
+            chan i = fromIntegral (img.pixels UA.! (base + i)) / 255
+        in case img.format of
+             BitmapMSDF ->
+               let r = chan 0
+                   g = chan 1
+                   b = chan 2
+               in median3 r g b - 0.5
+             BitmapMTSDF ->
+               let a = chan 3
+               in a - 0.5
+      isInside sd = sd > 0
+      stable sd = abs sd >= stableThreshold
+  in if w < 3 || h < 3
+     then []
+     else
+       [ (x, y)
+       | y <- [1 .. h - 2]
+       , x <- [1 .. w - 2]
+       , let sd = sdAt x y
+       , stable sd
+       , not (isInside sd)
+       , let neighborSds = [ sdAt (x + dx) (y + dy) | (dx, dy) <- neighbors8 ]
+       , let stableNeighbors = [ sdN | sdN <- neighborSds, stable sdN ]
+       , length stableNeighbors >= 7
+       , let insideNeighbors = length [ () | sdN <- stableNeighbors, isInside sdN ]
+       , insideNeighbors >= 7
+       ]
+
+median3 :: Double -> Double -> Double -> Double
+median3 a b c = max (min a b) (min (max a b) c)
+
+bitmapToRgba :: BitmapFormat -> UA.UArray Int Word8 -> UA.UArray Int Word8
+bitmapToRgba fmt arr =
+  let rgbaList = go fmt (UA.elems arr)
   in if null rgbaList
      then UA.listArray (0, -1) []
      else UA.listArray (0, length rgbaList - 1) rgbaList
   where
-    go (r:g:b:rest) = r:g:b:255:go rest
-    go [] = []
-    go _ = error "rgbToRgba: invalid RGB length"
+    go BitmapMSDF (r:g:b:rest) = r:g:b:255:go BitmapMSDF rest
+    go BitmapMTSDF (r:g:b:a:rest) = r:g:b:a:go BitmapMTSDF rest
+    go _ [] = []
+    go BitmapMSDF _ = error "bitmapToRgba: invalid MSDF RGB length"
+    go BitmapMTSDF _ = error "bitmapToRgba: invalid MTSDF RGBA length"
 
 glyphSignatureSafe :: String -> GlyphMSDF -> IO (Double, Double, Double, BBox, Maybe VerticalMetrics, Int, Int, Int, Maybe GlyphPlacement)
 glyphSignatureSafe label glyph = do

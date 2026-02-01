@@ -68,6 +68,9 @@ If you render at native pixel size (1 font pixel == 1 screen pixel), then
 MSDF decoding uses the **median** of RGB channels. The signed distance is
 centered around `0.5` in texture space.
 
+If you generated **MTSDF** (RGBA), the alpha channel already stores the true
+signed distance. Use `sample.a` instead of the RGB median.
+
 ### GLSL (fragment)
 
 ```glsl
@@ -81,12 +84,23 @@ float median(float r, float g, float b) {
 
 void main() {
   vec3 sample = texture(uMsdfTex, vUV).rgb;
-  float sd = 0.5 - median(sample.r, sample.g, sample.b);
+  float sd = median(sample.r, sample.g, sample.b) - 0.5;
   float dist = sd * uPxRange;
   float w = fwidth(dist);
   float alpha = smoothstep(-w, w, dist);
   fragColor = vec4(uTextColor.rgb, uTextColor.a * alpha);
 }
+```
+
+MTSDF (alpha channel is the true SDF):
+
+```glsl
+vec4 sample = texture(uMsdfTex, vUV);
+float sd = sample.a - 0.5;
+float dist = sd * uPxRange;
+float w = fwidth(dist);
+float alpha = smoothstep(-w, w, dist);
+fragColor = vec4(uTextColor.rgb, uTextColor.a * alpha);
 ```
 
 ### WGSL (fragment)
@@ -104,7 +118,7 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 @fragment
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
-  let sd = 0.5 - median(sample.r, sample.g, sample.b);
+  let sd = median(sample.r, sample.g, sample.b) - 0.5;
   let dist = sd * uPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
@@ -129,7 +143,7 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 @fragment
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
-  let sd = 0.5 - median(sample.r, sample.g, sample.b);
+  let sd = median(sample.r, sample.g, sample.b) - 0.5;
   let dist = sd * uPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
@@ -142,4 +156,5 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 - Sample MSDF textures in **linear color space** (disable sRGB sampling).
 - Use **bilinear filtering** for MSDF textures.
 - Premultiplied alpha is recommended if your pipeline expects it.
-- To avoid artifacts, keep MSDF `range` between 2 and 8 pixels.
+- For typical sizes, keep MSDF `range` between 2 and 8 pixels; if you increase it, also raise `atlasPadding`.
+- If you see interior specks, lower `msdfCorrectionThreshold` (e.g. `0.05` → `0.02`), raise `speckleThreshold` (e.g. `1.0`), and increase `range`/`atlasPadding`.
