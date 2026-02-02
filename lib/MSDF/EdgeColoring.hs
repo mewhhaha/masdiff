@@ -21,7 +21,19 @@ import MSDF.Types (BBox(..))
 colorEdges :: EdgeColoringConfig -> [[Edge]] -> [ColoredEdge]
 colorEdges cfg contours =
   let colored = concatMap (colorContour cfg) (zip [0..] contours)
-  in resolveConflicts cfg colored
+  in map promoteTwoChannel (resolveConflicts cfg colored)
+
+promoteTwoChannel :: ColoredEdge -> ColoredEdge
+promoteTwoChannel (ColoredEdge c er) =
+  ColoredEdge (toTwoChannel c) er
+
+toTwoChannel :: EdgeColor -> EdgeColor
+toTwoChannel c =
+  case c of
+    ColorRed -> ColorYellow
+    ColorGreen -> ColorCyan
+    ColorBlue -> ColorMagenta
+    _ -> c
 
 colorContour :: EdgeColoringConfig -> (Int, [Edge]) -> [ColoredEdge]
 colorContour cfg (contourId, edges) =

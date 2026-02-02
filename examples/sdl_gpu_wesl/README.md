@@ -102,7 +102,8 @@ just demo-headless
 
 - The generator bakes positions into clip space for a **1280x720** window.
   If you change the window size, update `screenW/screenH` in `Main.hs`.
-- The fragment shader expects a **linear** texture and uses `pxRange` from `meta.txt`.
+- The fragment shader expects a **linear** texture, uses `pxRange` from `meta.txt`,
+  and derives `screenPxRange` from UV derivatives and atlas size.
 - `just demo` writes `examples/sdl_gpu_wesl/out/screenshot.tga` and exits.
 - Customize the delay with `SDL_MSDF_SCREENSHOT_DELAY_MS=1000 just demo`.
 - If you see `No supported SDL_GPU backend found`, ensure SDL_gpu has a backend

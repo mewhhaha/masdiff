@@ -1,6 +1,8 @@
 struct FragUniforms {
   textColor: vec4<f32>;
   params: vec4<f32>; // params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF), params.z = debug (alpha-only)
+  atlasSize: vec2<f32>;
+  _pad: vec2<f32>;
 };
 
 // SDL GPU (SPIR-V) expects fragment textures in set=2 and uniforms in set=3.
@@ -26,7 +28,9 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   if (uFrag.params.y > 0.5) {
     sd = sample.a - 0.5;
   }
-  let dist = sd * uFrag.params.x;
+  let texelFwidth = fwidth(vUV) * uFrag.atlasSize;
+  let screenPxRange = uFrag.params.x * max(texelFwidth.x, texelFwidth.y);
+  let dist = sd * screenPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
   return vec4<f32>(uFrag.textColor.rgb, uFrag.textColor.a * alpha);

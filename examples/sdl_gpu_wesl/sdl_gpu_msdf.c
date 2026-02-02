@@ -14,6 +14,8 @@ typedef struct Vertex {
 typedef struct FragUniforms {
   float textColor[4];
   float params[4]; /* params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF), params.z = debug */
+  float atlasSize[2];
+  float _pad[2];
 } FragUniforms;
 
 static void die(const char *msg) {
@@ -589,7 +591,12 @@ int main(int argc, char **argv) {
       SDL_BindGPUFragmentSamplers(pass, 0, &sbind, 1);
 
       float debugFlag = debugAlphaOnly ? 1.f : 0.f;
-      FragUniforms fu = { { 1.f, 1.f, 1.f, 1.f }, { out->meta.pxRange, out->formatFlag, debugFlag, 0.f } };
+      FragUniforms fu = {
+        { 1.f, 1.f, 1.f, 1.f },
+        { out->meta.pxRange, out->formatFlag, debugFlag, 0.f },
+        { (float) out->meta.atlasW, (float) out->meta.atlasH },
+        { 0.f, 0.f }
+      };
       SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
 
       SDL_DrawGPUPrimitives(pass, out->meta.vertexCount, 1, 0, 0);

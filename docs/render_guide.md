@@ -63,6 +63,14 @@ pxRange = pixelRange range S
 If you render at native pixel size (1 font pixel == 1 screen pixel), then
 `S = 1.0` and `pxRange = range`.
 
+In a shader, compute a screen-space range from derivatives and atlas texel
+density:
+
+```text
+texelFwidth = fwidth(uv) * atlasSize
+screenPxRange = pxRange * max(texelFwidth.x, texelFwidth.y)
+```
+
 ## Fragment shader logic
 
 MSDF decoding uses the **median** of RGB channels. The signed distance is
@@ -77,6 +85,7 @@ signed distance. Use `sample.a` instead of the RGB median.
 uniform sampler2D uMsdfTex;
 uniform vec4 uTextColor;
 uniform float uPxRange;
+uniform vec2 uAtlasSize;
 
 float median(float r, float g, float b) {
   return max(min(r, g), min(max(r, g), b));
@@ -85,7 +94,9 @@ float median(float r, float g, float b) {
 void main() {
   vec3 sample = texture(uMsdfTex, vUV).rgb;
   float sd = median(sample.r, sample.g, sample.b) - 0.5;
-  float dist = sd * uPxRange;
+  vec2 texelFwidth = fwidth(vUV) * uAtlasSize;
+  float screenPxRange = uPxRange * max(texelFwidth.x, texelFwidth.y);
+  float dist = sd * screenPxRange;
   float w = fwidth(dist);
   float alpha = smoothstep(-w, w, dist);
   fragColor = vec4(uTextColor.rgb, uTextColor.a * alpha);
@@ -97,7 +108,9 @@ MTSDF (alpha channel is the true SDF):
 ```glsl
 vec4 sample = texture(uMsdfTex, vUV);
 float sd = sample.a - 0.5;
-float dist = sd * uPxRange;
+vec2 texelFwidth = fwidth(vUV) * uAtlasSize;
+float screenPxRange = uPxRange * max(texelFwidth.x, texelFwidth.y);
+float dist = sd * screenPxRange;
 float w = fwidth(dist);
 float alpha = smoothstep(-w, w, dist);
 fragColor = vec4(uTextColor.rgb, uTextColor.a * alpha);
@@ -110,6 +123,7 @@ fragColor = vec4(uTextColor.rgb, uTextColor.a * alpha);
 @group(2) @binding(1) var msdfSampler : sampler;
 @group(3) @binding(0) var<uniform> uTextColor : vec4<f32>;
 @group(3) @binding(1) var<uniform> uPxRange : f32;
+@group(3) @binding(2) var<uniform> uAtlasSize : vec2<f32>;
 
 fn median(r: f32, g: f32, b: f32) -> f32 {
   return max(min(r, g), min(max(r, g), b));
@@ -119,7 +133,9 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
   let sd = median(sample.r, sample.g, sample.b) - 0.5;
-  let dist = sd * uPxRange;
+  let texelFwidth = fwidth(vUV) * uAtlasSize;
+  let screenPxRange = uPxRange * max(texelFwidth.x, texelFwidth.y);
+  let dist = sd * screenPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
   return vec4<f32>(uTextColor.rgb, uTextColor.a * alpha);
@@ -135,6 +151,7 @@ SDL_gpu (SPIR-V) expects fragment textures in set 2 and uniform buffers in set 3
 @group(2) @binding(1) var msdfSampler : sampler;
 @group(3) @binding(0) var<uniform> uTextColor : vec4<f32>;
 @group(3) @binding(1) var<uniform> uPxRange : f32;
+@group(3) @binding(2) var<uniform> uAtlasSize : vec2<f32>;
 
 fn median(r: f32, g: f32, b: f32) -> f32 {
   return max(min(r, g), min(max(r, g), b));
@@ -144,7 +161,9 @@ fn median(r: f32, g: f32, b: f32) -> f32 {
 fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
   let sample = textureSample(msdfTex, msdfSampler, vUV).rgb;
   let sd = median(sample.r, sample.g, sample.b) - 0.5;
-  let dist = sd * uPxRange;
+  let texelFwidth = fwidth(vUV) * uAtlasSize;
+  let screenPxRange = uPxRange * max(texelFwidth.x, texelFwidth.y);
+  let dist = sd * screenPxRange;
   let w = fwidth(dist);
   let alpha = smoothstep(-w, w, dist);
   return vec4<f32>(uTextColor.rgb, uTextColor.a * alpha);
@@ -156,5 +175,7 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 - Sample MSDF textures in **linear color space** (disable sRGB sampling).
 - Use **bilinear filtering** for MSDF textures.
 - Premultiplied alpha is recommended if your pipeline expects it.
+- Edges are colored in **at least two channels** (yellow/cyan/magenta), which
+  avoids single-channel artifacts in MSDF/MTSDF.
 - For typical sizes, keep MSDF `range` between 2 and 8 pixels; if you increase it, also raise `atlas.atlasPadding`.
 - If you see interior specks, lower `correction.channelThreshold` (e.g. `0.1` → `0.05`), raise `correction.edgeThreshold` (e.g. `1.0` → `1.5`), and increase `range`/`atlas.atlasPadding`.
