@@ -1,10 +1,12 @@
 module MSDF.Generated
   ( generateMSDF
   , generateMSDFWithConfig
+  , generateMSDFFromBytes
   , generateMSDFFromTTF
   , generateMSDFOrThrow
   , generateMTSDF
   , generateMTSDFWithConfig
+  , generateMTSDFFromBytes
   , generateMTSDFFromTTF
   , generateMTSDFOrThrow
   ) where
@@ -12,6 +14,7 @@ module MSDF.Generated
 import Control.Exception (SomeException, evaluate, try)
 import Control.DeepSeq (deepseq)
 import Control.Monad (forM_)
+import qualified Data.ByteString as BS
 import Control.Parallel.Strategies (parListChunk, rdeepseq, withStrategy)
 import Data.Array (Array, array, listArray, accumArray, bounds, (!), (//))
 import Data.Array.ST (STUArray, newArray, writeArray, freeze)
@@ -54,6 +57,13 @@ generateMSDFWithConfig cfg path = do
 generateMSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas
 generateMSDFFromTTF cfg ttf = buildAtlas cfg ttf
 
+-- | Generate an MSDF atlas from a TTF ByteString.
+generateMSDFFromBytes :: MSDFConfig -> BS.ByteString -> Either ParseError MSDFAtlas
+generateMSDFFromBytes cfg bs =
+  case parseTTFBytes bs of
+    Left err -> Left err
+    Right ttf -> Right (buildAtlas cfg ttf)
+
 generateMSDFOrThrow :: FilePath -> IO MSDFAtlas
 generateMSDFOrThrow path = do
   result <- generateMSDF path
@@ -72,6 +82,10 @@ generateMTSDFWithConfig cfg = generateMSDFWithConfig (cfg { outputFormat = Bitma
 -- | Generate an MTSDF atlas from a parsed TTF.
 generateMTSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas
 generateMTSDFFromTTF cfg = generateMSDFFromTTF (cfg { outputFormat = BitmapMTSDF })
+
+-- | Generate an MTSDF atlas from a TTF ByteString.
+generateMTSDFFromBytes :: MSDFConfig -> BS.ByteString -> Either ParseError MSDFAtlas
+generateMTSDFFromBytes cfg bs = generateMSDFFromBytes (cfg { outputFormat = BitmapMTSDF }) bs
 
 generateMTSDFOrThrow :: FilePath -> IO MSDFAtlas
 generateMTSDFOrThrow path = do
@@ -98,7 +112,7 @@ buildAtlas cfg ttf =
       codepointIndex = arrayFromList codepointEntries
       selector = glyphSelector cfg.glyphSet mappingsUnique
       glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
-      (glyphsPacked, atlasImage) = if cfg.packAtlas
+      (glyphsPacked, atlasImage) = if cfg.atlas.packAtlas
                                    then packAtlas cfg glyphs
                                    else (glyphs, Nothing)
       glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphsPacked)
@@ -149,7 +163,7 @@ buildAtlas cfg ttf =
        , pixelSize = cfg.pixelSize
        , range = cfg.range
        , scale = scale
-       , atlasPadding = cfg.atlasPadding
+       , atlasPadding = cfg.atlas.atlasPadding
        , atlas = atlasImage
       , glyphs = glyphArray
       , codepointIndex = codepointIndex
@@ -316,7 +330,7 @@ data SkylineNode = SkylineNode
 
 packAtlas :: MSDFConfig -> [GlyphMSDF] -> ([GlyphMSDF], Maybe AtlasImage)
 packAtlas cfg glyphs =
-  let pad = max 0 cfg.atlasPadding
+  let pad = max 0 cfg.atlas.atlasPadding
       rects = [ PackRect i (bmp.width + 2 * pad) (bmp.height + 2 * pad) bmp.width bmp.height
               | (i, g) <- zip [0..] glyphs
               , let bmp = g.bitmap
@@ -365,10 +379,10 @@ toPlacement atlasW atlasH pad p =
 
 chooseAtlasSize :: MSDFConfig -> [PackRect] -> Maybe (Int, Int, [PackPlacement])
 chooseAtlasSize cfg rects =
-  let maxDim = max 1 cfg.atlasMaxSize
-      minDim0 = max cfg.atlasMinSize (maximum [ r.slotW | r <- rects ])
-      minDim = if cfg.atlasPowerOfTwo then nextPow2 minDim0 else minDim0
-      sizes = if cfg.atlasPowerOfTwo
+  let maxDim = max 1 cfg.atlas.atlasMaxSize
+      minDim0 = max cfg.atlas.atlasMinSize (maximum [ r.slotW | r <- rects ])
+      minDim = if cfg.atlas.atlasPowerOfTwo then nextPow2 minDim0 else minDim0
+      sizes = if cfg.atlas.atlasPowerOfTwo
               then takeWhile (<= maxDim) (iterate (*2) minDim)
               else [minDim .. maxDim]
       sorted = sortOn (\r -> (-r.slotH, -r.slotW, r.glyphIndex)) rects
@@ -377,7 +391,7 @@ chooseAtlasSize cfg rects =
         case packWithWidth w sorted of
           Nothing -> trySize ws
           Just (placements, hUsed) ->
-            let h = if cfg.atlasPowerOfTwo then nextPow2 hUsed else hUsed
+            let h = if cfg.atlas.atlasPowerOfTwo then nextPow2 hUsed else hUsed
             in if h <= maxDim then Just (w, h, placements) else trySize ws
   in trySize sizes
 

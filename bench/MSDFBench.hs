@@ -31,8 +31,8 @@ main = do
         { MSDF.pixelSize = pixelSize
         , MSDF.glyphSet = glyphSet
         }
-      cfgNoPack = cfgBase { MSDF.packAtlas = False }
-      cfgPack = cfgBase { MSDF.packAtlas = True }
+      cfgNoPack = cfgBase { MSDF.atlas = cfgBase.atlas { MSDF.packAtlas = False } }
+      cfgPack = cfgBase { MSDF.atlas = cfgBase.atlas { MSDF.packAtlas = True } }
   tNoPack <- timePure "generate (no pack)" (generateMSDFFromTTF cfgNoPack ttf)
   tPack <- timePure "generate (pack)" (generateMSDFFromTTF cfgPack ttf)
   printf "packing delta (approx): %.2f ms\n" (tPack - tNoPack)

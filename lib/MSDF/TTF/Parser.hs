@@ -15,6 +15,7 @@ module MSDF.TTF.Parser
   , normalizeLocation
   , defaultLocation
   , parseTTF
+  , parseTTFBytes
   , parseTTFUnsafe
   , glyphOutline
   , glyphOutlineAt
@@ -24,7 +25,8 @@ module MSDF.TTF.Parser
   , compositeComponentCount
   ) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, try, evaluate)
+import qualified Data.ByteString as BS
 import Data.Array (Array, array, bounds, inRange, (!))
 import Data.Bits (testBit, shiftL, (.|.), (.&.))
 import Data.Char (chr)
@@ -35,6 +37,7 @@ import MSDF.Binary
 import MSDF.Outline (Point(..))
 import MSDF.TTF.GPOS (KerningPairRaw(..), GPOSAll(..), GPOSMarksRaw(..), parseGPOSAll)
 import MSDF.TTF.Variations
+import System.IO.Unsafe (unsafePerformIO)
 
 within :: ByteBuffer -> Int -> Int -> Bool
 within bb off size =
@@ -137,9 +140,23 @@ parseTTF path = do
       pure (Left (ParseError { context = "parseTTF", message = show e }))
     Right ttf -> pure (Right ttf)
 
+parseTTFBytes :: BS.ByteString -> Either ParseError TTF
+parseTTFBytes bs =
+  unsafePerformIO $ do
+    result <- try (evaluate (parseTTFBuffer (readByteBufferBytes bs)))
+    case result of
+      Left (e :: SomeException) ->
+        pure (Left (ParseError { context = "parseTTFBytes", message = show e }))
+      Right ttf -> pure (Right ttf)
+{-# NOINLINE parseTTFBytes #-}
+
 parseTTFUnsafe :: FilePath -> IO TTF
 parseTTFUnsafe path = do
   bb <- readByteBuffer path
+  pure (parseTTFBuffer bb)
+
+parseTTFBuffer :: ByteBuffer -> TTF
+parseTTFBuffer bb =
   let tables = parseTableDirectory bb
       headTbl = requireTable "head" tables bb
       hheaTbl = requireTable "hhea" tables bb
@@ -185,22 +202,22 @@ parseTTFUnsafe path = do
                 vvar = vvarTbl >>= parseVvar
                 mvar = mvarTbl >>= parseMvar
             in Just (Variations fvar avar gvar hvar vvar mvar)
-  pure TTF
-    { head = headInfo
-    , hhea = hhea
-    , vhea = vhea
-    , maxp = maxp
-    , hmtx = hmtx
-    , vmtx = vmtx
-    , loca = loca
-    , glyf = glyfTbl
-    , cmap = cmap
-    , kern = kern
-    , gpos = gpos
-    , gposMarks = gposMarks
-    , name = name
-    , variations = variations
-    }
+  in TTF
+      { head = headInfo
+      , hhea = hhea
+      , vhea = vhea
+      , maxp = maxp
+      , hmtx = hmtx
+      , vmtx = vmtx
+      , loca = loca
+      , glyf = glyfTbl
+      , cmap = cmap
+      , kern = kern
+      , gpos = gpos
+      , gposMarks = gposMarks
+      , name = name
+      , variations = variations
+      }
 
 -- Table directory -----------------------------------------------------------
 

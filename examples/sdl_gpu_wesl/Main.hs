@@ -8,7 +8,7 @@ import qualified Data.Array.Unboxed as UA
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, floatLE, word8, toLazyByteString)
 import qualified Data.ByteString.Lazy as BL
-import Data.Char (ord)
+import Data.Char (ord, toLower)
 import Data.List (foldl', isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Control.Monad (when)
@@ -45,9 +45,16 @@ data CliOptions = CliOptions
   , rangeOpt :: Maybe Int
   , paddingOpt :: Maybe Int
   , correctionOpt :: Maybe Double
-  , speckleOpt :: Maybe Double
+  , edgeOpt :: Maybe Double
+  , hardOpt :: Maybe Double
   , conflictOpt :: Maybe Double
   , flatnessOpt :: Maybe Double
+  , signModeOpt :: Maybe MSDF.SignMode
+  , fillRuleOpt :: Maybe MSDF.FillRule
+  , overlapOpt :: Maybe Bool
+  , overlapEpsOpt :: Maybe Double
+  , coloringOpt :: Maybe MSDF.ColoringStrategy
+  , pseudoOpt :: Maybe Bool
   , packAtlasOpt :: Maybe Bool
   }
 
@@ -59,9 +66,16 @@ defaultCliOptions =
     , rangeOpt = Nothing
     , paddingOpt = Nothing
     , correctionOpt = Nothing
-    , speckleOpt = Nothing
+    , edgeOpt = Nothing
+    , hardOpt = Nothing
     , conflictOpt = Nothing
     , flatnessOpt = Nothing
+    , signModeOpt = Nothing
+    , fillRuleOpt = Nothing
+    , overlapOpt = Nothing
+    , overlapEpsOpt = Nothing
+    , coloringOpt = Nothing
+    , pseudoOpt = Nothing
     , packAtlasOpt = Nothing
     }
 
@@ -74,12 +88,16 @@ usage :: String
 usage =
   unlines
     [ "msdf-sdl-gen [--font PATH] [--pixel-size N] [--range N] [--padding N]"
-    , "             [--correction X] [--speckle X] [--conflict X] [--flatness X]"
+    , "             [--correction X] [--edge-threshold X] [--hard-threshold X]"
+    , "             [--conflict X] [--flatness X]"
+    , "             [--sign-mode winding|scanline] [--fill-rule nonzero|odd|positive|negative]"
+    , "             [--overlap | --no-overlap] [--overlap-epsilon X]"
+    , "             [--coloring simple|inktrap|distance] [--pseudo-distance | --no-pseudo-distance]"
     , "             [--no-pack]"
     , ""
     , "Examples:"
     , "  msdf-sdl-gen --font /path/to/font.ttf"
-    , "  msdf-sdl-gen --range 16 --padding 24 --correction 0.02 --speckle 1.0"
+    , "  msdf-sdl-gen --range 16 --padding 24 --correction 0.08 --edge-threshold 1.0"
     ]
 
 main :: IO ()
@@ -103,16 +121,16 @@ main = do
     ParseOk parsed -> pure parsed
 
   fontPath <- resolveFontPath baseDir opts
-  let cfgBase = MSDF.defaultMSDFConfig
+  let cfg0 = MSDF.defaultMSDFConfig
+      cfgBase = cfg0
         { MSDF.pixelSize = 256
         , MSDF.range = 12
-        , MSDF.atlasPadding = 16
-        , MSDF.msdfCorrectionThreshold = 0.05
-        , MSDF.windingFlatness = 0.02
-        , MSDF.speckleThreshold = 1.0
-        , MSDF.edgeConflictThreshold = 1.0
+        , MSDF.atlas = cfg0.atlas { MSDF.atlasPadding = 16, MSDF.packAtlas = True }
+        , MSDF.correction = cfg0.correction { MSDF.channelThreshold = 0.1, MSDF.edgeThreshold = 1.0, MSDF.hardThreshold = 0.05 }
+        , MSDF.outline = cfg0.outline { MSDF.windingFlatness = 0.02 }
+        , MSDF.distance = cfg0.distance { MSDF.signMode = MSDF.SignScanline }
+        , MSDF.coloring = cfg0.coloring { MSDF.conflictDistance = 1.0 }
         , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
-        , MSDF.packAtlas = True
         }
       cfg = applyCliOverrides opts cfgBase
   parsed <- parseTTF fontPath
@@ -198,15 +216,37 @@ writeAtlas outDir cfgBase ttf (label, fmt, centerX, writeDefault) =
 
 applyCliOverrides :: CliOptions -> MSDF.MSDFConfig -> MSDF.MSDFConfig
 applyCliOverrides opts cfg =
-  cfg
+  let atlasCfg = cfg.atlas
+      corrCfg = cfg.correction
+      outlineCfg = cfg.outline
+      coloringCfg = cfg.coloring
+      distCfg = cfg.distance
+  in cfg
     { MSDF.pixelSize = fromMaybe cfg.pixelSize opts.pixelSizeOpt
     , MSDF.range = fromMaybe cfg.range opts.rangeOpt
-    , MSDF.atlasPadding = fromMaybe cfg.atlasPadding opts.paddingOpt
-    , MSDF.msdfCorrectionThreshold = fromMaybe cfg.msdfCorrectionThreshold opts.correctionOpt
-    , MSDF.speckleThreshold = fromMaybe cfg.speckleThreshold opts.speckleOpt
-    , MSDF.edgeConflictThreshold = fromMaybe cfg.edgeConflictThreshold opts.conflictOpt
-    , MSDF.windingFlatness = fromMaybe cfg.windingFlatness opts.flatnessOpt
-    , MSDF.packAtlas = fromMaybe cfg.packAtlas opts.packAtlasOpt
+    , MSDF.atlas = atlasCfg
+        { MSDF.atlasPadding = fromMaybe atlasCfg.atlasPadding opts.paddingOpt
+        , MSDF.packAtlas = fromMaybe atlasCfg.packAtlas opts.packAtlasOpt
+        }
+    , MSDF.correction = corrCfg
+        { MSDF.channelThreshold = fromMaybe corrCfg.channelThreshold opts.correctionOpt
+        , MSDF.edgeThreshold = fromMaybe corrCfg.edgeThreshold opts.edgeOpt
+        , MSDF.hardThreshold = fromMaybe corrCfg.hardThreshold opts.hardOpt
+        }
+    , MSDF.coloring = coloringCfg
+        { MSDF.conflictDistance = fromMaybe coloringCfg.conflictDistance opts.conflictOpt
+        , MSDF.strategy = fromMaybe coloringCfg.strategy opts.coloringOpt
+        }
+    , MSDF.outline = outlineCfg
+        { MSDF.windingFlatness = fromMaybe outlineCfg.windingFlatness opts.flatnessOpt
+        }
+    , MSDF.distance = distCfg
+        { MSDF.signMode = fromMaybe distCfg.signMode opts.signModeOpt
+        , MSDF.fillRule = fromMaybe distCfg.fillRule opts.fillRuleOpt
+        , MSDF.overlapSupport = fromMaybe distCfg.overlapSupport opts.overlapOpt
+        , MSDF.overlapEpsilon = fromMaybe distCfg.overlapEpsilon opts.overlapEpsOpt
+        , MSDF.pseudoDistance = fromMaybe distCfg.pseudoDistance opts.pseudoOpt
+        }
     }
 
 parseArgs :: [String] -> CliOptions -> ParseResult
@@ -221,12 +261,32 @@ parseArgs ("--padding":n:rest) opts =
   parseNumber "padding" n (\v -> opts { paddingOpt = Just v }) rest
 parseArgs ("--correction":x:rest) opts =
   parseDouble "correction" x (\v -> opts { correctionOpt = Just v }) rest
-parseArgs ("--speckle":x:rest) opts =
-  parseDouble "speckle" x (\v -> opts { speckleOpt = Just v }) rest
+parseArgs ("--edge-threshold":x:rest) opts =
+  parseDouble "edge-threshold" x (\v -> opts { edgeOpt = Just v }) rest
+parseArgs ("--hard-threshold":x:rest) opts =
+  parseDouble "hard-threshold" x (\v -> opts { hardOpt = Just v }) rest
 parseArgs ("--conflict":x:rest) opts =
   parseDouble "conflict" x (\v -> opts { conflictOpt = Just v }) rest
 parseArgs ("--flatness":x:rest) opts =
   parseDouble "flatness" x (\v -> opts { flatnessOpt = Just v }) rest
+parseArgs ("--sign-mode":v:rest) opts =
+  case parseSignMode v of
+    Just mode -> parseArgs rest opts { signModeOpt = Just mode }
+    Nothing -> CliParseError ("invalid sign-mode: " <> v)
+parseArgs ("--fill-rule":v:rest) opts =
+  case parseFillRule v of
+    Just rule -> parseArgs rest opts { fillRuleOpt = Just rule }
+    Nothing -> CliParseError ("invalid fill-rule: " <> v)
+parseArgs ("--overlap":rest) opts = parseArgs rest opts { overlapOpt = Just True }
+parseArgs ("--no-overlap":rest) opts = parseArgs rest opts { overlapOpt = Just False }
+parseArgs ("--overlap-epsilon":x:rest) opts =
+  parseDouble "overlap-epsilon" x (\v -> opts { overlapEpsOpt = Just v }) rest
+parseArgs ("--coloring":v:rest) opts =
+  case parseColoring v of
+    Just mode -> parseArgs rest opts { coloringOpt = Just mode }
+    Nothing -> CliParseError ("invalid coloring: " <> v)
+parseArgs ("--pseudo-distance":rest) opts = parseArgs rest opts { pseudoOpt = Just True }
+parseArgs ("--no-pseudo-distance":rest) opts = parseArgs rest opts { pseudoOpt = Just False }
 parseArgs ("--no-pack":rest) opts = parseArgs rest opts { packAtlasOpt = Just False }
 parseArgs (arg:rest) opts
   | "-" `isPrefixOf` arg = CliParseError ("unknown option: " <> arg)
@@ -257,6 +317,30 @@ readDouble :: String -> Maybe Double
 readDouble s =
   case reads s of
     [(v, "")] -> Just v
+    _ -> Nothing
+
+parseSignMode :: String -> Maybe MSDF.SignMode
+parseSignMode s =
+  case map toLower s of
+    "winding" -> Just MSDF.SignWinding
+    "scanline" -> Just MSDF.SignScanline
+    _ -> Nothing
+
+parseFillRule :: String -> Maybe MSDF.FillRule
+parseFillRule s =
+  case map toLower s of
+    "nonzero" -> Just MSDF.FillNonZero
+    "odd" -> Just MSDF.FillOdd
+    "positive" -> Just MSDF.FillPositive
+    "negative" -> Just MSDF.FillNegative
+    _ -> Nothing
+
+parseColoring :: String -> Maybe MSDF.ColoringStrategy
+parseColoring s =
+  case map toLower s of
+    "simple" -> Just MSDF.ColoringSimple
+    "inktrap" -> Just MSDF.ColoringInktrap
+    "distance" -> Just MSDF.ColoringDistance
     _ -> Nothing
 
 bitmapToRgbaBytes :: BitmapFormat -> UA.UArray Int Word8 -> BS.ByteString

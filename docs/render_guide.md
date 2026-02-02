@@ -6,7 +6,7 @@ It assumes you already have an `MSDFAtlas` and know how to draw textured quads.
 ## Data model
 
 - `GlyphMSDF.bitmap` contains an RGB MSDF texture (one glyph per bitmap).
-- `GlyphMSDF.placement` is `Just` when `MSDFConfig.packAtlas` is enabled and
+- `GlyphMSDF.placement` is `Just` when `MSDFConfig.atlas.packAtlas` is enabled and
   describes UVs inside the packed atlas.
 - `GlyphMSDF.bbox` is in **pixels**, already scaled to `MSDFConfig.pixelSize`.
 - `GlyphMSDF.advance` and `GlyphMSDF.bearingX` are also in **pixels**.
@@ -156,5 +156,5 @@ fn fs_main(@location(0) vUV: vec2<f32>) -> @location(0) vec4<f32> {
 - Sample MSDF textures in **linear color space** (disable sRGB sampling).
 - Use **bilinear filtering** for MSDF textures.
 - Premultiplied alpha is recommended if your pipeline expects it.
-- For typical sizes, keep MSDF `range` between 2 and 8 pixels; if you increase it, also raise `atlasPadding`.
-- If you see interior specks, lower `msdfCorrectionThreshold` (e.g. `0.05` → `0.02`), raise `speckleThreshold` (e.g. `1.0`), and increase `range`/`atlasPadding`.
+- For typical sizes, keep MSDF `range` between 2 and 8 pixels; if you increase it, also raise `atlas.atlasPadding`.
+- If you see interior specks, lower `correction.channelThreshold` (e.g. `0.1` → `0.05`), raise `correction.edgeThreshold` (e.g. `1.0` → `1.5`), and increase `range`/`atlas.atlasPadding`.

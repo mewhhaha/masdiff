@@ -74,5 +74,5 @@ Notes:
 
 - Use linear sampling and disable sRGB for MSDF textures.
 - `uPxRange` should be computed using `pixelRange` or `pixelRangeForAtlas`.
-- Use atlas UVs (`GlyphPlacement`) when `MSDFConfig.packAtlas` is enabled.
+- Use atlas UVs (`GlyphPlacement`) when `MSDFConfig.atlas.packAtlas` is enabled.
 - For MTSDF output, use the alpha channel (`sample.a`) as the signed distance.

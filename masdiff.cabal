@@ -41,11 +41,15 @@ library
                         , NoFieldSelectors
                         , OverloadedRecordDot
     exposed-modules:  MSDF.Types
+                    , MSDF.Config
                     , MSDF.Binary
                     , MSDF.TTF.Parser
                     , MSDF.TTF.GPOS
                     , MSDF.TTF.Variations
                     , MSDF.Outline
+                    , MSDF.Geometry
+                    , MSDF.Distance
+                    , MSDF.EdgeColoring
                     , MSDF.MSDF
                     , MSDF.Render
                     , MSDF.Generated
@@ -53,6 +57,7 @@ library
     -- other-extensions:
     build-depends:    base ^>=4.21.0.0
                     , array ^>=0.5.8.0
+                    , bytestring ^>=0.12.1.0
                     , containers ^>=0.7
                     , deepseq ^>=1.5.0.0
                     , parallel ^>=3.2.2.0
@@ -68,6 +73,7 @@ test-suite msdf-tests
     autogen-modules:  Paths_masdiff
     build-depends:    base ^>=4.21.0.0
                     , array ^>=0.5.8.0
+                    , bytestring ^>=0.12.1.0
                     , masdiff
     default-language: GHC2024
     default-extensions: DuplicateRecordFields

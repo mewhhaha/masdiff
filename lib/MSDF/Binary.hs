@@ -1,6 +1,7 @@
 module MSDF.Binary
   ( ByteBuffer(..)
   , readByteBuffer
+  , readByteBufferBytes
   , slice
   , readU8
   , readU16BE
@@ -11,10 +12,12 @@ module MSDF.Binary
   ) where
 
 import Data.Bits ((.|.), shiftL)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Internal as BSI
 import Data.Char (chr)
 import Data.Int (Int16, Int32)
 import Data.Word (Word8, Word16, Word32)
-import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr, castForeignPtr)
 import Foreign.Ptr (Ptr, plusPtr)
 import Foreign.Storable (peekByteOff)
 import System.IO (Handle, IOMode(ReadMode), withBinaryFile, hFileSize, hGetBuf)
@@ -35,6 +38,11 @@ readByteBuffer path = withBinaryFile path ReadMode $ \h -> do
   withForeignPtr fptr $ \p -> do
     readAll h p len
     pure (ByteBuffer fptr len 0)
+
+readByteBufferBytes :: BS.ByteString -> ByteBuffer
+readByteBufferBytes bs =
+  let (fp, off, len) = BSI.toForeignPtr bs
+  in ByteBuffer (castForeignPtr fp) len off
 
 slice :: ByteBuffer -> Int -> Int -> ByteBuffer
 slice bb off len

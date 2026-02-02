@@ -48,13 +48,13 @@ import MSDF.TTF.Parser (ParseError(..))
 
 main :: IO ()
 main = do
-  let cfg = defaultMSDFConfig
+  let cfg0 = defaultMSDFConfig
+      cfg = cfg0
         { MSDF.pixelSize = 24
         , MSDF.glyphSet = GlyphSetCodepoints [65,66,67]
         , MSDF.parallelism = 64 -- optional: chunk size for parallel rendering
         , MSDF.variations = [("wght", 700)] -- optional: variable font axes
-        , MSDF.packAtlas = True
-        , MSDF.atlasPadding = 1
+        , MSDF.atlas = cfg0.atlas { MSDF.packAtlas = True, MSDF.atlasPadding = 1 }
         , MSDF.outputFormat = BitmapMSDF -- or BitmapMTSDF
         }
   result <- generateMSDFWithConfig cfg "path/to/font.ttf"
@@ -77,6 +77,19 @@ atlasBold <- generateMSDFWithConfig cfgBold "assets/Inter/Inter-VariableFont_ops
 ```sh
 cabal test msdf-tests
 ```
+
+## Reference comparison (msdfgen)
+
+If you have `msdfgen` installed, you can generate side‑by‑side outputs for quick visual comparison:
+
+```sh
+tools/msdfgen_compare.sh assets/Inter/Inter-VariableFont_opsz,wght.ttf masdiff
+```
+
+This writes:
+
+- `out/msdfgen_compare/masdiff` (masdiff raw + metadata)
+- `out/msdfgen_compare/msdfgen` (msdfgen PNGs)
 
 ## API overview (quick peek)
 
@@ -325,9 +338,8 @@ main = do
   let cfg = MSDF.defaultMSDFConfig
         { MSDF.pixelSize = 48
         , MSDF.range = 8
-        , MSDF.atlasPadding = 12
         , MSDF.glyphSet = GlyphSetCodepoints [fromEnum 'H']
-        , MSDF.packAtlas = True
+        , MSDF.atlas = MSDF.defaultMSDFConfig.atlas { MSDF.atlasPadding = 12, MSDF.packAtlas = True }
         }
   Right atlas <- generateMSDFWithConfig cfg "assets/Inter/Inter-VariableFont_opsz,wght.ttf"
   let Just img = atlas.atlas
@@ -524,7 +536,7 @@ Notes:
 - `glyphQuad` + `glyphUV` keeps the math consistent with SDL’s NDC (y-up) coords.
 - Full runnable example (Haskell generator + SDL renderer) lives in `examples/sdl_gpu_wesl` and uses spirdo to compile WESL → SPIR‑V.
 - From repo root, run `just demo` to build + capture a screenshot of the SDL example (see `examples/sdl_gpu_wesl/README.md`). Use `SDL_GPU_DRIVER=vulkan` if you need to force the backend.
-- If you see tiny specks at sharp corners, lower `msdfCorrectionThreshold` (e.g. `0.05` → `0.02`), raise `speckleThreshold` (e.g. `1.0`), and increase `range`/`atlasPadding`.
+- If you see tiny specks at sharp corners, lower `correction.channelThreshold` (e.g. `0.1` → `0.05`), raise `correction.edgeThreshold` (e.g. `1.0` → `1.5`), and increase `range`/`atlas.atlasPadding`.
 
 ## Limitations (sad but true)
 

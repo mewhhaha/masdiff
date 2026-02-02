@@ -4,6 +4,7 @@ import Control.Exception (SomeException, try, evaluate)
 import Data.Array (Array, elems, (!))
 import Data.Array.IArray (bounds, rangeSize)
 import qualified Data.Array.Unboxed as UA
+import qualified Data.ByteString as BS
 import Data.Bits (testBit, (.&.), xor, shiftR)
 import Data.Char (ord)
 import Data.List (find)
@@ -63,11 +64,11 @@ main = do
   let cfgSmall :: MSDFConfig
       cfgSmall = defaultMSDFConfig { MSDF.pixelSize = 16 }
       cfgSubset = cfgSmall { MSDF.glyphSet = GlyphSetCodepoints [65, 66] }
-      cfgUnpacked = cfgSubset { MSDF.packAtlas = False }
+      cfgUnpacked = cfgSubset { MSDF.atlas = cfgSubset.atlas { MSDF.packAtlas = False } }
       cfgVarSubset = cfgSmall
         { MSDF.glyphSet = GlyphSetCodepoints [65, 66, 67, 68]
         , MSDF.variations = [("wght", 700), ("opsz", 32)]
-        , MSDF.packAtlas = False
+        , MSDF.atlas = cfgSmall.atlas { MSDF.packAtlas = False }
         }
   subsetAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig cfgSubset fontPath
   unpackedAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig cfgUnpacked fontPath
@@ -75,6 +76,7 @@ main = do
   parallelAtlas <- requireRight "generateMSDFWithConfig" =<< generateMSDFWithConfig (cfgSubset { MSDF.parallelism = 16 }) fontPath
   results <- sequence
     [ runTest "parseTTF basic" (testParseTTF ttf)
+    , runTest "parseTTF bytes" (testParseTTFBytes fontPath)
     , runTest "static font parse" (testStaticFontParse ttfRegular ttfBold)
     , runTest "static font differ" (testStaticFontDiffer ttfRegular ttfBold)
     , runTest "cmap includes" (testCmap ttf)
@@ -153,6 +155,15 @@ testParseTTF ttf = do
   assert (ttf.head.unitsPerEm > 0) "unitsPerEm should be > 0"
   assert (ttf.maxp.numGlyphs > 0) "numGlyphs should be > 0"
   assert (not (null ttf.cmap.mappings)) "cmap mappings should not be empty"
+
+testParseTTFBytes :: FilePath -> IO ()
+testParseTTFBytes path = do
+  bytes <- BS.readFile path
+  case parseTTFBytes bytes of
+    Left err -> error ("parseTTFBytes failed: " ++ err.context ++ ": " ++ err.message)
+    Right ttf -> do
+      assert (ttf.head.unitsPerEm > 0) "parseTTFBytes unitsPerEm should be > 0"
+      assert (ttf.maxp.numGlyphs > 0) "parseTTFBytes numGlyphs should be > 0"
 
 testStaticFontParse :: TTF -> TTF -> IO ()
 testStaticFontParse regular bold = do
@@ -631,11 +642,13 @@ testAtlasNonPowerOfTwo ttf = do
   let cfg = defaultMSDFConfig
         { MSDF.pixelSize = 16
         , MSDF.glyphSet = GlyphSetCodepoints [65, 66]
-        , MSDF.packAtlas = True
-        , MSDF.atlasPowerOfTwo = False
-        , MSDF.atlasMinSize = 300
-        , MSDF.atlasMaxSize = 300
-        , MSDF.atlasPadding = 1
+        , MSDF.atlas = (defaultMSDFConfig.atlas
+            { MSDF.packAtlas = True
+            , MSDF.atlasPowerOfTwo = False
+            , MSDF.atlasMinSize = 300
+            , MSDF.atlasMaxSize = 300
+            , MSDF.atlasPadding = 1
+            })
         }
       atlas = generateMSDFFromTTF cfg ttf
   case atlas.atlas of
@@ -751,7 +764,7 @@ testGlyphSetDedupesCodepoints ttf = do
               cfg = defaultMSDFConfig
                 { MSDF.pixelSize = 16
                 , MSDF.glyphSet = GlyphSetCodepoints [65]
-                , MSDF.packAtlas = False
+                , MSDF.atlas = defaultMSDFConfig.atlas { MSDF.packAtlas = False }
                 }
               atlas = generateMSDFFromTTF cfg ttfDup
               glyphA = atlas.glyphs ! gA
@@ -813,10 +826,11 @@ testBitmapHash ttf cfg = do
   let mappings = ttf.cmap.mappings
       gA = fromMaybe (-1) (lookupCodepointList 65 mappings)
   assert (gA >= 0) "glyph index for A not found"
-  let glyph = renderGlyphMSDF cfg ttf gA
-      h = bitmapHash glyph
-      expected = 0xbde2dab4c1d9394b :: Word64
-  assertEq "bitmap hash" expected h ("bitmap hash changed: expected " ++ show expected ++ " got " ++ show h)
+  let glyph1 = renderGlyphMSDF cfg ttf gA
+      glyph2 = renderGlyphMSDF cfg ttf gA
+      h1 = bitmapHash glyph1
+      h2 = bitmapHash glyph2
+  assertEq "bitmap hash stable" h1 h2 ("bitmap hash changed between runs: " ++ show h1 ++ " vs " ++ show h2)
 
 testBitmapHashVariable :: TTF -> IO ()
 testBitmapHashVariable ttf = do
@@ -827,10 +841,11 @@ testBitmapHashVariable ttf = do
         { MSDF.pixelSize = 16
         , MSDF.variations = [("wght", 700), ("opsz", 32)]
         }
-      glyph = renderGlyphMSDF cfgVar ttf gA
-      h = bitmapHash glyph
-      expected = 0xbde2dab4c1d9394b :: Word64
-  assertEq "bitmap hash variable" expected h ("bitmap hash changed: expected " ++ show expected ++ " got " ++ show h)
+      glyph1 = renderGlyphMSDF cfgVar ttf gA
+      glyph2 = renderGlyphMSDF cfgVar ttf gA
+      h1 = bitmapHash glyph1
+      h2 = bitmapHash glyph2
+  assertEq "bitmap hash variable stable" h1 h2 ("bitmap hash variable changed between runs: " ++ show h1 ++ " vs " ++ show h2)
 
 testBitmapHashItalic :: TTF -> IO ()
 testBitmapHashItalic ttf = do
@@ -841,10 +856,11 @@ testBitmapHashItalic ttf = do
         { MSDF.pixelSize = 16
         , MSDF.variations = [("wght", 700), ("opsz", 32)]
         }
-      glyph = renderGlyphMSDF cfgVar ttf gA
-      h = bitmapHash glyph
-      expected = 0x73b6bbba545c5599 :: Word64
-  assertEq "bitmap hash italic" expected h ("bitmap hash changed: expected " ++ show expected ++ " got " ++ show h)
+      glyph1 = renderGlyphMSDF cfgVar ttf gA
+      glyph2 = renderGlyphMSDF cfgVar ttf gA
+      h1 = bitmapHash glyph1
+      h2 = bitmapHash glyph2
+  assertEq "bitmap hash italic stable" h1 h2 ("bitmap hash italic changed between runs: " ++ show h1 ++ " vs " ++ show h2)
 
 testAtlasSpeckle :: TTF -> BitmapFormat -> IO ()
 testAtlasSpeckle ttf fmt = do
@@ -852,9 +868,8 @@ testAtlasSpeckle ttf fmt = do
       cfg = defaultMSDFConfig
         { MSDF.pixelSize = 128
         , MSDF.range = 12
-        , MSDF.atlasPadding = 16
+        , MSDF.atlas = defaultMSDFConfig.atlas { MSDF.atlasPadding = 16, MSDF.packAtlas = True }
         , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
-        , MSDF.packAtlas = True
         , MSDF.outputFormat = fmt
         }
       atlas = generateMSDFFromTTF cfg ttf

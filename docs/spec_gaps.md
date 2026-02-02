@@ -25,4 +25,5 @@ This document tracks known gaps vs. the TrueType/OpenType specs.
 ## MSDF
 
 - Atlas packing is implemented with a skyline packer; no optimal packing or rotation.
+- Overlap handling uses boundary filtering; no msdfgen-style preprocess/overlap resolution.
 - Edge-coloring correction is heuristic; no full msdfgen conflict/repair pipeline.

@@ -48,12 +48,12 @@ main = do
     Right val -> pure val
   createDirectoryIfMissing True opts.optOutDir
   let cps = nub (map ord opts.optText)
-      cfg = defaultMSDFConfig
+      cfg0 = defaultMSDFConfig
+      cfg = cfg0
         { MSDF.pixelSize = opts.optPixelSize
         , MSDF.range = opts.optRange
-        , MSDF.atlasPadding = opts.optPadding
+        , MSDF.atlas = (cfg0.atlas { MSDF.atlasPadding = opts.optPadding, MSDF.packAtlas = False })
         , MSDF.outputFormat = opts.optFormat
-        , MSDF.packAtlas = False
         }
   mapM_ (dumpGlyph ttf cfg opts.optOutDir) cps
 

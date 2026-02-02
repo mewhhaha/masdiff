@@ -8,10 +8,12 @@ invariants for masdiff.
 - `MSDF.Generated`
   - `generateMSDF :: FilePath -> IO (Either ParseError MSDFAtlas)`
   - `generateMSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)`
+  - `generateMSDFFromBytes :: MSDFConfig -> ByteString -> Either ParseError MSDFAtlas`
   - `generateMSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas`
   - `generateMSDFOrThrow :: FilePath -> IO MSDFAtlas`
   - `generateMTSDF :: FilePath -> IO (Either ParseError MSDFAtlas)`
   - `generateMTSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)`
+  - `generateMTSDFFromBytes :: MSDFConfig -> ByteString -> Either ParseError MSDFAtlas`
   - `generateMTSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas`
   - `generateMTSDFOrThrow :: FilePath -> IO MSDFAtlas`
 - `MSDF.MSDF`
@@ -21,6 +23,8 @@ invariants for masdiff.
   - `GlyphCacheLazy`, `prepareGlyphCacheLazy`, `renderGlyphMSDFCachedLazy` (on-demand outline caching)
   - `defaultMSDFConfig`
   - `renderGlyphMSDF` / `glyphMetricsOnly`
+- `MSDF.Config`
+  - `MSDFConfig`, `AtlasConfig`, `OutlineConfig`, `EdgeColoringConfig`, `DistanceConfig`, `CorrectionConfig`
 - `MSDF.Render`
   - `Origin`, `YAxis` (coordinate conventions)
   - `SamplerHints` (recommended sampling settings)
@@ -36,6 +40,7 @@ invariants for masdiff.
   - `lookupCodepoint`, `lookupKerning`
 - `MSDF.TTF.Parser`
   - `parseTTF`, `parseTTFUnsafe`
+  - `parseTTFBytes`
   - `glyphOutline`, `glyphBBoxRaw`
   - `VariationLocation`, `normalizeLocation`
 
@@ -43,19 +48,16 @@ invariants for masdiff.
 
 - `pixelSize`: output pixel size (used for scaling from font units).
 - `range`: MSDF pixel range (see shader expectations in README).
-- `cornerThreshold`: edge coloring threshold in degrees (msdfgen-style).
 - `glyphSet`: which glyphs to rasterize (others get metrics only).
 - `parallelism`: `0` disables parallel rendering, otherwise chunk size for `parListChunk`.
 - `variations`: axis settings like `[("wght", 700)]` (user-space values).
-- `packAtlas`: when `True`, pack glyphs into a single atlas and populate `atlas`.
-- `atlasPadding`: pixel padding around glyphs in the atlas.
-- `atlasMinSize`/`atlasMaxSize`: atlas size bounds (power‑of‑two when enabled).
-- `atlasPowerOfTwo`: round atlas dimensions to next power‑of‑two.
-- `msdfCorrectionThreshold`: correction threshold for MSDF error smoothing.
 - `outputFormat`: `BitmapMSDF` (RGB) or `BitmapMTSDF` (RGBA with alpha SDF).
-- `windingFlatness`: curve flatness used for inside/outside winding (lower = more accurate, slower).
-- `speckleThreshold`: fix isolated sign speckles near edges when > 0 (distance threshold in pixels).
-- `edgeConflictThreshold`: recolor edges when different-colored edges are within this distance.
+- `atlas`: atlas packing options (`packAtlas`, `atlasPadding`, `atlasMinSize`, `atlasMaxSize`, `atlasPowerOfTwo`).
+- `outline`: outline preprocessing (`windingFlatness`, `contourEpsilon`, `normalizeOrientation`).
+- `coloring`: edge coloring (`cornerAngleDeg`, `minSegments`, `conflictDistance`, `coloringSeed`, `strategy`).
+- `distance`: distance evaluation (`pseudoDistance`, `gridCellSize`, `signEpsilon`, `fillRule`, `signMode`,
+  `overlapSupport`, `overlapEpsilon`).
+- `correction`: error correction (`enableCorrection`, `channelThreshold`, `edgeThreshold`, `hardThreshold`).
 
 ## Determinism and ordering
 

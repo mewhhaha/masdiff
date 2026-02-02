@@ -19,7 +19,19 @@ cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --font /path/to/fo
 If you see specks, try a more conservative generation setup:
 
 ```sh
-cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --range 16 --padding 24 --correction 0.02 --speckle 1.0
+cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --range 16 --padding 24 --correction 0.08 --edge-threshold 1.0
+```
+
+You can also toggle sign mode and overlap handling to match msdfgen behavior:
+
+```sh
+cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --sign-mode scanline --fill-rule nonzero --overlap
+```
+
+And test different edge coloring strategies:
+
+```sh
+cabal run --project-dir=examples/sdl_gpu_wesl msdf-sdl-gen -- --coloring distance
 ```
 
 To check whether artifacts are atlas-related, disable packing:

@@ -1,0 +1,269 @@
+module MSDF.EdgeColoring
+  ( colorEdges
+  ) where
+
+import Data.List (sort)
+import Data.Bits ((.&.))
+import MSDF.Config (EdgeColoringConfig(..), ColoringStrategy(..))
+import MSDF.Distance (buildEdgeIndex, minDistance)
+import MSDF.Outline (flattenEdge)
+import MSDF.Geometry
+  ( Edge(..)
+  , EdgeRef(..)
+  , EdgeColor(..)
+  , ColoredEdge(..)
+  , edgeLengthApprox
+  , edgeSamplePoints
+  , bboxFromEdges
+  )
+import MSDF.Types (BBox(..))
+
+colorEdges :: EdgeColoringConfig -> [[Edge]] -> [ColoredEdge]
+colorEdges cfg contours =
+  let colored = concatMap (colorContour cfg) (zip [0..] contours)
+  in resolveConflicts cfg colored
+
+colorContour :: EdgeColoringConfig -> (Int, [Edge]) -> [ColoredEdge]
+colorContour cfg (contourId, edges) =
+  case edges of
+    [] -> []
+    _ ->
+      let n = length edges
+          joinCorners =
+            [ isCornerFor cfg edges i
+            | i <- [0 .. n - 1]
+            ]
+          cornerStarts = pickCornerStarts cfg n joinCorners
+      in if null cornerStarts
+         then
+           [ ColoredEdge ColorWhite (EdgeRef contourId i e)
+           | (i, e) <- zip [0..] edges
+           ]
+         else
+           let starts = ensureMinSegments cfg.minSegments edges cornerStarts
+               segments = buildSegments contourId edges starts
+               colors = cycle (drop (cfg.coloringSeed `mod` 3) [ColorRed, ColorGreen, ColorBlue])
+          in concat (zipWith colorSegment colors segments)
+
+colorSegment :: EdgeColor -> [EdgeRef] -> [ColoredEdge]
+colorSegment c seg = [ ColoredEdge c er | er <- seg ]
+
+isCorner :: Edge -> Edge -> Double -> Bool
+isCorner e1 e2 thresholdDeg =
+  let (x1, y1) = edgeEndDir e1
+      (x2, y2) = edgeStartDir e2
+      dotp = x1 * x2 + y1 * y2
+      len1 = sqrt (x1 * x1 + y1 * y1)
+      len2 = sqrt (x2 * x2 + y2 * y2)
+      threshold = thresholdDeg * pi / 180
+  in if len1 == 0 || len2 == 0
+     then False
+     else
+       let cosang = max (-1) (min 1 (dotp / (len1 * len2)))
+           ang = acos cosang
+       in ang > threshold
+
+isCornerFor :: EdgeColoringConfig -> [Edge] -> Int -> Bool
+isCornerFor cfg edges i =
+  let n = length edges
+      e1 = edges !! i
+      e2 = edges !! ((i + 1) `mod` n)
+      base = cfg.cornerAngleDeg
+      orient = signum (contourArea edges)
+      crossZ = edgeCross e1 e2
+      concave = if orient >= 0 then crossZ < 0 else crossZ > 0
+      threshold =
+        case cfg.strategy of
+          ColoringInktrap -> if concave then base * 0.5 else base
+          _ -> base
+  in isCorner e1 e2 threshold
+
+edgeCross :: Edge -> Edge -> Double
+edgeCross e1 e2 =
+  let (x1, y1) = edgeEndDir e1
+      (x2, y2) = edgeStartDir e2
+  in x1 * y2 - y1 * x2
+
+contourArea :: [Edge] -> Double
+contourArea edges =
+  case edges of
+    [] -> 0
+    _ ->
+      let segs = concatMap (flattenEdge 0.5) edges
+      in 0.5 * sum [ cross a b | (a, b) <- segs ]
+  where
+    cross (x0, y0) (x1, y1) = x0 * y1 - x1 * y0
+
+edgeStartDir :: Edge -> (Double, Double)
+edgeStartDir (EdgeLine (x0, y0) (x1, y1)) = (x1 - x0, y1 - y0)
+edgeStartDir (EdgeQuad (x0, y0) (x1, y1) _ ) = (x1 - x0, y1 - y0)
+
+edgeEndDir :: Edge -> (Double, Double)
+edgeEndDir (EdgeLine (x0, y0) (x1, y1)) = (x1 - x0, y1 - y0)
+edgeEndDir (EdgeQuad _ (x1, y1) (x2, y2)) = (x2 - x1, y2 - y1)
+
+ensureMinSegments :: Int -> [Edge] -> [Int] -> [Int]
+ensureMinSegments minSegs edges starts =
+  let n = length edges
+      base = uniqueSorted starts
+      anchor = case base of
+        (a:_) -> a
+        [] -> 0
+      merged =
+        if length base >= minSegs
+        then base
+        else uniqueSorted (base ++ splitByLengthFrom edges anchor minSegs)
+  in if n == 0
+     then []
+     else if length merged >= minSegs
+          then merged
+          else uniqueSorted (base ++ splitByIndexFrom anchor n minSegs)
+
+splitByLengthFrom :: [Edge] -> Int -> Int -> [Int]
+splitByLengthFrom edges anchor segments =
+  let n = length edges
+  in if n == 0 || segments <= 0
+     then []
+     else
+       let idxs = indicesFrom anchor n
+           lens = map (\i -> edgeLengthApprox (edges !! i)) idxs
+           total = sum lens
+       in if total <= 1e-6
+          then splitByIndexFrom anchor n segments
+          else
+            let step = total / fromIntegral segments
+                thresholds = [ step * fromIntegral k | k <- [1 .. segments - 1] ]
+                (hits, _cum, _ts) = foldl accumThresholds ([], 0.0, thresholds) (zip idxs lens)
+            in uniqueSorted (anchor : hits)
+
+accumThresholds :: ([Int], Double, [Double]) -> (Int, Double) -> ([Int], Double, [Double])
+accumThresholds (acc, cum, ts) (idx, len) =
+  let cum' = cum + len
+      (hit, rest) = span (<= cum') ts
+      acc' = acc ++ replicate (length hit) idx
+  in (acc', cum', rest)
+
+splitByIndexFrom :: Int -> Int -> Int -> [Int]
+splitByIndexFrom anchor n segments =
+  let step = max 1 (n `div` segments)
+  in uniqueSorted
+       [ (anchor + i * step) `mod` n
+       | i <- [0 .. segments - 1]
+       ]
+
+indicesFrom :: Int -> Int -> [Int]
+indicesFrom anchor n =
+  take n (iterate (\i -> (i + 1) `mod` n) anchor)
+
+pickCornerStarts :: EdgeColoringConfig -> Int -> [Bool] -> [Int]
+pickCornerStarts cfg n corners =
+  let starts = [ (i + 1) `mod` n | i <- [0 .. n - 1], corners !! i ]
+  in case cfg.strategy of
+       ColoringDistance ->
+         if length starts <= cfg.minSegments
+         then starts
+         else sampleCorners cfg.minSegments starts
+       _ -> starts
+
+sampleCorners :: Int -> [Int] -> [Int]
+sampleCorners target starts =
+  let total = length starts
+  in if target <= 0 || total == 0
+     then []
+     else
+       let step :: Double
+           step = fromIntegral total / fromIntegral target
+       in [ starts !! (min (total - 1) (floor (step * fromIntegral i))) | i <- [0 .. target - 1] ]
+
+uniqueSorted :: [Int] -> [Int]
+uniqueSorted xs =
+  case sort xs of
+    [] -> []
+    (y:ys) -> y : go y ys
+  where
+    go _ [] = []
+    go prev (z:zs)
+      | z == prev = go prev zs
+      | otherwise = z : go z zs
+
+buildSegments :: Int -> [Edge] -> [Int] -> [[EdgeRef]]
+buildSegments contourId edges starts =
+  let n = length edges
+      starts' = case starts of
+        [] -> [0]
+        _ -> starts
+      nexts = rotate starts'
+  in zipWith (segmentFrom contourId edges n) starts' nexts
+
+rotate :: [a] -> [a]
+rotate [] = []
+rotate (x:xs) = xs ++ [x]
+
+segmentFrom :: Int -> [Edge] -> Int -> Int -> Int -> [EdgeRef]
+segmentFrom contourId edges n start next =
+  let count = if next > start then next - start else if next == start then n else n - start + next
+  in [ EdgeRef contourId ((start + i) `mod` n) (edges !! ((start + i) `mod` n))
+     | i <- [0 .. count - 1]
+     ]
+
+resolveConflicts :: EdgeColoringConfig -> [ColoredEdge] -> [ColoredEdge]
+resolveConflicts cfg colored =
+  if cfg.conflictDistance <= 0 || length colored <= 1
+  then colored
+  else recolorPasses 2 colored
+  where
+    recolorPasses :: Int -> [ColoredEdge] -> [ColoredEdge]
+    recolorPasses 0 edges = edges
+    recolorPasses n edges =
+      let edges' = recolorOnce cfg edges
+      in if edges' == edges then edges else recolorPasses (n - 1) edges'
+
+recolorOnce :: EdgeColoringConfig -> [ColoredEdge] -> [ColoredEdge]
+recolorOnce cfg edges =
+  let (edgesR, edgesG, edgesB) = splitByColor edges
+      allEdges = map (\e -> e.edgeRef) edges
+      bb = case bboxFromEdges allEdges of
+        Just b -> b
+        Nothing -> BBox 0 0 1 1
+      idxR = buildEdgeIndex 1 bb edgesR
+      idxG = buildEdgeIndex 1 bb edgesG
+      idxB = buildEdgeIndex 1 bb edgesB
+      distTo idx er =
+        minimum [ minDistance idx p | p <- edgeSamplePoints er.edge ]
+      pickColor cur er =
+        let dR = distTo idxR er
+            dG = distTo idxG er
+            dB = distTo idxB er
+            otherA = case cur of
+              ColorRed -> Just (ColorGreen, dG, ColorBlue, dB)
+              ColorGreen -> Just (ColorRed, dR, ColorBlue, dB)
+              ColorBlue -> Just (ColorRed, dR, ColorGreen, dG)
+              _ -> Nothing
+        in case otherA of
+             Just (c1, d1, c2, d2) -> if d1 < d2 then c1 else c2
+             Nothing -> cur
+  in
+  [ let d1 = case c of
+          ColorRed -> distTo idxG er < cfg.conflictDistance && distTo idxB er < cfg.conflictDistance
+          ColorGreen -> distTo idxR er < cfg.conflictDistance && distTo idxB er < cfg.conflictDistance
+          ColorBlue -> distTo idxR er < cfg.conflictDistance && distTo idxG er < cfg.conflictDistance
+          _ -> False
+    in if d1 then ColoredEdge (pickColor c er) er else ColoredEdge c er
+  | ColoredEdge c er <- edges
+  ]
+
+splitByColor :: [ColoredEdge] -> ([EdgeRef], [EdgeRef], [EdgeRef])
+splitByColor edges =
+  let edgesByMask mask = [ e.edgeRef | e <- edges, colorMask e.color .&. mask /= 0 ]
+  in (edgesByMask 1, edgesByMask 2, edgesByMask 4)
+
+colorMask :: EdgeColor -> Int
+colorMask c =
+  case c of
+    ColorRed -> 1
+    ColorGreen -> 2
+    ColorBlue -> 4
+    ColorYellow -> 3
+    ColorMagenta -> 5
+    ColorCyan -> 6
+    ColorWhite -> 7
