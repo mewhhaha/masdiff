@@ -802,76 +802,184 @@ renderBitmap fmt speckleThreshold width height offsetX offsetY range correction 
              , (-1,  0),          (1,  0)
              , (-1,  1), (0,  1), (1,  1)
              ]
+           neighbors9 = (0, 0) : neighbors8
        dAllArr0' <- case dAllArr0 of
          Just arr -> pure arr
          Nothing -> pure dAllArr
        dAllArr' <- if speckleThreshold > 0
-        then do
-          let passes = 2 :: Int
-          let pass src = do
-                dst <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
-                forM_ [0 .. height - 1] $ \y -> do
-                  forM_ [0 .. width - 1] $ \x -> do
-                    let i = y * width + x
-                    d <- readArray src i
-                    let sign :: Int
-                        sign = if d < 0 then -1 else 1
-                    (negCount, posCount, total) <-
-                      foldM
-                        (\(nC, pC, tC) (dx, dy) ->
-                          let nx = x + dx
-                              ny = y + dy
-                          in if nx < 0 || nx >= width || ny < 0 || ny >= height
-                             then pure (nC, pC, tC)
-                             else do
-                               let ni = ny * width + nx
-                               nd <- readArray src ni
-                               let s :: Int
-                                   s = if nd < 0 then -1 else 1
-                               pure (if s < 0 then (nC + 1, pC, tC + 1) else (nC, pC + 1, tC + 1))
-                        ) (0 :: Int, 0 :: Int, 0 :: Int) neighbors8
-                    let majoritySign
-                          | negCount >= 5 = -1
-                          | posCount >= 5 = 1
-                          | otherwise = sign
-                        d' =
-                          if total >= 5 && majoritySign /= sign && abs d < speckleThreshold
-                          then fromIntegral majoritySign * abs d
-                          else d
-                    writeArray dst i d'
-                pure dst
-          let loop i src =
-                if i <= 0
-                then pure src
-                else do
-                  dst <- pass src
-                  loop (i - 1) dst
-          loop passes dAllArr0'
-        else pure dAllArr0'
+         then do
+           let passes = 2 :: Int
+           let pass src = do
+                 dst <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+                 forM_ [0 .. height - 1] $ \y -> do
+                   forM_ [0 .. width - 1] $ \x -> do
+                     let i = y * width + x
+                     d <- readArray src i
+                     let sign :: Int
+                         sign = if d < 0 then -1 else 1
+                     (negCount, posCount, total) <-
+                       foldM
+                         (\(nC, pC, tC) (dx, dy) ->
+                           let nx = x + dx
+                               ny = y + dy
+                           in if nx < 0 || nx >= width || ny < 0 || ny >= height
+                              then pure (nC, pC, tC)
+                              else do
+                                let ni = ny * width + nx
+                                nd <- readArray src ni
+                                let s :: Int
+                                    s = if nd < 0 then -1 else 1
+                                pure (if s < 0 then (nC + 1, pC, tC + 1) else (nC, pC + 1, tC + 1))
+                         ) (0 :: Int, 0 :: Int, 0 :: Int) neighbors8
+                     let majoritySign
+                           | negCount >= 5 = -1
+                           | posCount >= 5 = 1
+                           | otherwise = sign
+                         d' =
+                           if total >= 5 && majoritySign /= sign && abs d < speckleThreshold
+                           then fromIntegral majoritySign * abs d
+                           else d
+                     writeArray dst i d'
+                 pure dst
+           let loop i src =
+                 if i <= 0
+                 then pure src
+                 else do
+                   dst <- pass src
+                   loop (i - 1) dst
+           loop passes dAllArr0'
+         else pure dAllArr0'
        dAllArr'' <- pure dAllArr'
+       fixMask <-
+        if fmt == BitmapMTSDF
+          then do
+          sdArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
+          forM_ [0 .. height - 1] $ \y -> do
+            forM_ [0 .. width - 1] $ \x -> do
+              let i = y * width + x
+              dR0 <- readArray dRArr i
+              dG0 <- readArray dGArr i
+              dB0 <- readArray dBArr i
+              writeArray sdArr i (median3 dR0 dG0 dB0)
+          let edgeThreshold = min 1.5 (max 0.75 (fromIntegral range * 0.25))
+              deltaThreshold = max 0.1 (correction * 2)
+          mask <- newArray (0, n - 1) False :: ST s (STUArray s Int Bool)
+          forM_ [0 .. height - 1] $ \y -> do
+            forM_ [0 .. width - 1] $ \x -> do
+              let i = y * width + x
+              dAll <- readArray dAllArr'' i
+              if abs dAll < edgeThreshold
+                then do
+                  let signAll = dAll >= 0
+                  vals <- foldM
+                    (\acc (dx, dy) ->
+                      let nx = x + dx
+                          ny = y + dy
+                      in if nx < 0 || nx >= width || ny < 0 || ny >= height
+                         then pure acc
+                         else do
+                           let ni = ny * width + nx
+                           dAllN <- readArray dAllArr'' ni
+                           if (dAllN >= 0) == signAll
+                             then do
+                               sdN <- readArray sdArr ni
+                               pure (sdN : acc)
+                             else pure acc
+                    ) [] neighbors9
+                  let values = if null vals
+                        then []
+                        else vals
+                  if null values
+                    then pure ()
+                    else do
+                      sd <- readArray sdArr i
+                      let med = medianList values
+                      if abs (sd - med) > deltaThreshold
+                        then writeArray mask i True
+                        else pure ()
+                else pure ()
+          pure (Just mask)
+          else pure Nothing
        out <- newArray (0, n * channels - 1) 0 :: ST s (STUArray s Int Word8)
        forM_ [0 .. height - 1] $ \y -> do
          forM_ [0 .. width - 1] $ \x -> do
            let i = y * width + x
                base = i * channels
-           dR0 <- readArray dRArr i
-           dG0 <- readArray dGArr i
-           dB0 <- readArray dBArr i
+           dR0' <- readArray dRArr i
+           dG0' <- readArray dGArr i
+           dB0' <- readArray dBArr i
            dAll <- readArray dAllArr'' i
-           let sd = median3 dR0 dG0 dB0
-               spread = max (abs (dR0 - dG0)) (max (abs (dR0 - dB0)) (abs (dG0 - dB0)))
+           (dR0, dG0, dB0) <- case fixMask of
+             Just mask -> do
+               fix <- readArray mask i
+               if fix
+                 then pure (dAll, dAll, dAll)
+                 else pure (dR0', dG0', dB0')
+             Nothing -> pure (dR0', dG0', dB0')
+           let mtsdfEdgeThreshold =
+                 min 1.5 (max 0.75 (fromIntegral range * 0.25))
+               mtsdfChannelThreshold =
+                 max 0.1 (correction * 2)
+               mtsdfHardThreshold =
+                 max 0.05 (correction * 1.25)
+               neighborThreshold =
+                 max 0.05 (correction * 1.0)
+           (dR0n, dG0n, dB0n) <-
+             if fmt == BitmapMTSDF && abs dAll < mtsdfEdgeThreshold
+               then do
+                 mR <- neighborMedian dRArr dAllArr'' width height x y neighbors9
+                 mG <- neighborMedian dGArr dAllArr'' width height x y neighbors9
+                 mB <- neighborMedian dBArr dAllArr'' width height x y neighbors9
+                 let dR0'' = case mR of
+                       Just v | abs (dR0 - v) > neighborThreshold -> v
+                       _ -> dR0
+                     dG0'' = case mG of
+                       Just v | abs (dG0 - v) > neighborThreshold -> v
+                       _ -> dG0
+                     dB0'' = case mB of
+                       Just v | abs (dB0 - v) > neighborThreshold -> v
+                       _ -> dB0
+                 pure (dR0'', dG0'', dB0'')
+               else pure (dR0, dG0, dB0)
+           let fixChannel d =
+                 if fmt == BitmapMTSDF &&
+                    abs dAll < mtsdfEdgeThreshold &&
+                    (d * dAll < 0 || abs (d - dAll) > mtsdfChannelThreshold)
+                 then dAll
+                 else d
+               dR1 = fixChannel dR0n
+               dG1 = fixChannel dG0n
+               dB1 = fixChannel dB0n
+               sd = median3 dR1 dG1 dB1
+               spread = max (abs (dR1 - dG1)) (max (abs (dR1 - dB1)) (abs (dG1 - dB1)))
                sameSign = sd * dAll >= 0
                conflict =
                  conflictThreshold > 0 &&
-                 ( (abs dR0 < conflictThreshold && abs dG0 < conflictThreshold)
-                || (abs dR0 < conflictThreshold && abs dB0 < conflictThreshold)
-                || (abs dG0 < conflictThreshold && abs dB0 < conflictThreshold)
+                 ( (abs dR1 < conflictThreshold && abs dG1 < conflictThreshold)
+                || (abs dR1 < conflictThreshold && abs dB1 < conflictThreshold)
+                || (abs dG1 < conflictThreshold && abs dB1 < conflictThreshold)
                  )
-               forceAll = conflict || (correction > 0 && (not sameSign || abs (sd - dAll) > correction || spread > correction))
+               mtsdfSpreadThreshold =
+                 max 0.1 (correction * 2)
+               mtsdfHard =
+                 fmt == BitmapMTSDF &&
+                 abs dAll < mtsdfEdgeThreshold &&
+                 (abs (dR1 - dAll) > mtsdfHardThreshold ||
+                  abs (dG1 - dAll) > mtsdfHardThreshold ||
+                  abs (dB1 - dAll) > mtsdfHardThreshold)
+               mtsdfExtra =
+                 fmt == BitmapMTSDF &&
+                 abs sd < mtsdfEdgeThreshold &&
+                 spread > mtsdfSpreadThreshold
+               forceAll =
+                 conflict ||
+                 (correction > 0 && (not sameSign || abs (sd - dAll) > correction || spread > correction)) ||
+                 mtsdfExtra ||
+                 mtsdfHard
                (dR, dG, dB) =
                  if forceAll
                  then (dAll, dAll, dAll)
-                 else (dR0, dG0, dB0)
+                 else (dR1, dG1, dB1)
                r = distanceToByte range dR
                g = distanceToByte range dG
                b = distanceToByte range dB
@@ -886,6 +994,44 @@ renderBitmap fmt speckleThreshold width height offsetX offsetY range correction 
                writeArray out (base + 2) b
                writeArray out (base + 3) (distanceToByte range dAll)
        freeze out)
+
+medianList :: [Double] -> Double
+medianList xs =
+  case sort xs of
+    [] -> 0
+    ys -> ys !! (length ys `div` 2)
+
+neighborMedian
+  :: STUArray s Int Double
+  -> STUArray s Int Double
+  -> Int
+  -> Int
+  -> Int
+  -> Int
+  -> [(Int, Int)]
+  -> ST s (Maybe Double)
+neighborMedian chanArr dAllArr width height x y neighbors = do
+  let i = y * width + x
+  dAll <- readArray dAllArr i
+  let signAll = dAll >= 0
+  vals <- foldM
+    (\acc (dx, dy) ->
+      let nx = x + dx
+          ny = y + dy
+      in if nx < 0 || nx >= width || ny < 0 || ny >= height
+         then pure acc
+         else do
+           let ni = ny * width + nx
+           dAllN <- readArray dAllArr ni
+           if (dAllN >= 0) == signAll
+             then do
+               v <- readArray chanArr ni
+               pure (v : acc)
+             else pure acc
+    ) [] neighbors
+  if null vals
+    then pure Nothing
+    else pure (Just (medianList vals))
 
 trueSignedDistanceSupersampled :: Int -> Int -> Double -> Double -> [LineSeg] -> Int -> Int -> ST s (STUArray s Int Double, STUArray s Int Bool)
 trueSignedDistanceSupersampled width height offsetX offsetY segs range ss = do
