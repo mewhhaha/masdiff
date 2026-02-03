@@ -30,6 +30,8 @@ import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Data.List (sortOn)
+import Data.Maybe (mapMaybe)
+import qualified Data.IntSet as IntSet
 import Data.Ord (Down(..))
 import Data.Bits ((.&.))
 import Data.Word (Word8)
@@ -143,7 +145,11 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
               if cfg.outline.splitIntersections
               then splitContoursIntersections cfg.outline edgesByContour0
               else edgesByContour0
-            edgesByContour = map (filterDegenerateEdges eps) edgesByContour1
+            edgesByContour2 =
+              if cfg.outline.splitIntersections
+              then preprocessContours cfg.outline cfg.distance.fillRule edgesByContour1
+              else edgesByContour1
+            edgesByContour = map (filterDegenerateEdges eps) edgesByContour2
             edgeInfosByContour0 = buildEdgeInfos cfg.outline edgesByContour
             allInfos0 = concat edgeInfosByContour0
             overlapFlags = computeEdgeOverlaps cfg.outline.windingFlatness cfg.outline.contourEpsilon allInfos0
@@ -619,6 +625,151 @@ splitContoursIntersections cfg contours
       | (cid, edges) <- zip [0..] contours
       ]
 
+reverseEdge :: Edge -> Edge
+reverseEdge (EdgeLine p0 p1) = EdgeLine p1 p0
+reverseEdge (EdgeQuad p0 p1 p2) = EdgeQuad p2 p1 p0
+
+preprocessContours :: OutlineConfig -> FillRule -> [[Edge]] -> [[Edge]]
+preprocessContours cfg rule contours =
+  let flatness = cfg.windingFlatness
+      eps = max cfg.contourEpsilon (flatness * 0.1)
+      edgesAll = concat contours
+      mergeEps = max eps (flatness * 0.5)
+      loops = faceWalkLoops mergeEps edgesAll
+      segsAll = flattenEdges flatness edgesAll
+      loops' = mapMaybe (classifyLoop rule eps segsAll) loops
+  in if null loops' then contours else loops'
+
+data HalfEdge = HalfEdge Edge Int Int Vec2 Vec2
+
+faceWalkLoops :: Double -> [Edge] -> [[Edge]]
+faceWalkLoops eps edges =
+  let vEps = max eps 1e-9
+      key (x, y) =
+        let kx = round (x / vEps) :: Int
+            ky = round (y / vEps) :: Int
+        in (kx, ky)
+      addVertex (m, next) p =
+        let k = key p
+        in if Map.member k m
+           then (m, next)
+           else (Map.insert k next m, next + 1)
+      (vmap, _) =
+        foldl'
+          addVertex
+          (Map.empty, 0 :: Int)
+          ([ edgeStartPoint e | e <- edges ] ++ [ edgeEndPoint e | e <- edges ])
+      vertexId p = Map.findWithDefault (-1) (key p) vmap
+      mkHalfEdges e =
+        let s = edgeStartPoint e
+            t = edgeEndPoint e
+            sd = normalizeVec (edgeStartDir e)
+            ed = normalizeVec (edgeEndDir e)
+            sid = vertexId s
+            tid = vertexId t
+            rev = reverseEdge e
+            sdR = normalizeVec (vecScale (-1) ed)
+            edR = normalizeVec (vecScale (-1) sd)
+        in if sid < 0 || tid < 0
+           then []
+           else
+             [ HalfEdge e sid tid sd ed
+             , HalfEdge rev tid sid sdR edR
+             ]
+      hedges = concatMap mkHalfEdges edges
+      n = length hedges
+      edgeArr =
+        if n == 0 then array (0, -1) [] else array (0, n - 1) (zip [0..] hedges)
+      angleOf (dx, dy) =
+        let a = atan2 dy dx
+        in if a < 0 then a + 2 * pi else a
+      outgoing =
+        foldl'
+          (\acc (i, e) ->
+             let HalfEdge _ start _ startDir _ = e
+                 ang = angleOf startDir
+             in IntMap.insertWith (++) start [(ang, i)] acc
+          )
+          IntMap.empty
+          (zip [0..] hedges)
+      chooseNext v incomingDir used =
+        case IntMap.lookup v outgoing of
+          Nothing -> Nothing
+          Just lst ->
+            let anglePrev = angleOf incomingDir
+                candidates = [ (ang, idx) | (ang, idx) <- lst, not (IntSet.member idx used) ]
+                sorted = sortOn fst candidates
+            in case sorted of
+                 [] -> Nothing
+                 _ ->
+                   let before = takeWhile (\(ang, _) -> ang < anglePrev - 1e-12) sorted
+                       pick = case reverse before of
+                         (x:_) -> x
+                         [] -> last sorted
+                   in Just (snd pick)
+      walk startIdx used0 =
+        let startEdge = edgeArr ! startIdx
+            startV =
+              let HalfEdge _ start _ _ _ = startEdge
+              in start
+            go idx used acc =
+              if IntSet.member idx used
+              then (used, reverse acc)
+              else
+                let used' = IntSet.insert idx used
+                    e = edgeArr ! idx
+                    HalfEdge edge _ endV _ endDir = e
+                    acc' = edge : acc
+                in if endV == startV && not (null acc)
+                   then (used', reverse acc')
+                   else
+                     case chooseNext endV (vecScale (-1) endDir) used' of
+                       Nothing -> (used', reverse acc')
+                       Just nextIdx -> go nextIdx used' acc'
+        in go startIdx used0 []
+      build i used acc =
+        if i >= n
+        then acc
+        else if IntSet.member i used
+          then build (i + 1) used acc
+          else
+            let (used', loopEdges) = walk i used
+            in build (i + 1) used' (if length loopEdges < 2 then acc else loopEdges : acc)
+  in reverse (build 0 IntSet.empty [])
+
+classifyLoop :: FillRule -> Double -> [LineSeg] -> [Edge] -> Maybe [Edge]
+classifyLoop rule eps segs edges =
+  case edges of
+    [] -> Nothing
+    (e:_) ->
+      case loopSide rule eps segs e of
+        Nothing -> Nothing
+        Just (insideLeft, insideRight) ->
+          if insideLeft == insideRight
+          then Nothing
+          else if insideLeft
+            then Just edges
+            else Just (map reverseEdge (reverse edges))
+
+loopSide :: FillRule -> Double -> [LineSeg] -> Edge -> Maybe (Bool, Bool)
+loopSide rule eps segs edge =
+  let p = edgePointAt edge 0.5
+      (tx, ty) = edgeTangentAt edge 0.5
+      n = normalizeVec (-ty, tx)
+      base = max eps (edgeLengthApprox edge * 1e-2)
+      steps = [base, base * 2, base * 4]
+      apply = applyFillRule rule
+      insideAt pt = apply (windingNumber segs pt)
+      go [] = Nothing
+      go (step:rest) =
+        let p1 = vecAdd p (vecScale step n)
+            p2 = vecSub p (vecScale step n)
+            i1 = insideAt p1
+            i2 = insideAt p2
+        in if i1 == i2 then go rest else Just (i1, i2)
+  in if nearZero n then Nothing else go steps
+
+
 collectIntersection :: [[Edge]] -> Double -> Map.Map (Int, Int) [Double] -> (FlatSeg, FlatSeg) -> Map.Map (Int, Int) [Double]
 collectIntersection contours eps acc (FlatSeg ca ea t0a t1a p0a p1a, FlatSeg cb eb t0b t1b p0b p1b)
   | ca == cb && ea == eb = acc
@@ -632,7 +783,8 @@ collectIntersection contours eps acc (FlatSeg ca ea t0a t1a p0a p1a, FlatSeg cb 
               accB = if isInterior v then Map.insertWith (++) (cb, eb) [tb] accA else accA
           in accB
         Nothing ->
-          let acc1 = insertEndpointSplit acc (cb, eb) p0b p1b p0a
+          let acc0 = addColinearOverlap acc
+              acc1 = insertEndpointSplit acc0 (cb, eb) p0b p1b p0a
               acc2 = insertEndpointSplit acc1 (cb, eb) p0b p1b p1a
               acc3 = insertEndpointSplit acc2 (ca, ea) p0a p1a p0b
               acc4 = insertEndpointSplit acc3 (ca, ea) p0a p1a p1b
@@ -640,10 +792,54 @@ collectIntersection contours eps acc (FlatSeg ca ea t0a t1a p0a p1a, FlatSeg cb 
   where
     edgeAt cid eid = (contours !! cid) !! eid
     isInterior t = t > eps && t < 1 - eps
+    addColinearOverlap acc' =
+      case colinearOverlapParams eps p0a p1a p0b p1b of
+        Nothing -> acc'
+        Just (tmin, tmax, smin, smax) ->
+          let accA = addSplitParams acc' (ca, ea) t0a t1a tmin tmax
+              accB = addSplitParams accA (cb, eb) t0b t1b smin smax
+          in accB
     insertEndpointSplit acc' key s0 s1 pt =
       case pointOnSegmentParam eps s0 s1 pt of
         Just t | isInterior t -> Map.insertWith (++) key [t] acc'
         _ -> acc'
+
+addSplitParams :: Map.Map (Int, Int) [Double] -> (Int, Int) -> Double -> Double -> Double -> Double -> Map.Map (Int, Int) [Double]
+addSplitParams acc key segT0 segT1 tmin tmax =
+  let isInterior t = t > 1e-6 && t < 1 - 1e-6
+      ta = segT0 + tmin * (segT1 - segT0)
+      tb = segT0 + tmax * (segT1 - segT0)
+      acc1 = if isInterior tmin then Map.insertWith (++) key [ta] acc else acc
+      acc2 = if isInterior tmax then Map.insertWith (++) key [tb] acc1 else acc1
+  in acc2
+
+colinearOverlapParams :: Double -> Vec2 -> Vec2 -> Vec2 -> Vec2 -> Maybe (Double, Double, Double, Double)
+colinearOverlapParams eps p0 p1 q0 q1 =
+  let rx = fst p1 - fst p0
+      ry = snd p1 - snd p0
+      sx = fst q1 - fst q0
+      sy = snd q1 - snd q0
+      rlen2 = rx * rx + ry * ry
+      slen2 = sx * sx + sy * sy
+  in if rlen2 < eps * eps || slen2 < eps * eps
+     then Nothing
+     else
+       let d0 = distancePointLine q0 p0 p1
+           d1 = distancePointLine q1 p0 p1
+       in if d0 > eps || d1 > eps
+          then Nothing
+          else
+            let t0 = ((fst q0 - fst p0) * rx + (snd q0 - snd p0) * ry) / rlen2
+                t1 = ((fst q1 - fst p0) * rx + (snd q1 - snd p0) * ry) / rlen2
+                tmin = max 0 (min t0 t1)
+                tmax = min 1 (max t0 t1)
+                s0 = ((fst p0 - fst q0) * sx + (snd p0 - snd q0) * sy) / slen2
+                s1 = ((fst p1 - fst q0) * sx + (snd p1 - snd q0) * sy) / slen2
+                smin = max 0 (min s0 s1)
+                smax = min 1 (max s0 s1)
+            in if tmax - tmin <= eps || smax - smin <= eps
+               then Nothing
+               else Just (tmin, tmax, smin, smax)
 
 flatPairs :: [a] -> [(a, a)]
 flatPairs xs = go xs
@@ -830,7 +1026,7 @@ segmentsIntersectAny eps segsA segsB =
   any (\sa -> any (segmentsIntersect eps sa) segsB) segsA
 
 renderBitmap :: MSDFConfig -> Int -> Int -> Double -> Double -> [(EdgeColor, EdgeInfo)] -> [LineSeg] -> [[LineSeg]] -> UArray Int Word8
-renderBitmap cfg width height offsetX offsetY coloredInfos segs segsByContour =
+renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
   let fmt = cfg.outputFormat
       n = width * height
       channels = bitmapChannels fmt
