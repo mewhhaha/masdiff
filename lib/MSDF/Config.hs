@@ -40,6 +40,7 @@ data OutlineConfig = OutlineConfig
   { windingFlatness :: Double
   , contourEpsilon :: Double
   , normalizeOrientation :: Bool
+  , splitIntersections :: Bool
   }
 
 data EdgeColoringConfig = EdgeColoringConfig

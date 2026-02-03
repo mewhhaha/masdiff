@@ -111,3 +111,6 @@ just demo-headless
 - To force a backend: `SDL_GPU_BACKEND=vulkan just demo` (the demo defaults to
   Vulkan when headless).
 - If you want different text, edit `sampleText` in `Main.hs` and re-run the generator.
+- Debug views: set `SDL_MSDF_DEBUG_VIEW=alpha|r|g|b|median|split|fill` to inspect channels
+  (use `split` for a 2x2 grid of R/G/B/A, `fill` for a binary 0.5 threshold).
+- `SDL_MSDF_DEBUG_GRID=1` renders a 4x2 grid of modes (alpha/fill/split/median/r/g/b/normal).

@@ -78,6 +78,7 @@ defaultMSDFConfig = MSDFConfig
       { windingFlatness = 0.02
       , contourEpsilon = 1e-6
       , normalizeOrientation = True
+      , splitIntersections = True
       }
   , coloring = EdgeColoringConfig
       { cornerAngleDeg = 3.0
@@ -137,7 +138,12 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
       else
         let contoursScaled = map (map (scalePoint scale)) contours
             eps = cfg.outline.contourEpsilon
-            edgesByContour = map (filterDegenerateEdges eps . contourToEdges) contoursScaled
+            edgesByContour0 = map (filterDegenerateEdges eps . contourToEdges) contoursScaled
+            edgesByContour1 =
+              if cfg.outline.splitIntersections
+              then splitContoursIntersections cfg.outline edgesByContour0
+              else edgesByContour0
+            edgesByContour = map (filterDegenerateEdges eps) edgesByContour1
             edgeInfosByContour0 = buildEdgeInfos cfg.outline edgesByContour
             allInfos0 = concat edgeInfosByContour0
             overlapFlags = computeEdgeOverlaps cfg.outline.windingFlatness cfg.outline.contourEpsilon allInfos0
@@ -150,6 +156,7 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
             coloredInfos0 = attachEdgeInfo edgeInfosByContour coloredEdges
             allEdges0 = [ info | (_, info) <- coloredInfos0 ]
             segsAll = flattenEdges cfg.outline.windingFlatness [ info.edge | info <- allEdges0 ]
+            segsByContour = map (flattenEdges cfg.outline.windingFlatness) edgesByContour
             coloredInfos =
               if cfg.distance.overlapSupport
               then
@@ -159,6 +166,8 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
                         cfg.distance.overlapEpsilon
                         cfg.outline.windingFlatness
                         segsAll
+                        segsByContour
+                        cfg.outline.splitIntersections
                         coloredInfos0
                 in if null filtered then coloredInfos0 else filtered
               else coloredInfos0
@@ -170,7 +179,7 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours =
                  height = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding))
                  offsetX = bbox.xMin - padding
                  offsetY = bbox.yMin - padding
-                 pixels = renderBitmap cfg width height offsetX offsetY coloredInfos segsAll
+                 pixels = renderBitmap cfg width height offsetX offsetY coloredInfos segsAll segsByContour
              in GlyphMSDF
                  { index = glyphIndex
                  , codepoints = []
@@ -583,6 +592,189 @@ filterDegenerateEdges eps = filter (\e -> edgeLength e > eps)
 scalePoint :: Double -> Point -> Point
 scalePoint s p = Point (p.x * s) (p.y * s) p.on
 
+data FlatSeg = FlatSeg Int Int Double Double Vec2 Vec2
+
+splitContoursIntersections :: OutlineConfig -> [[Edge]] -> [[Edge]]
+splitContoursIntersections cfg contours
+  | not cfg.splitIntersections = contours
+  | all ((< 2) . length) contours = contours
+  | otherwise =
+      let flatness = cfg.windingFlatness
+          eps = max cfg.contourEpsilon (flatness * 0.1)
+          edgesWithIds =
+            [ (cid, eid, e)
+            | (cid, edges) <- zip [0..] contours
+            , (eid, e) <- zip [0..] edges
+            ]
+          flatSegs = concat
+            [ flattenEdgeWithParams flatness cid eid e
+            | (cid, eid, e) <- edgesWithIds
+            ]
+          tMap = foldl (collectIntersection contours eps) Map.empty (flatPairs flatSegs)
+          splitEdgeFor cid eid e =
+            let ts = Map.findWithDefault [] (cid, eid) tMap
+            in splitEdgeAt cfg.contourEpsilon e ts
+      in
+      [ concat [ splitEdgeFor cid eid e | (eid, e) <- zip [0..] edges ]
+      | (cid, edges) <- zip [0..] contours
+      ]
+
+collectIntersection :: [[Edge]] -> Double -> Map.Map (Int, Int) [Double] -> (FlatSeg, FlatSeg) -> Map.Map (Int, Int) [Double]
+collectIntersection contours eps acc (FlatSeg ca ea t0a t1a p0a p1a, FlatSeg cb eb t0b t1b p0b p1b)
+  | ca == cb && ea == eb = acc
+  | edgesShareEndpointEdge eps (edgeAt ca ea) (edgeAt cb eb) = acc
+  | otherwise =
+      case segmentIntersectionTU eps p0a p1a p0b p1b of
+        Just (u, v) ->
+          let ta = t0a + u * (t1a - t0a)
+              tb = t0b + v * (t1b - t0b)
+              accA = if isInterior u then Map.insertWith (++) (ca, ea) [ta] acc else acc
+              accB = if isInterior v then Map.insertWith (++) (cb, eb) [tb] accA else accA
+          in accB
+        Nothing ->
+          let acc1 = insertEndpointSplit acc (cb, eb) p0b p1b p0a
+              acc2 = insertEndpointSplit acc1 (cb, eb) p0b p1b p1a
+              acc3 = insertEndpointSplit acc2 (ca, ea) p0a p1a p0b
+              acc4 = insertEndpointSplit acc3 (ca, ea) p0a p1a p1b
+          in acc4
+  where
+    edgeAt cid eid = (contours !! cid) !! eid
+    isInterior t = t > eps && t < 1 - eps
+    insertEndpointSplit acc' key s0 s1 pt =
+      case pointOnSegmentParam eps s0 s1 pt of
+        Just t | isInterior t -> Map.insertWith (++) key [t] acc'
+        _ -> acc'
+
+flatPairs :: [a] -> [(a, a)]
+flatPairs xs = go xs
+  where
+    go [] = []
+    go (y:ys) = map (\z -> (y, z)) ys ++ go ys
+
+flattenEdgeWithParams :: Double -> Int -> Int -> Edge -> [FlatSeg]
+flattenEdgeWithParams _ cid eid (EdgeLine p0 p1) =
+  [ FlatSeg cid eid 0 1 p0 p1 ]
+flattenEdgeWithParams eps cid eid (EdgeQuad p0 p1 p2) =
+  flattenQuadWithParams eps cid eid 0 1 p0 p1 p2
+
+flattenQuadWithParams :: Double -> Int -> Int -> Double -> Double -> Vec2 -> Vec2 -> Vec2 -> [FlatSeg]
+flattenQuadWithParams eps cid eid t0 t1 p0 p1 p2
+  | quadFlatEnough eps p0 p1 p2 = [ FlatSeg cid eid t0 t1 p0 p2 ]
+  | otherwise =
+      let (l0, l1, l2, r0, r1, r2) = subdivideQuad p0 p1 p2
+          tm = (t0 + t1) * 0.5
+      in flattenQuadWithParams eps cid eid t0 tm l0 l1 l2
+         ++ flattenQuadWithParams eps cid eid tm t1 r0 r1 r2
+
+quadFlatEnough :: Double -> Vec2 -> Vec2 -> Vec2 -> Bool
+quadFlatEnough eps p0 p1 p2 =
+  distancePointLine p1 p0 p2 <= eps
+
+distancePointLine :: Vec2 -> Vec2 -> Vec2 -> Double
+distancePointLine (px, py) (x0, y0) (x1, y1) =
+  let dx = x1 - x0
+      dy = y1 - y0
+      num = abs ((px - x0) * dy - (py - y0) * dx)
+      den = sqrt (dx * dx + dy * dy)
+  in if den < 1e-12 then sqrt ((px - x0) ^ (2 :: Int) + (py - y0) ^ (2 :: Int)) else num / den
+
+subdivideQuad :: Vec2 -> Vec2 -> Vec2 -> (Vec2, Vec2, Vec2, Vec2, Vec2, Vec2)
+subdivideQuad p0 p1 p2 =
+  let p01 = midpoint p0 p1
+      p12 = midpoint p1 p2
+      p012 = midpoint p01 p12
+  in (p0, p01, p012, p012, p12, p2)
+
+midpoint :: Vec2 -> Vec2 -> Vec2
+midpoint (x0, y0) (x1, y1) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+
+segmentIntersectionTU :: Double -> Vec2 -> Vec2 -> Vec2 -> Vec2 -> Maybe (Double, Double)
+segmentIntersectionTU eps (p0x, p0y) (p1x, p1y) (q0x, q0y) (q1x, q1y) =
+  let rx = p1x - p0x
+      ry = p1y - p0y
+      sx = q1x - q0x
+      sy = q1y - q0y
+      rxs = rx * sy - ry * sx
+      qpx = q0x - p0x
+      qpy = q0y - p0y
+      qpxr = qpx * ry - qpy * rx
+  in if abs rxs <= eps
+     then Nothing
+     else
+       let t = (qpx * sy - qpy * sx) / rxs
+           u = qpxr / rxs
+       in if t >= -eps && t <= 1 + eps && u >= -eps && u <= 1 + eps
+          then Just (t, u)
+          else Nothing
+
+pointOnSegmentParam :: Double -> Vec2 -> Vec2 -> Vec2 -> Maybe Double
+pointOnSegmentParam eps (x0, y0) (x1, y1) (px, py) =
+  let dx = x1 - x0
+      dy = y1 - y0
+      denom = dx * dx + dy * dy
+  in if denom < 1e-12
+     then Nothing
+     else
+       let t = ((px - x0) * dx + (py - y0) * dy) / denom
+           tClamped = max 0 (min 1 t)
+           cx = x0 + tClamped * dx
+           cy = y0 + tClamped * dy
+           distSq = (px - cx) * (px - cx) + (py - cy) * (py - cy)
+       in if distSq <= eps * eps then Just tClamped else Nothing
+
+splitEdgeAt :: Double -> Edge -> [Double] -> [Edge]
+splitEdgeAt eps edge ts =
+  let ts' = dedupTs eps (filter (\t -> t > eps && t < 1 - eps) ts)
+  in case edge of
+       EdgeLine p0 p1 -> splitLineAt p0 p1 ts'
+       EdgeQuad p0 p1 p2 -> splitQuadAt p0 p1 p2 ts'
+
+splitLineAt :: Vec2 -> Vec2 -> [Double] -> [Edge]
+splitLineAt p0 p1 ts =
+  let pts = map (lerp p0 p1) ts
+      allPts = p0 : pts ++ [p1]
+  in case allPts of
+       (_:_) -> [ EdgeLine a b | (a, b) <- zip allPts (drop 1 allPts) ]
+       [] -> []
+
+splitQuadAt :: Vec2 -> Vec2 -> Vec2 -> [Double] -> [Edge]
+splitQuadAt p0 p1 p2 ts =
+  case ts of
+    [] -> [EdgeQuad p0 p1 p2]
+    (t:rest) ->
+      let (l0, l1, l2, r0, r1, r2) = splitQuadAtParam t p0 p1 p2
+          rest' = map (\u -> (u - t) / (1 - t)) rest
+      in EdgeQuad l0 l1 l2 : splitQuadAt r0 r1 r2 rest'
+
+splitQuadAtParam :: Double -> Vec2 -> Vec2 -> Vec2 -> (Vec2, Vec2, Vec2, Vec2, Vec2, Vec2)
+splitQuadAtParam t p0 p1 p2 =
+  let p01 = lerp p0 p1 t
+      p12 = lerp p1 p2 t
+      p012 = lerp p01 p12 t
+  in (p0, p01, p012, p012, p12, p2)
+
+lerp :: Vec2 -> Vec2 -> Double -> Vec2
+lerp (x0, y0) (x1, y1) t = (x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+
+dedupTs :: Double -> [Double] -> [Double]
+dedupTs eps ts =
+  case sortOn id ts of
+    [] -> []
+    (x:xs) -> x : go x xs
+  where
+    go _ [] = []
+    go prev (y:ys)
+      | abs (y - prev) <= eps = go prev ys
+      | otherwise = y : go y ys
+
+edgesShareEndpointEdge :: Double -> Edge -> Edge -> Bool
+edgesShareEndpointEdge eps a b =
+  let a0 = edgeStartPoint a
+      a1 = edgeEndPoint a
+      b0 = edgeStartPoint b
+      b1 = edgeEndPoint b
+  in sameVec eps a0 b0 || sameVec eps a0 b1 || sameVec eps a1 b0 || sameVec eps a1 b1
+
 computeEdgeOverlaps :: Double -> Double -> [EdgeInfo] -> [Bool]
 computeEdgeOverlaps flatness eps infos =
   let n = length infos
@@ -637,8 +829,8 @@ segmentsIntersectAny :: Double -> [LineSeg] -> [LineSeg] -> Bool
 segmentsIntersectAny eps segsA segsB =
   any (\sa -> any (segmentsIntersect eps sa) segsB) segsA
 
-renderBitmap :: MSDFConfig -> Int -> Int -> Double -> Double -> [(EdgeColor, EdgeInfo)] -> [LineSeg] -> UArray Int Word8
-renderBitmap cfg width height offsetX offsetY coloredInfos segs =
+renderBitmap :: MSDFConfig -> Int -> Int -> Double -> Double -> [(EdgeColor, EdgeInfo)] -> [LineSeg] -> [[LineSeg]] -> UArray Int Word8
+renderBitmap cfg width height offsetX offsetY coloredInfos segs segsByContour =
   let fmt = cfg.outputFormat
       n = width * height
       channels = bitmapChannels fmt
@@ -684,6 +876,8 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs =
                Just _ ->
                  if not cfg.distance.overlapSupport
                  then pure True
+                 else if cfg.outline.splitIntersections
+                   then pure True
                  else
                    let normal = edgeUnitNormalAt info t
                        q = edgePointAt info.edge t
@@ -700,8 +894,9 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs =
                            else if not info.overlaps
                              then pure True
                              else do
-                               let w1 = windingNumber segs q1 - windingNumber edgeSegs q1
-                                   w2 = windingNumber segs q2 - windingNumber edgeSegs q2
+                               let contourSegs = edgeSegs
+                                   w1 = windingNumber segs q1 - windingNumber contourSegs q1
+                                   w2 = windingNumber segs q2 - windingNumber contourSegs q2
                                pure (applyRule w1 /= applyRule w2)
                    in if nearZero normal
                       then pure True
@@ -1138,8 +1333,8 @@ applyFillRule rule w =
     FillPositive -> w > 0
     FillNegative -> w < 0
 
-edgeIsBoundary :: FillRule -> Double -> Double -> [LineSeg] -> EdgeInfo -> Bool
-edgeIsBoundary rule eps flatness segsAll info =
+edgeIsBoundary :: FillRule -> Double -> Double -> [LineSeg] -> [[LineSeg]] -> Bool -> EdgeInfo -> Bool
+edgeIsBoundary rule eps _flatness segsAll _segsByContour useContour info =
   let edge = info.edge
       len = edgeLengthApprox edge
       base = max eps (len * 1e-3)
@@ -1148,8 +1343,7 @@ edgeIsBoundary rule eps flatness segsAll info =
         EdgeLine _ _ -> [0.5]
         EdgeQuad _ _ _ -> [0.25, 0.5, 0.75]
       applyRule = applyFillRule rule
-      segsEdge = flattenEdges flatness [edge]
-      windingOther p = windingNumber segsAll p - windingNumber segsEdge p
+      windingAt p = windingNumber segsAll p
       check t =
         let p = edgePointAt edge t
             n = edgeUnitNormalAt info t
@@ -1160,24 +1354,28 @@ edgeIsBoundary rule eps flatness segsAll info =
                (\step ->
                  let p1 = vecAdd p (vecScale step n)
                      p2 = vecSub p (vecScale step n)
-                     w1 = windingOther p1
-                     w2 = windingOther p2
+                     w1 = windingAt p1
+                     w2 = windingAt p2
                  in applyRule w1 /= applyRule w2
                )
                steps
-  in if not info.overlaps
-     then True
-     else any check samples
+  in if useContour
+     then any check samples
+     else if not info.overlaps
+       then True
+       else any check samples
 
 filterBoundaryEdges
   :: FillRule
   -> Double
   -> Double
   -> [LineSeg]
+  -> [[LineSeg]]
+  -> Bool
   -> [(EdgeColor, EdgeInfo)]
   -> [(EdgeColor, EdgeInfo)]
-filterBoundaryEdges rule eps flatness segsAll colored =
-  let keep info = edgeIsBoundary rule eps flatness segsAll info
+filterBoundaryEdges rule eps flatness segsAll segsByContour useContour colored =
+  let keep info = edgeIsBoundary rule eps flatness segsAll segsByContour useContour info
   in [ (c, info) | (c, info) <- colored, keep info ]
 
 

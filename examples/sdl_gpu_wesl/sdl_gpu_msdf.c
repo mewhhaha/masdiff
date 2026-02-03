@@ -15,7 +15,7 @@ typedef struct FragUniforms {
   float textColor[4];
   float params[4]; /* params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF), params.z = debug */
   float atlasSize[2];
-  float _pad[2];
+  float screenSize[2];
 } FragUniforms;
 
 static void die(const char *msg) {
@@ -165,7 +165,30 @@ int main(int argc, char **argv) {
   if (delayEnv && delayEnv[0] != '\0') {
     screenshotDelayMs = atoi(delayEnv);
   }
-  bool debugAlphaOnly = SDL_getenv("SDL_MSDF_ALPHA_ONLY") != NULL;
+  float debugMode = 0.f;
+  const char *debugEnv = SDL_getenv("SDL_MSDF_DEBUG_VIEW");
+  bool debugGrid = SDL_getenv("SDL_MSDF_DEBUG_GRID") != NULL;
+  if (debugEnv && debugEnv[0] != '\0') {
+    if (strcmp(debugEnv, "alpha") == 0) {
+      debugMode = 1.f;
+    } else if (strcmp(debugEnv, "r") == 0) {
+      debugMode = 2.f;
+    } else if (strcmp(debugEnv, "g") == 0) {
+      debugMode = 3.f;
+    } else if (strcmp(debugEnv, "b") == 0) {
+      debugMode = 4.f;
+    } else if (strcmp(debugEnv, "median") == 0) {
+      debugMode = 5.f;
+    } else if (strcmp(debugEnv, "split") == 0) {
+      debugMode = 6.f;
+    } else if (strcmp(debugEnv, "fill") == 0) {
+      debugMode = 7.f;
+    } else {
+      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "unknown SDL_MSDF_DEBUG_VIEW=%s", debugEnv);
+    }
+  } else if (SDL_getenv("SDL_MSDF_ALPHA_ONLY") != NULL) {
+    debugMode = 1.f;
+  }
   bool forceNearest = SDL_getenv("SDL_MSDF_NEAREST") != NULL;
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -175,7 +198,7 @@ int main(int argc, char **argv) {
   SDL_Window *window = NULL;
   bool headless = forceHeadless;
   if (!headless) {
-    window = SDL_CreateWindow("masdiff SDL_gpu", 1280, 720, 0);
+    window = SDL_CreateWindow("masdiff SDL_gpu", 1280, 720, SDL_WINDOW_RESIZABLE);
     if (!window) {
       SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow failed: %s (falling back to headless)", SDL_GetError());
       headless = true;
@@ -574,11 +597,6 @@ int main(int argc, char **argv) {
     SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &colorTarget, 1, NULL);
     SDL_BindGPUGraphicsPipeline(pass, pipeline);
 
-    SDL_GPUViewport vp = { 0.f, 0.f, (float) swapW, (float) swapH, 0.f, 1.f };
-    SDL_SetGPUViewport(pass, &vp);
-    SDL_Rect scissor = { 0, 0, (int) swapW, (int) swapH };
-    SDL_SetGPUScissor(pass, &scissor);
-
     for (int i = 0; i < outputTotal; i++) {
       DemoOutput *out = &outputs[i];
       if (!out->atlasTex || !out->vertexBuffer) {
@@ -590,16 +608,42 @@ int main(int argc, char **argv) {
       SDL_GPUTextureSamplerBinding sbind = { out->atlasTex, sampler };
       SDL_BindGPUFragmentSamplers(pass, 0, &sbind, 1);
 
-      float debugFlag = debugAlphaOnly ? 1.f : 0.f;
-      FragUniforms fu = {
-        { 1.f, 1.f, 1.f, 1.f },
-        { out->meta.pxRange, out->formatFlag, debugFlag, 0.f },
-        { (float) out->meta.atlasW, (float) out->meta.atlasH },
-        { 0.f, 0.f }
-      };
-      SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
-
-      SDL_DrawGPUPrimitives(pass, out->meta.vertexCount, 1, 0, 0);
+      if (debugGrid) {
+        const int cols = 4;
+        const int rows = 2;
+        const float modes[8] = { 1.f, 7.f, 6.f, 5.f, 2.f, 3.f, 4.f, 0.f };
+        const int cellW = (int) swapW / cols;
+        const int cellH = (int) swapH / rows;
+        for (int m = 0; m < 8; m++) {
+          const int col = m % cols;
+          const int row = m / cols;
+          SDL_GPUViewport vp = { (float) (col * cellW), (float) (row * cellH), (float) cellW, (float) cellH, 0.f, 1.f };
+          SDL_SetGPUViewport(pass, &vp);
+          SDL_Rect scissor = { col * cellW, row * cellH, cellW, cellH };
+          SDL_SetGPUScissor(pass, &scissor);
+          FragUniforms fu = {
+            { 1.f, 1.f, 1.f, 1.f },
+            { out->meta.pxRange, out->formatFlag, modes[m], 0.f },
+            { (float) out->meta.atlasW, (float) out->meta.atlasH },
+            { (float) cellW, (float) cellH }
+          };
+          SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
+          SDL_DrawGPUPrimitives(pass, out->meta.vertexCount, 1, 0, 0);
+        }
+      } else {
+        SDL_GPUViewport vp = { 0.f, 0.f, (float) swapW, (float) swapH, 0.f, 1.f };
+        SDL_SetGPUViewport(pass, &vp);
+        SDL_Rect scissor = { 0, 0, (int) swapW, (int) swapH };
+        SDL_SetGPUScissor(pass, &scissor);
+        FragUniforms fu = {
+          { 1.f, 1.f, 1.f, 1.f },
+          { out->meta.pxRange, out->formatFlag, debugMode, 0.f },
+          { (float) out->meta.atlasW, (float) out->meta.atlasH },
+          { (float) swapW, (float) swapH }
+        };
+        SDL_PushGPUFragmentUniformData(cmd, 0, &fu, (Uint32) sizeof(fu));
+        SDL_DrawGPUPrimitives(pass, out->meta.vertexCount, 1, 0, 0);
+      }
     }
     SDL_EndGPURenderPass(pass);
 

@@ -22,6 +22,10 @@ demo-vulkan: demo-gen demo-build
 
 # Run without auto-screenshot/exit.
 demo-live: demo-gen demo-build
+    SDL_MSDF_DEBUG_GRID=1 "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf"
+
+# Run live with the final render only (no debug grid).
+demo-live-text: demo-gen demo-build
     "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf"
 
 # Headless offscreen screenshot (requires a GPU backend that works without a window).

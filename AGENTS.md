@@ -32,7 +32,7 @@ It is the single source of truth for scope, sequencing, and exit criteria.
 - Generate reference outputs with msdfgen/msdf-atlas-gen for a fixed glyph set and seed.
 - Lock down “golden” images/metrics for MSDF and MTSDF.
 - Add regression tests that compare output **visually** (hash + tolerance) against reference.
-**Status:** Done — optional `tools/msdfgen_compare.sh` provides msdfgen side‑by‑side output; internal hash tests + speckle tests cover regression safety.
+**Status:** In progress — `tools/msdfgen_compare.sh` exists and basic regression tests exist, but reference outputs for intersection cases (f/m/a/d) are not locked yet.
 
 ### Phase 1 — Shape Normalization & Preprocess (msdfgen‑style)
 - Implement `Shape::normalize` equivalent: contour cleanup, consistent winding, and explicit close.
@@ -40,21 +40,21 @@ It is the single source of truth for scope, sequencing, and exit criteria.
   - Match msdfgen’s behavior where preprocessing can be disabled (`-nopreprocess`).
   - Provide overlap/scanline fallback modes (`-overlap`, `-scanline`).
 - Exit when complex glyphs (f/m/a/d) are consistent across preprocessing on/off.
-**Status:** Done — contour cleanup + explicit close + orientation normalization + overlap boundary filtering + scanline sign mode + overlap toggles.
+**Status:** Partially done — contour cleanup + explicit close + orientation normalization + scanline sign mode are in place. **Missing:** intersection splitting + contour recomposition (self‑intersection fix).
 
 ### Phase 2 — Edge Coloring (corner‑aware)
 - Implement msdfgen edge coloring **strategies** (`simple`, `inktrap`, `distance`).
 - Respect angle threshold (`-angle`) and coloring seed (`-seed`).
 - Enforce msdfgen constraints: edges at sharp corners share only one channel; smooth contours can be white.
 - Exit when edge coloring matches msdfgen outputs for reference glyphs.
-**Status:** Done — simple/inktrap/distance strategies, smooth‑contour white, multi‑channel colors, conflict resolution, CLI toggles.
+**Status:** Mostly done — simple/inktrap/distance strategies, smooth‑contour white, conflict resolution, CLI toggles. **Pending:** recolor after intersection splitting (post‑preprocess coloring must be applied to split edges).
 
 ### Phase 3 — Distance & Sign Field Correctness
 - Accurate curve distance for line/quad/cubic (subdivision + analytic roots).
 - Implement **pseudo/perpendicular distance** handling for corner endpoints (PSDF/MSDF).
 - Implement fill rule + sign resolution that matches msdfgen, including scanline correction.
 - Exit when alpha (true SDF) is free of crossbar/join breaks on reference glyphs.
-**Status:** Done — exact/pseudo distance paths, scanline sign + fill rule, overlap filtering.
+**Status:** Partially done — exact/pseudo distance paths, scanline sign + fill rule, overlap filtering are in place. **Blocking:** crossbar/join artifacts persist because edges are not split at intersections.
 
 ### Phase 4 — MSDF/MTSDF Generation (true SDF in alpha)
 - MSDF: median of RGB from edge‑colored channels.
@@ -87,12 +87,12 @@ It is the single source of truth for scope, sequencing, and exit criteria.
 - Update render guide and SDL example to match msdfgen semantics (alpha is true SDF).
 - Provide “known‑good” reference renders for QA.
 - Exit when parity tests are green and examples match reference screenshots.
-**Status:** Done — SDL example updated + CLI toggles; reference comparison script; docs updated.
+**Status:** In progress — SDL example updated + CLI toggles; reference comparison script; docs updated. **Missing:** acceptance screenshots once intersection splitting is complete.
 
 ## Exit Criteria (Parity Definition)
 
 - MSDF/MTSDF output visually matches msdfgen/msdf-atlas-gen on the reference suite.
-- No join/crossbar artifacts in alpha (true SDF), especially `f`, `m`, `a`, `d`.
+- No join/crossbar artifacts in alpha (true SDF), especially `f`, `m`, `a`, `d` (requires intersection splitting).
 - Deterministic outputs for identical inputs/config/seed.
 
 ---

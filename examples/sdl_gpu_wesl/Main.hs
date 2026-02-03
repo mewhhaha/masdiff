@@ -13,7 +13,7 @@ import Data.List (foldl', isPrefixOf)
 import Data.Maybe (fromMaybe)
 import Control.Monad (when)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
-import System.Environment (getArgs)
+import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>), takeBaseName, (<.>))
 import Data.Word (Word8)
@@ -36,8 +36,11 @@ screenW, screenH :: Double
 screenW = 1280
 screenH = 720
 
-sampleText :: String
-sampleText = "masdiff"
+pangramText :: String
+pangramText = "The quick brown fox jumps over the lazy dog"
+
+defaultSampleText :: String
+defaultSampleText = "f"
 
 data CliOptions = CliOptions
   { fontPathOpt :: Maybe FilePath
@@ -109,6 +112,7 @@ main = do
   compileWesl outDir (shaderDir </> "msdf.vert.wesl")
   compileWesl outDir (shaderDir </> "msdf.frag.wesl")
 
+  sampleText <- resolveSampleText
   args <- getArgs
   opts <- case parseArgs args defaultCliOptions of
     ParseHelp -> do
@@ -143,7 +147,16 @@ main = do
       let outputs =
             [ ("mtsdf", BitmapMTSDF, screenW * 0.5, False)
             ]
-      mapM_ (writeAtlas outDir cfg ttf) outputs
+      mapM_ (writeAtlas outDir sampleText cfg ttf) outputs
+
+resolveSampleText :: IO String
+resolveSampleText = do
+  val <- lookupEnv "SDL_MSDF_SAMPLE_TEXT"
+  case fmap (map toLower) val of
+    Nothing -> pure defaultSampleText
+    Just "pangram" -> pure pangramText
+    Just "" -> pure defaultSampleText
+    Just other -> pure other
 
 resolveBaseDir :: IO FilePath
 resolveBaseDir = do
@@ -184,8 +197,8 @@ compileWesl outDir src = do
       BS.writeFile outPath (shaderSpirv bundle)
       putStrLn ("wrote " <> outPath)
 
-writeAtlas :: FilePath -> MSDF.MSDFConfig -> TTF -> (String, BitmapFormat, Double, Bool) -> IO ()
-writeAtlas outDir cfgBase ttf (label, fmt, centerX, writeDefault) =
+writeAtlas :: FilePath -> String -> MSDF.MSDFConfig -> TTF -> (String, BitmapFormat, Double, Bool) -> IO ()
+writeAtlas outDir sampleText cfgBase ttf (label, fmt, centerX, writeDefault) =
   let cfg = cfgBase { MSDF.outputFormat = fmt }
       atlas = generateMSDFFromTTF cfg ttf
   in
