@@ -144,6 +144,18 @@ data OutputData = OutputData
   , outVertexBytes :: BS.ByteString
   }
 
+data OutputSpec = OutputSpec
+  { specLabel :: String
+  , specFormat :: BitmapFormat
+  , specCenterX :: Double
+  , specCenterY :: Double
+  , specWriteDefault :: Bool
+  , specVars :: [(String, Double)]
+  , specText :: String
+  , specFontPath :: FilePath
+  , specTTF :: TTF
+  }
+
 {-# NOINLINE emitBlobRef #-}
 emitBlobRef :: IORef Bool
 emitBlobRef = unsafePerformIO (newIORef False)
@@ -263,6 +275,7 @@ main = do
   rangeEnv <- resolveRangeOverride
   cacheEnv <- resolveCacheMode
   batchEnv <- resolveBatchMode
+  demoVariants <- resolveDemoVariants
   args <- getArgs
   opts <- case parseArgs args defaultCliOptions of
     ParseHelp -> do
@@ -344,7 +357,12 @@ main = do
     logMsg "text debug: batch mode enabled (lazy atlas disabled)"
   when cacheEnabled $
     logMsg "text debug: atlas cache enabled (keyed by font+config+glyph set)"
+  when demoVariants $
+    logMsg "text debug: demo variants enabled (regular/bold/italic/bolditalic)"
   fontPath <- resolveFontPath baseDir opts
+  italicFontPath <- if demoVariants
+    then resolveItalicFontPath baseDir fontPath
+    else pure fontPath
   parsed <- parseTTF fontPath
   case parsed of
     Left err -> do
@@ -352,23 +370,51 @@ main = do
       logMsg ("parseTTF failed: " <> ctx <> ": " <> msg)
       exitFailure
     Right ttf -> do
-      let outputs =
-            case pairWeights of
-              Just (w0, w1) ->
-                let baseVars = maybe [] (\o -> [("opsz", o)]) pairOpsz
-                    vars0 = ("wght", w0) : baseVars
-                    vars1 = ("wght", w1) : baseVars
-                in [ ("w400", BitmapMTSDF, screenW * 0.33, False, vars0)
-                   , ("w900", BitmapMTSDF, screenW * 0.67, False, vars1)
-                   ]
-              Nothing ->
-                [ ("mtsdf", BitmapMTSDF, screenW * 0.5, False, variations)
-                ]
+      italicTtf <-
+        if italicFontPath == fontPath
+        then pure ttf
+        else do
+          parsedItalic <- parseTTF italicFontPath
+          case parsedItalic of
+            Left err -> do
+              let ParseError { context = ctx, message = msg } = err
+              logMsg ("parseTTF failed: " <> ctx <> ": " <> msg)
+              exitFailure
+            Right ttfItalic -> pure ttfItalic
+      let baseVars = maybe [] (\o -> [("opsz", o)]) pairOpsz
+          (wRegular, wBold) = fromMaybe (400, 900) pairWeights
+          outputs =
+            if demoVariants
+            then
+              [ OutputSpec "regular" BitmapMTSDF (screenW * 0.5) (screenH * 0.78) False (("wght", wRegular) : baseVars)
+                  "Regular: The quick brown fox jumps over the lazy dog."
+                  fontPath ttf
+              , OutputSpec "bold" BitmapMTSDF (screenW * 0.5) (screenH * 0.60) False (("wght", wBold) : baseVars)
+                  "Bold: Sphinx of black quartz, judge my vow."
+                  fontPath ttf
+              , OutputSpec "italic" BitmapMTSDF (screenW * 0.5) (screenH * 0.42) False (("wght", wRegular) : baseVars)
+                  "Italic: Pack my box with five dozen liquor jugs."
+                  italicFontPath italicTtf
+              , OutputSpec "bolditalic" BitmapMTSDF (screenW * 0.5) (screenH * 0.24) False (("wght", wBold) : baseVars)
+                  "Bold Italic: How vexingly quick daft zebras jump."
+                  italicFontPath italicTtf
+              ]
+            else
+              case pairWeights of
+                Just (w0, w1) ->
+                  let vars0 = ("wght", w0) : baseVars
+                      vars1 = ("wght", w1) : baseVars
+                  in [ OutputSpec "w400" BitmapMTSDF (screenW * 0.33) (screenH * 0.5) False vars0 sampleText fontPath ttf
+                     , OutputSpec "w900" BitmapMTSDF (screenW * 0.67) (screenH * 0.5) False vars1 sampleText fontPath ttf
+                     ]
+                Nothing ->
+                  [ OutputSpec "mtsdf" BitmapMTSDF (screenW * 0.5) (screenH * 0.5) False variations sampleText fontPath ttf
+                  ]
       if emitBlob
         then do
-          outs <- mapM (buildAtlas fontPath sampleText cfg ttf lazyAtlas textDebug cacheEnabled) outputs
+          outs <- mapM (buildAtlas cfg lazyAtlas textDebug cacheEnabled) outputs
           emitBlobOutputs vertSpv fragSpv outs
-        else mapM_ (writeAtlas outDir fontPath sampleText cfg ttf lazyAtlas textDebug cacheEnabled) outputs
+        else mapM_ (writeAtlas outDir cfg lazyAtlas textDebug cacheEnabled) outputs
 
 resolveSampleText :: IO String
 resolveSampleText = do
@@ -442,6 +488,16 @@ resolveCacheMode = do
 resolveBatchMode :: IO Bool
 resolveBatchMode = do
   val <- lookupEnv "SDL_MSDF_BATCH"
+  pure (case fmap (map toLower) val of
+    Just "1" -> True
+    Just "true" -> True
+    Just "yes" -> True
+    Just "on" -> True
+    _ -> False)
+
+resolveDemoVariants :: IO Bool
+resolveDemoVariants = do
+  val <- lookupEnv "SDL_MSDF_DEMO_VARIANTS"
   pure (case fmap (map toLower) val of
     Just "1" -> True
     Just "true" -> True
@@ -575,6 +631,20 @@ resolveFontPath baseDir opts = do
       logMsg "pass a font path: msdf-sdl-gen --font /path/to/font.ttf"
       exitFailure
 
+resolveItalicFontPath :: FilePath -> FilePath -> IO FilePath
+resolveItalicFontPath baseDir fontPath = do
+  env <- lookupEnv "SDL_MSDF_ITALIC_FONT"
+  let defaultPath = baseDir </> ".." </> ".." </> "assets/Inter/Inter-Italic-VariableFont_opsz,wght.ttf"
+      path = case env of
+        Just p | not (null p) -> p
+        _ -> defaultPath
+  exists <- doesFileExist path
+  if exists
+    then pure path
+    else do
+      logMsg ("italic font not found: " <> path <> " (using base font)")
+      pure fontPath
+
 compileWesl :: Bool -> FilePath -> FilePath -> IO BS.ByteString
 compileWesl writeOut outDir src = do
   result <- compile [] (sourceFile src)
@@ -596,16 +666,28 @@ formatFlagFor fmt =
     BitmapMSDF -> 0
     BitmapMTSDF -> 1
 
-buildAtlas :: FilePath -> String -> MSDF.MSDFConfig -> TTF -> Bool -> Bool -> Bool -> (String, BitmapFormat, Double, Bool, [(String, Double)]) -> IO OutputData
-buildAtlas fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled (label, fmt, centerX, _writeDefault, vars) = do
+buildAtlas :: MSDF.MSDFConfig -> Bool -> Bool -> Bool -> OutputSpec -> IO OutputData
+buildAtlas cfgBase lazyAtlas textDebug cacheEnabled spec = do
+  let label = spec.specLabel
+      fmt = spec.specFormat
+      centerX = spec.specCenterX
+      centerY = spec.specCenterY
+      vars = spec.specVars
+      sampleText = spec.specText
+      fontKey = spec.specFontPath
+      ttf = spec.specTTF
   when textDebug $ do
     let glyphCount = IntMap.size (buildGlyphMap ttf sampleText)
     logMsg ("text debug: label=" <> label <> " lazy=" <> show lazyAtlas <> " glyphs=" <> show glyphCount <> " vars=" <> show vars)
   debugEnv <- lookupEnv "SDL_MSDF_VARIATION_DEBUG"
   when (isJust debugEnv) $ debugVariations label ttf vars sampleText
-  let cfg = cfgBase { MSDF.outputFormat = fmt, MSDF.variations = vars }
+  let cfg = cfgBase
+        { MSDF.outputFormat = fmt
+        , MSDF.variations = vars
+        , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
+        }
   if lazyAtlas
-    then buildAtlasLazy sampleText cfg ttf label centerX textDebug
+    then buildAtlasLazy sampleText cfg ttf label centerX centerY textDebug
     else do
       let cacheKey = atlasCacheKey fontKey cfg
       atlas <- getCachedAtlas cacheEnabled cacheKey cfg ttf
@@ -639,7 +721,7 @@ buildAtlas fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled (labe
               rgbaBytes = bitmapToRgbaBytes fmtImg px
               pxRange = pixelRangeForAtlas atlas (fromIntegral ps :: Double)
               bounds = textBounds atlas sampleText
-              penStart' = snapPen (penForCenter (centerX, screenH * 0.5) bounds)
+              penStart' = snapPen (penForCenter (centerX, centerY) bounds)
               texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
               verts = buildTextVertices atlas (screenW, screenH) penStart' texel sampleText
               vtxBytes = BL.toStrict (toLazyByteString (floatListBuilder verts))
@@ -653,15 +735,15 @@ buildAtlas fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled (labe
                 , metaVertexCount = length verts `div` 4
                 }
           pure OutputData
-            { outLabel = label
-            , outFormatFlag = formatFlagFor fmt
-            , outMeta = meta
-            , outAtlasBytes = rgbaBytes
-            , outVertexBytes = vtxBytes
-            }
+                { outLabel = label
+                , outFormatFlag = formatFlagFor fmt
+                , outMeta = meta
+                , outAtlasBytes = rgbaBytes
+                , outVertexBytes = vtxBytes
+                }
 
-buildAtlasLazy :: String -> MSDF.MSDFConfig -> TTF -> String -> Double -> Bool -> IO OutputData
-buildAtlasLazy sampleText cfg ttf label centerX textDebug = do
+buildAtlasLazy :: String -> MSDF.MSDFConfig -> TTF -> String -> Double -> Double -> Bool -> IO OutputData
+buildAtlasLazy sampleText cfg ttf label centerX centerY textDebug = do
   let AtlasConfig { atlasMaxSize = maxSize, atlasPadding = pad } = cfg.atlas
       lazyCfg = (defaultLazyAtlasConfig cfg)
         { atlasWidth = max 1 maxSize
@@ -681,7 +763,7 @@ buildAtlasLazy sampleText cfg ttf label centerX textDebug = do
       rgbaBytes = bitmapToRgbaBytes fmtImg px
       pxRange = fromIntegral cfg.range
       bounds = textBoundsLazy glyphsMap sampleText ttf
-      penStart' = snapPen (penForCenter (centerX, screenH * 0.5) bounds)
+      penStart' = snapPen (penForCenter (centerX, centerY) bounds)
       texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
       verts = buildTextVerticesLazy glyphsMap (screenW, screenH) penStart' texel sampleText ttf
       vtxBytes = BL.toStrict (toLazyByteString (floatListBuilder verts))
@@ -702,9 +784,9 @@ buildAtlasLazy sampleText cfg ttf label centerX textDebug = do
     , outVertexBytes = vtxBytes
     }
 
-writeAtlas :: FilePath -> FilePath -> String -> MSDF.MSDFConfig -> TTF -> Bool -> Bool -> Bool -> (String, BitmapFormat, Double, Bool, [(String, Double)]) -> IO ()
-writeAtlas outDir fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled args@(_label, _fmt, _centerX, writeDefault, _vars) = do
-  output <- buildAtlas fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled args
+writeAtlas :: FilePath -> MSDF.MSDFConfig -> Bool -> Bool -> Bool -> OutputSpec -> IO ()
+writeAtlas outDir cfgBase lazyAtlas textDebug cacheEnabled spec = do
+  output <- buildAtlas cfgBase lazyAtlas textDebug cacheEnabled spec
   let emptyOutput = BS.null output.outAtlasBytes
                 || BS.null output.outVertexBytes
                 || output.outMeta.metaAtlasW <= 0
@@ -716,7 +798,7 @@ writeAtlas outDir fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnable
           atlasOut = outDir </> ("atlas_" <> output.outLabel <.> "rgba")
           metaOut = outDir </> ("meta_" <> output.outLabel <.> "txt")
       writeOutputs atlasOut verticesOut metaOut output
-      when writeDefault $ do
+      when spec.specWriteDefault $ do
         let verticesOut' = outDir </> "vertices.bin"
             atlasOut' = outDir </> "atlas.rgba"
             metaOut' = outDir </> "meta.txt"
