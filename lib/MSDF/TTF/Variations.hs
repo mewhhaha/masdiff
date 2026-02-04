@@ -23,6 +23,7 @@ module MSDF.TTF.Variations
   , componentDeltas
   , gvarTupleScalars
   , gvarTupleHeaderStats
+  , gvarTupleDeltaStats
   , gvarDeltaSum
   , hvarDeltas
   , vvarDeltas
@@ -118,6 +119,24 @@ data GlyphTupleData = GlyphTupleData
   { tuplePointCount :: Int
   , tupleTuples :: [DecodedTuple]
   }
+
+gvarTupleDeltaStats :: Gvar -> VariationLocation -> Int -> Int -> Maybe [(Double, Int, Int, Int, Int)]
+gvarTupleDeltaStats gvar loc glyphIndex pointCount =
+  case getGlyphTupleData gvar glyphIndex pointCount of
+    Nothing -> Nothing
+    Just tuples ->
+      let coords' = coordsForAxis gvar.axisCount loc
+          tupleStats tup =
+            let scalar = tupleScalar coords' tup.tupleHeader
+                dxs = tup.tupleDX
+                dys = tup.tupleDY
+                (minDx, maxDx) = minMax dxs
+                (minDy, maxDy) = minMax dys
+            in (scalar, minDx, maxDx, minDy, maxDy)
+      in Just (map tupleStats tuples.tupleTuples)
+  where
+    minMax [] = (0, 0)
+    minMax xs = (minimum xs, maximum xs)
 
 data DecodedTuple = DecodedTuple
   { tupleHeader :: TupleHeader
@@ -638,14 +657,24 @@ data TupleHeader = TupleHeader
 
 readTupleHeadersAuto :: ByteBuffer -> Int -> Int -> Int -> Gvar -> ([TupleHeader], Int)
 readTupleHeadersAuto bb off count dataOffset gvar =
-  let (headersLong, endLong) = readTupleHeadersLong bb off count gvar
+  let (headersPacked, endPacked) = readTupleHeadersPacked bb off count gvar
+      (headersLong, endLong) = readTupleHeadersLong bb off count gvar
       dataBytes = max 0 (bb.len - dataOffset)
+      packedSize = sum (map (\h -> h.tupleSize) headersPacked)
+      validPacked =
+        dataOffset >= endPacked
+        && packedSize <= dataBytes
       validLong =
         dataOffset >= endLong
         && all (\h -> h.tupleDataOffset >= 0 && h.tupleDataOffset + h.tupleSize <= dataBytes) headersLong
-  in if validLong
-     then (headersLong, endLong)
-     else readTupleHeadersPacked bb off count gvar
+      preferPacked =
+        dataOffset == endPacked
+        || (dataOffset >= endPacked && (not validLong || dataOffset - endPacked <= dataOffset - endLong))
+  in case (validPacked, validLong) of
+       (True, False) -> (headersPacked, endPacked)
+       (False, True) -> (headersLong, endLong)
+       (True, True) -> if preferPacked then (headersPacked, endPacked) else (headersLong, endLong)
+       (False, False) -> (headersPacked, endPacked)
 
 readTupleHeadersLong :: ByteBuffer -> Int -> Int -> Gvar -> ([TupleHeader], Int)
 readTupleHeadersLong bb off count gvar =

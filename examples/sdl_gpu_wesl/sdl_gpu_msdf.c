@@ -324,11 +324,28 @@ static int load_blob_from_stdin(DemoOutput **outOutputs, int *outCount,
       SDL_free(blob);
       return -1;
     }
-    void *atlasData = SDL_malloc(atlasSize);
-    void *vertData = SDL_malloc(vertSize);
-    if (!atlasData || !vertData) {
-      SDL_free(atlasData);
-      SDL_free(vertData);
+    void *atlasData = NULL;
+    void *vertData = NULL;
+    if (atlasSize == 0 && vertSize == 0) {
+      /* empty output, keep buffers null */
+    } else if (atlasSize > 0 && vertSize > 0) {
+      atlasData = SDL_malloc(atlasSize);
+      vertData = SDL_malloc(vertSize);
+      if (!atlasData || !vertData) {
+        SDL_free(atlasData);
+        SDL_free(vertData);
+        SDL_free(label);
+        SDL_free(outputs);
+        SDL_free(vsCode);
+        SDL_free(fsCode);
+        SDL_free(blob);
+        return -1;
+      }
+      memcpy(atlasData, blob + off, atlasSize);
+      off += atlasSize;
+      memcpy(vertData, blob + off, vertSize);
+      off += vertSize;
+    } else {
       SDL_free(label);
       SDL_free(outputs);
       SDL_free(vsCode);
@@ -336,10 +353,6 @@ static int load_blob_from_stdin(DemoOutput **outOutputs, int *outCount,
       SDL_free(blob);
       return -1;
     }
-    memcpy(atlasData, blob + off, atlasSize);
-    off += atlasSize;
-    memcpy(vertData, blob + off, vertSize);
-    off += vertSize;
 
     outputs[i].label = label;
     outputs[i].formatFlag = formatFlag;
@@ -587,6 +600,11 @@ int main(int argc, char **argv) {
         SDL_free(atlasData);
         continue;
       }
+      if (atlasSize == 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "atlas empty for %s", out->label);
+        SDL_free(atlasData);
+        continue;
+      }
       out->atlasData = atlasData;
       out->atlasSize = atlasSize;
 
@@ -608,6 +626,13 @@ int main(int argc, char **argv) {
       }
       if (vertSize % sizeof(Vertex) != 0) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex size mismatch for %s", out->label);
+        SDL_free(atlasData);
+        SDL_free(vertData);
+        out->atlasData = NULL;
+        continue;
+      }
+      if (vertSize == 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex data empty for %s", out->label);
         SDL_free(atlasData);
         SDL_free(vertData);
         out->atlasData = NULL;
@@ -778,7 +803,7 @@ int main(int argc, char **argv) {
   }
   for (int i = 0; i < outputTotal; i++) {
     DemoOutput *out = &outputs[i];
-    if (!out->atlasData || !out->vertData) {
+    if (!out->atlasData || !out->vertData || out->atlasSize == 0 || out->vertSize == 0) {
       continue;
     }
     out->atlasTex = SDL_CreateGPUTexture(gpu, &(SDL_GPUTextureCreateInfo){

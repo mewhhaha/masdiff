@@ -737,20 +737,24 @@ data CompositeComponent = CompositeComponent
 parseCompositeGlyph :: Maybe VariationLocation -> Maybe Gvar -> ByteBuffer -> Int -> TTF -> Int -> ([[Point]], (Double, Double, Double, Double))
 parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
   let components = readCompositeComponents bb
+      compCount = length components
       hasGvar = case gvar of
         Just gv -> gvarHasData gv glyphIndex
         Nothing -> False
       compLoc = if hasGvar then Nothing else loc
+      (compDxs, compDys, compPhantom) =
+        case (loc, gvar, hasGvar) of
+          (Just loc', Just gv, True) -> componentDeltas gv loc' glyphIndex compCount
+          _ -> (array (0, -1) [], array (0, -1) [], (0, 0, 0, 0))
   in if depth > 16
      then ([], (0, 0, 0, 0))
      else
-       let baseContours = buildContours compLoc components
-       in case (loc, gvar) of
-            (Just loc', Just gv) | hasGvar ->
-              applyGvarToContours gv loc' glyphIndex baseContours
+       let baseContours = buildContours compLoc components compDxs compDys
+       in case (loc, gvar, hasGvar) of
+            (Just _, Just _, True) -> (baseContours, compPhantom)
             _ -> (baseContours, (0, 0, 0, 0))
   where
-    buildContours compLoc comps =
+    buildContours compLoc comps dxs dys =
       let go _ acc [] = acc
           go idx acc (c:cs) =
             let (contours, _) = glyphContoursAtVar compLoc ttf c.compGlyph (depth + 1)
@@ -764,10 +768,16 @@ parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
                   if testBit c.compFlags 2
                   then (fromIntegral (round dx0 :: Int), fromIntegral (round dy0 :: Int))
                   else (dx0, dy0)
-                transformed = map (map (applyTransform c.compTransform dx1 dy1)) contours
+                dxVar = arrAt dxs idx
+                dyVar = arrAt dys idx
+                transformed = map (map (applyTransform c.compTransform (dx1 + dxVar) (dy1 + dyVar))) contours
                 acc' = acc ++ transformed
             in go (idx + 1) acc' cs
       in go 0 [] comps
+
+    arrAt arr i =
+      let (lo, hi) = bounds arr
+      in if i < lo || i > hi then 0 else arr ! i
 
     gvarHasData gv gi =
       let offs = gv.offsets

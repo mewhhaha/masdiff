@@ -299,72 +299,77 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours phantomMaybe =
   in if null contours
      then base
       else
-        let contoursScaled = traceStage "msdf: scale contours" (map (map (scalePoint scale)) contours)
-            eps = cfg.outline.contourEpsilon
-            edgesByContour0 = traceStage "msdf: contour->edges" (map (filterDegenerateEdges eps . contourToEdges) contoursScaled)
-            edgesByContour1 =
-              traceStage "msdf: split intersections" $
-                if cfg.outline.splitIntersections
-                then splitContoursIntersections cfg.outline edgesByContour0
-                else edgesByContour0
-            edgesByContour2 =
-              traceStage "msdf: preprocess contours" $
-                if cfg.outline.splitIntersections
-                then preprocessContours cfg.outline cfg.distance.fillRule edgesByContour1
-                else edgesByContour1
-            edgesByContour = map (filterDegenerateEdges eps) edgesByContour2
-            edgeInfosByContour0 = traceStage "msdf: build edge infos" (buildEdgeInfos cfg.outline edgesByContour)
-            allInfos0 = concat edgeInfosByContour0
-            edgeInfosByContour =
-              if cfg.distance.overlapSupport
-              then
-                let overlapFlags = traceStage "msdf: compute overlaps" (computeEdgeOverlaps cfg.outline.windingFlatness cfg.outline.contourEpsilon allInfos0)
-                    overlapMap = Map.fromList
-                      [ (edgeKey info, flag)
-                      | (info, flag) <- zip allInfos0 overlapFlags
-                      ]
-                in traceStage "msdf: apply overlap flags" (map (map (applyOverlapFlag overlapMap)) edgeInfosByContour0)
-              else edgeInfosByContour0
-            coloredEdges = traceStage "msdf: edge coloring" (colorEdges cfg.coloring edgesByContour)
-            coloredInfos0 = traceStage "msdf: attach edge info" (attachEdgeInfo edgeInfosByContour coloredEdges)
-            allEdges0 = [ info | (_, info) <- coloredInfos0 ]
-            segsAll = traceStage "msdf: flatten edges all" (flattenEdges cfg.outline.windingFlatness [ info.edge | info <- allEdges0 ])
-            segsByContour = traceStage "msdf: flatten edges by contour" (map (flattenEdges cfg.outline.windingFlatness) edgesByContour)
-            coloredInfos =
-              if cfg.distance.overlapSupport
-              then
-                let filtered =
-                      filterBoundaryEdges
-                        cfg.distance.fillRule
-                        cfg.distance.overlapEpsilon
-                        cfg.outline.windingFlatness
-                        segsAll
-                        segsByContour
-                        cfg.outline.splitIntersections
-                        coloredInfos0
-                in if null filtered then coloredInfos0 else filtered
-              else coloredInfos0
-        in if null coloredInfos
-           then base
+        let padding0 = fromIntegral (safeRange + 1) :: Double
+            width0 = max 1 (ceiling ((bbox.xMax - bbox.xMin) + 2 * padding0))
+            height0 = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding0))
+            area0 = width0 * height0
+            maxPixels0 = msdfMaxBitmapPixels
+        in if maxPixels0 > 0 && area0 > maxPixels0
+           then traceStage
+             ("msdf: bitmap size exceeds MSDF_MAX_BITMAP_PIXELS=" <> show maxPixels0 <> ", skipping render")
+             base
            else
-             let padding = fromIntegral (safeRange + 1) :: Double
-                 width = max 1 (ceiling ((bbox.xMax - bbox.xMin) + 2 * padding))
-                 height = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding))
-                 area = width * height
-                 offsetX = bbox.xMin - padding
-                 offsetY = bbox.yMin - padding
-                 !_ = traceStage
-                   ("msdf: bitmap size " <> show width <> "x" <> show height
-                     <> " pixels=" <> show area <> " bbox=" <> show bbox)
-                   ()
-                 maxPixels = msdfMaxBitmapPixels
-             in if maxPixels > 0 && area > maxPixels
-                then traceStage
-                  ("msdf: bitmap size exceeds MSDF_MAX_BITMAP_PIXELS=" <> show maxPixels <> ", skipping render")
-                  base
+             let contoursScaled = traceStage "msdf: scale contours" (map (map (scalePoint scale)) contours)
+                 eps = cfg.outline.contourEpsilon
+                 edgesByContour0 = traceStage "msdf: contour->edges" (map (filterDegenerateEdges eps . contourToEdges) contoursScaled)
+                 edgesByContour1 =
+                   traceStage "msdf: split intersections" $
+                     if cfg.outline.splitIntersections
+                     then splitContoursIntersections cfg.outline edgesByContour0
+                     else edgesByContour0
+                 edgesByContour2 =
+                   traceStage "msdf: preprocess contours" $
+                     if cfg.outline.splitIntersections
+                     then preprocessContours cfg.outline cfg.distance.fillRule edgesByContour1
+                     else edgesByContour1
+                 edgesByContour = map (filterDegenerateEdges eps) edgesByContour2
+                 edgeInfosByContour0 = traceStage "msdf: build edge infos" (buildEdgeInfos cfg.outline edgesByContour)
+                 allInfos0 = concat edgeInfosByContour0
+                 edgeInfosByContour =
+                   if cfg.distance.overlapSupport
+                   then
+                     let overlapFlags = traceStage "msdf: compute overlaps" (computeEdgeOverlaps cfg.outline.windingFlatness cfg.outline.contourEpsilon allInfos0)
+                         overlapMap = Map.fromList
+                           [ (edgeKey info, flag)
+                           | (info, flag) <- zip allInfos0 overlapFlags
+                           ]
+                     in traceStage "msdf: apply overlap flags" (map (map (applyOverlapFlag overlapMap)) edgeInfosByContour0)
+                   else edgeInfosByContour0
+                 coloredEdges = traceStage "msdf: edge coloring" (colorEdges cfg.coloring edgesByContour)
+                 coloredInfos0 = traceStage "msdf: attach edge info" (attachEdgeInfo edgeInfosByContour coloredEdges)
+                 allEdges0 = [ info | (_, info) <- coloredInfos0 ]
+                 segsAll = traceStage "msdf: flatten edges all" (flattenEdges cfg.outline.windingFlatness [ info.edge | info <- allEdges0 ])
+                 segsByContour = traceStage "msdf: flatten edges by contour" (map (flattenEdges cfg.outline.windingFlatness) edgesByContour)
+                 coloredInfos =
+                   if cfg.distance.overlapSupport
+                   then
+                     let filtered =
+                           filterBoundaryEdges
+                             cfg.distance.fillRule
+                             cfg.distance.overlapEpsilon
+                             cfg.outline.windingFlatness
+                             segsAll
+                             segsByContour
+                             cfg.outline.splitIntersections
+                             coloredInfos0
+                     in if null filtered then coloredInfos0 else filtered
+                   else coloredInfos0
+             in if null coloredInfos
+                then base
                 else
-                  let pixels = traceStage "msdf: render bitmap" (renderBitmap cfg width height offsetX offsetY coloredInfos segsAll segsByContour)
-                  in GlyphMSDF
+                  let padding = fromIntegral (safeRange + 1) :: Double
+                      width = max 1 (ceiling ((bbox.xMax - bbox.xMin) + 2 * padding))
+                      height = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding))
+                      area = width * height
+                      offsetX = bbox.xMin - padding
+                      offsetY = bbox.yMin - padding
+                      !_ = traceStage
+                        ("msdf: bitmap size " <> show width <> "x" <> show height
+                          <> " pixels=" <> show area <> " bbox=" <> show bbox)
+                        ()
+                  in
+                    let pixels = traceStage "msdf: render bitmap" (renderBitmap cfg width height offsetX offsetY coloredInfos segsAll segsByContour)
+                    in GlyphMSDF
                       { index = glyphIndex
                       , codepoints = []
                       , advance = base.advance

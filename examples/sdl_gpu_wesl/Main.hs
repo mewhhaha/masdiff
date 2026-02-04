@@ -4,7 +4,7 @@
 module Main (main) where
 
 import Data.Array ((!))
-import Data.Array.IArray (bounds)
+import Data.Array.IArray (bounds, elems)
 import qualified Data.Array.Unboxed as UA
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -12,10 +12,11 @@ import Data.ByteString.Builder (Builder, byteString, floatLE, word32LE, word8, t
 import qualified Data.ByteString.Lazy as BL
 import Data.Bits ((.&.))
 import Data.Char (isSpace, ord, toLower)
-import Data.List (foldl', isPrefixOf)
+import Data.List (foldl', isPrefixOf, sortOn)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Numeric (showHex)
 import Control.Monad (foldM, forM_, when)
+import qualified Data.Map.Strict as Map
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
@@ -35,7 +36,7 @@ import MSDF.Binary (ByteBuffer(..), readU8)
 import MSDF.Outline (Point(..))
 import MSDF.Types (AtlasImage(..), BitmapFormat(..), GlyphMSDF(..), MSDFAtlas(..), MSDFBitmap(..), lookupCodepoint)
 import MSDF.TTF.Parser (Cmap(..), ParseError(..), glyphBBoxRawAt, glyphOutlineAt, parseTTF, TTF(..))
-import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), Variations(..), gvarDeltaSum, gvarTupleHeaderStats, gvarTupleScalars, normalizeLocation)
+import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), Variations(..), gvarDeltaSum, gvarTupleDeltaStats, gvarTupleHeaderStats, gvarTupleScalars, normalizeLocation)
 import MSDF.LazyAtlas (LazyAtlas, LazyAtlasConfig(..), defaultLazyAtlasConfig, ensureGlyph, newLazyAtlas, snapshotAtlasImage)
 import MSDF.Config (AtlasConfig(..))
 import Spirdo.Wesl (compile, renderCompileError, sourceFile, shaderSpirv)
@@ -75,6 +76,8 @@ data CliOptions = CliOptions
   , pseudoOpt :: Maybe Bool
   , packAtlasOpt :: Maybe Bool
   , emitBlobOpt :: Bool
+  , cacheOpt :: Bool
+  , batchOpt :: Bool
   }
 
 defaultCliOptions :: CliOptions
@@ -98,6 +101,8 @@ defaultCliOptions =
     , pseudoOpt = Nothing
     , packAtlasOpt = Nothing
     , emitBlobOpt = False
+    , cacheOpt = False
+    , batchOpt = False
     }
 
 data ParseResult
@@ -114,7 +119,7 @@ usage =
     , "             [--sign-mode winding|scanline] [--fill-rule nonzero|odd|positive|negative]"
     , "             [--overlap | --no-overlap] [--overlap-epsilon X]"
     , "             [--coloring simple|inktrap|distance] [--pseudo-distance | --no-pseudo-distance]"
-    , "             [--no-pack] [--emit-blob]"
+    , "             [--no-pack] [--emit-blob] [--cache] [--batch]"
     , ""
     , "Examples:"
     , "  msdf-sdl-gen --font /path/to/font.ttf"
@@ -153,6 +158,93 @@ logMsg msg = do
     then hPutStrLn stderr msg
     else putStrLn msg
 
+type AtlasCache = IORef (Map.Map String MSDFAtlas)
+
+{-# NOINLINE atlasCacheRef #-}
+atlasCacheRef :: AtlasCache
+atlasCacheRef = unsafePerformIO (newIORef Map.empty)
+
+getCachedAtlas :: Bool -> String -> MSDF.MSDFConfig -> TTF -> IO MSDFAtlas
+getCachedAtlas useCache key cfg ttf =
+  if not useCache
+    then pure (generateMSDFFromTTF cfg ttf)
+    else do
+      cache <- readIORef atlasCacheRef
+      case Map.lookup key cache of
+        Just atlas -> pure atlas
+        Nothing -> do
+          let atlas = generateMSDFFromTTF cfg ttf
+          writeIORef atlasCacheRef (Map.insert key atlas cache)
+          pure atlas
+
+atlasCacheKey :: FilePath -> MSDF.MSDFConfig -> String
+atlasCacheKey fontKey cfg =
+  let vars = normalizeVars cfg.variations
+      glyphKey = glyphSetKey cfg.glyphSet
+      atlasCfg = cfg.atlas
+      outlineCfg = cfg.outline
+      coloringCfg = cfg.coloring
+      distCfg = cfg.distance
+      corrCfg = cfg.correction
+  in unlines
+      [ "font=" <> fontKey
+      , "pixelSize=" <> show cfg.pixelSize
+      , "range=" <> show cfg.range
+      , "output=" <> show cfg.outputFormat
+      , "vars=" <> show vars
+      , "glyphs=" <> glyphKey
+      , "pack=" <> show atlasCfg.packAtlas
+      , "pad=" <> show atlasCfg.atlasPadding
+      , "minSize=" <> show atlasCfg.atlasMinSize
+      , "maxSize=" <> show atlasCfg.atlasMaxSize
+      , "pow2=" <> show atlasCfg.atlasPowerOfTwo
+      , "buildImage=" <> show atlasCfg.buildAtlasImage
+      , "flatness=" <> show outlineCfg.windingFlatness
+      , "eps=" <> show outlineCfg.contourEpsilon
+      , "normalize=" <> show outlineCfg.normalizeOrientation
+      , "split=" <> show outlineCfg.splitIntersections
+      , "cornerAngle=" <> show coloringCfg.cornerAngleDeg
+      , "minSegments=" <> show coloringCfg.minSegments
+      , "conflictDist=" <> show coloringCfg.conflictDistance
+      , "colorSeed=" <> show coloringCfg.coloringSeed
+      , "strategy=" <> show coloringCfg.strategy
+      , "pseudo=" <> show distCfg.pseudoDistance
+      , "grid=" <> show distCfg.gridCellSize
+      , "signEps=" <> show distCfg.signEpsilon
+      , "fill=" <> show distCfg.fillRule
+      , "sign=" <> show distCfg.signMode
+      , "overlap=" <> show distCfg.overlapSupport
+      , "overlapEps=" <> show distCfg.overlapEpsilon
+      , "corr=" <> show corrCfg.enableCorrection
+      , "corrChan=" <> show corrCfg.channelThreshold
+      , "corrEdge=" <> show corrCfg.edgeThreshold
+      , "corrHard=" <> show corrCfg.hardThreshold
+      ]
+
+normalizeVars :: [(String, Double)] -> [(String, Double)]
+normalizeVars = uniqueVars . sortOn fst
+  where
+    uniqueVars [] = []
+    uniqueVars (x:xs) = x : uniqueVars (dropWhile (\y -> fst y == fst x) xs)
+
+glyphSetKey :: GlyphSet -> String
+glyphSetKey gs =
+  case gs of
+    GlyphSetNone -> "none"
+    GlyphSetAll -> "all"
+    GlyphSetCodepoints cps -> "codepoints:" <> show (uniqueSortedInts cps)
+
+uniqueSortedInts :: [Int] -> [Int]
+uniqueSortedInts xs =
+  case sortOn id xs of
+    [] -> []
+    (y:ys) -> y : go y ys
+  where
+    go _ [] = []
+    go prev (z:zs)
+      | z == prev = go prev zs
+      | otherwise = z : go z zs
+
 main :: IO ()
 main = do
   baseDir <- resolveBaseDir
@@ -169,6 +261,8 @@ main = do
   pairOpsz <- resolvePairOpsz
   pixelSizeEnv <- resolvePixelSizeOverride
   rangeEnv <- resolveRangeOverride
+  cacheEnv <- resolveCacheMode
+  batchEnv <- resolveBatchMode
   args <- getArgs
   opts <- case parseArgs args defaultCliOptions of
     ParseHelp -> do
@@ -191,7 +285,11 @@ main = do
   vertSpv <- compileWesl (not emitBlob) outDir (shaderDir </> "msdf.vert.wesl")
   fragSpv <- compileWesl (not emitBlob) outDir (shaderDir </> "msdf.frag.wesl")
 
-  let lazyAtlas = fromMaybe lazyAtlasEnv opts.lazyAtlasOpt
+  let cacheEnabled = cacheEnv || opts.cacheOpt
+      batchEnabled = batchEnv || opts.batchOpt
+      lazyAtlas = if cacheEnabled || batchEnabled
+                  then False
+                  else fromMaybe lazyAtlasEnv opts.lazyAtlasOpt
       hasVariations = (not (null variations) || isJust pairWeights)
       autoFast = False
       fastEnabled = fastEnv || (fastVariationsEnv && hasVariations) || autoFast
@@ -242,6 +340,10 @@ main = do
       cfg = applyCliOverrides opts cfgFast
   when fastEnabled $
     logMsg "text debug: fast mode enabled (set SDL_MSDF_FAST=0 and SDL_MSDF_FAST_VARIATIONS=0 for full quality)"
+  when batchEnabled $
+    logMsg "text debug: batch mode enabled (lazy atlas disabled)"
+  when cacheEnabled $
+    logMsg "text debug: atlas cache enabled (keyed by font+config+glyph set)"
   fontPath <- resolveFontPath baseDir opts
   parsed <- parseTTF fontPath
   case parsed of
@@ -264,9 +366,9 @@ main = do
                 ]
       if emitBlob
         then do
-          outs <- mapM (buildAtlas outDir sampleText cfg ttf lazyAtlas textDebug) outputs
+          outs <- mapM (buildAtlas fontPath sampleText cfg ttf lazyAtlas textDebug cacheEnabled) outputs
           emitBlobOutputs vertSpv fragSpv outs
-        else mapM_ (writeAtlas outDir sampleText cfg ttf lazyAtlas textDebug) outputs
+        else mapM_ (writeAtlas outDir fontPath sampleText cfg ttf lazyAtlas textDebug cacheEnabled) outputs
 
 resolveSampleText :: IO String
 resolveSampleText = do
@@ -326,6 +428,26 @@ resolveRangeOverride :: IO (Maybe Int)
 resolveRangeOverride = do
   val <- lookupEnv "SDL_MSDF_RANGE"
   pure (val >>= readMaybe . trim)
+
+resolveCacheMode :: IO Bool
+resolveCacheMode = do
+  val <- lookupEnv "SDL_MSDF_CACHE"
+  pure (case fmap (map toLower) val of
+    Just "1" -> True
+    Just "true" -> True
+    Just "yes" -> True
+    Just "on" -> True
+    _ -> False)
+
+resolveBatchMode :: IO Bool
+resolveBatchMode = do
+  val <- lookupEnv "SDL_MSDF_BATCH"
+  pure (case fmap (map toLower) val of
+    Just "1" -> True
+    Just "true" -> True
+    Just "yes" -> True
+    Just "on" -> True
+    _ -> False)
 
 resolveEmitBlob :: IO Bool
 resolveEmitBlob = do
@@ -474,8 +596,8 @@ formatFlagFor fmt =
     BitmapMSDF -> 0
     BitmapMTSDF -> 1
 
-buildAtlas :: FilePath -> String -> MSDF.MSDFConfig -> TTF -> Bool -> Bool -> (String, BitmapFormat, Double, Bool, [(String, Double)]) -> IO OutputData
-buildAtlas _outDir sampleText cfgBase ttf lazyAtlas textDebug (label, fmt, centerX, _writeDefault, vars) = do
+buildAtlas :: FilePath -> String -> MSDF.MSDFConfig -> TTF -> Bool -> Bool -> Bool -> (String, BitmapFormat, Double, Bool, [(String, Double)]) -> IO OutputData
+buildAtlas fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled (label, fmt, centerX, _writeDefault, vars) = do
   when textDebug $ do
     let glyphCount = IntMap.size (buildGlyphMap ttf sampleText)
     logMsg ("text debug: label=" <> label <> " lazy=" <> show lazyAtlas <> " glyphs=" <> show glyphCount <> " vars=" <> show vars)
@@ -485,11 +607,33 @@ buildAtlas _outDir sampleText cfgBase ttf lazyAtlas textDebug (label, fmt, cente
   if lazyAtlas
     then buildAtlasLazy sampleText cfg ttf label centerX textDebug
     else do
-      let atlas = generateMSDFFromTTF cfg ttf
+      let cacheKey = atlasCacheKey fontKey cfg
+      atlas <- getCachedAtlas cacheEnabled cacheKey cfg ttf
       case atlas of
-        MSDFAtlas { atlas = Nothing } -> do
-          logMsg "atlas packing failed (packAtlas was true)"
-          exitFailure
+        MSDFAtlas { atlas = Nothing, glyphs = glyphArr } -> do
+          let hasBitmap = any (\g -> g.bitmap.width > 0 && g.bitmap.height > 0) (elems glyphArr)
+          if hasBitmap
+            then do
+              logMsg "atlas packing failed (packAtlas was true)"
+              exitFailure
+            else do
+              logMsg ("atlas empty (no glyph bitmaps); skipping output " <> label)
+              let meta = MetaInfo
+                    { metaAtlasW = 0
+                    , metaAtlasH = 0
+                    , metaPixelSize = 0
+                    , metaScreenW = round screenW
+                    , metaScreenH = round screenH
+                    , metaPxRange = 0
+                    , metaVertexCount = 0
+                    }
+              pure OutputData
+                { outLabel = label
+                , outFormatFlag = formatFlagFor fmt
+                , outMeta = meta
+                , outAtlasBytes = BS.empty
+                , outVertexBytes = BS.empty
+                }
         MSDFAtlas { atlas = Just img, pixelSize = ps } -> do
           let AtlasImage { width = aw, height = ah, format = fmtImg, pixels = px } = img
               rgbaBytes = bitmapToRgbaBytes fmtImg px
@@ -558,21 +702,28 @@ buildAtlasLazy sampleText cfg ttf label centerX textDebug = do
     , outVertexBytes = vtxBytes
     }
 
-writeAtlas :: FilePath -> String -> MSDF.MSDFConfig -> TTF -> Bool -> Bool -> (String, BitmapFormat, Double, Bool, [(String, Double)]) -> IO ()
-writeAtlas outDir sampleText cfgBase ttf lazyAtlas textDebug args@(_label, _fmt, _centerX, writeDefault, _vars) = do
-  output <- buildAtlas outDir sampleText cfgBase ttf lazyAtlas textDebug args
-  let verticesOut = outDir </> ("vertices_" <> output.outLabel <.> "bin")
-      atlasOut = outDir </> ("atlas_" <> output.outLabel <.> "rgba")
-      metaOut = outDir </> ("meta_" <> output.outLabel <.> "txt")
-  writeOutputs atlasOut verticesOut metaOut output
-  when writeDefault $ do
-    let verticesOut' = outDir </> "vertices.bin"
-        atlasOut' = outDir </> "atlas.rgba"
-        metaOut' = outDir </> "meta.txt"
-    writeOutputs atlasOut' verticesOut' metaOut' output
-  logMsg ("wrote " <> atlasOut)
-  logMsg ("wrote " <> verticesOut)
-  logMsg ("wrote " <> metaOut)
+writeAtlas :: FilePath -> FilePath -> String -> MSDF.MSDFConfig -> TTF -> Bool -> Bool -> Bool -> (String, BitmapFormat, Double, Bool, [(String, Double)]) -> IO ()
+writeAtlas outDir fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled args@(_label, _fmt, _centerX, writeDefault, _vars) = do
+  output <- buildAtlas fontKey sampleText cfgBase ttf lazyAtlas textDebug cacheEnabled args
+  let emptyOutput = BS.null output.outAtlasBytes
+                || BS.null output.outVertexBytes
+                || output.outMeta.metaAtlasW <= 0
+                || output.outMeta.metaAtlasH <= 0
+  if emptyOutput
+    then logMsg ("skip write: empty output " <> output.outLabel)
+    else do
+      let verticesOut = outDir </> ("vertices_" <> output.outLabel <.> "bin")
+          atlasOut = outDir </> ("atlas_" <> output.outLabel <.> "rgba")
+          metaOut = outDir </> ("meta_" <> output.outLabel <.> "txt")
+      writeOutputs atlasOut verticesOut metaOut output
+      when writeDefault $ do
+        let verticesOut' = outDir </> "vertices.bin"
+            atlasOut' = outDir </> "atlas.rgba"
+            metaOut' = outDir </> "meta.txt"
+        writeOutputs atlasOut' verticesOut' metaOut' output
+      logMsg ("wrote " <> atlasOut)
+      logMsg ("wrote " <> verticesOut)
+      logMsg ("wrote " <> metaOut)
 
 buildGlyphMap :: TTF -> String -> IntMap.IntMap Int
 buildGlyphMap ttf text =
@@ -748,6 +899,20 @@ debugVariations label ttf vars sampleText =
                                        <> " minSize=" <> show minSize
                                        <> " maxSize=" <> show maxSize
                                        <> " maxEnd=" <> show maxEnd)
+                  case gvar' of
+                    Nothing -> pure ()
+                    Just gv ->
+                      case gvarTupleDeltaStats gv loc gi pointCount of
+                        Nothing -> logMsg ("gvarDeltas[" <> label <> "]: none")
+                        Just stats ->
+                          let fmt (idx, (scalar, minDx, maxDx, minDy, maxDy)) =
+                                "  #" <> show idx <> " scalar=" <> show scalar
+                                  <> " dx=[" <> show minDx <> "," <> show maxDx <> "]"
+                                  <> " dy=[" <> show minDy <> "," <> show maxDy <> "]"
+                              lines' = zipWith (\i s -> fmt (i, s)) [0..] stats
+                          in do
+                            logMsg ("gvarDeltas[" <> label <> "]:")
+                            mapM_ logMsg lines'
 
 contourDeltaSum :: [[Point]] -> [[Point]] -> Double
 contourDeltaSum a b =
@@ -843,6 +1008,8 @@ parseArgs ("--pseudo-distance":rest) opts = parseArgs rest opts { pseudoOpt = Ju
 parseArgs ("--no-pseudo-distance":rest) opts = parseArgs rest opts { pseudoOpt = Just False }
 parseArgs ("--no-pack":rest) opts = parseArgs rest opts { packAtlasOpt = Just False }
 parseArgs ("--emit-blob":rest) opts = parseArgs rest opts { emitBlobOpt = True }
+parseArgs ("--cache":rest) opts = parseArgs rest opts { cacheOpt = True }
+parseArgs ("--batch":rest) opts = parseArgs rest opts { batchOpt = True }
 parseArgs (arg:rest) opts
   | "-" `isPrefixOf` arg = CliParseError ("unknown option: " <> arg)
   | otherwise =
