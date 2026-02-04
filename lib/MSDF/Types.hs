@@ -216,7 +216,16 @@ instance NFData MSDFBitmap where
 
 instance NFData GlyphMSDF where
   rnf (GlyphMSDF i cps adv bx by bb bm vm pl) =
-    i `seq` cps `seq` adv `seq` bx `seq` by `seq` bb `seq` bm `seq` vm `seq` pl `seq` ()
+    i `seq`
+    rnf cps `seq`
+    adv `seq`
+    bx `seq`
+    by `seq`
+    rnf bb `seq`
+    rnf bm `seq`
+    rnf vm `seq`
+    rnf pl `seq`
+    ()
 
 instance NFData VerticalMetrics where
   rnf (VerticalMetrics a b) = a `seq` b `seq` ()

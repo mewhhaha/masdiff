@@ -118,20 +118,30 @@ edgeDistanceSqWithParam p (EdgeLine a b) =
       ey = snd p - cy
   in (ex * ex + ey * ey, t')
 edgeDistanceSqWithParam p (EdgeQuad p0 p1 p2) =
-  let a = vecSub (vecAdd p0 p2) (vecScale 2 p1)
-      b = vecScale 2 (vecSub p1 p0)
-      c = vecSub p0 p
-      c3 = 2 * dot a a
-      c2 = 3 * dot a b
-      c1 = dot b b + 2 * dot a c
-      c0 = dot b c
-      roots = solveCubic c3 c2 c1 c0
-      ts = filter (\t -> t >= 0 && t <= 1) roots ++ [0, 1]
-      pick (bestD, bestT) t =
-        let d = distanceSq (bezier p0 p1 p2 t) p
-        in if d < bestD then (d, t) else (bestD, bestT)
-      (dMin, tMin) = foldl pick (1e18, 0) ts
-  in (dMin, tMin)
+  let (x0, y0) = p0
+      (x1, y1) = p1
+      (x2, y2) = p2
+      (px, py) = p
+      ax = x0 - 2 * x1 + x2
+      ay = y0 - 2 * y1 + y2
+      bx = 2 * (x1 - x0)
+      by = 2 * (y1 - y0)
+      cx = x0 - px
+      cy = y0 - py
+      c3 = 2 * (ax * ax + ay * ay)
+      c2 = 3 * (ax * bx + ay * by)
+      c1 = (bx * bx + by * by) + 2 * (ax * cx + ay * cy)
+      c0 = bx * cx + by * cy
+      d0 = distanceSq p0 p
+      d1 = distanceSq p2 p
+      start = if d0 < d1 then (d0, 0) else (d1, 1)
+      pick t (bestD, bestT) =
+        if t >= 0 && t <= 1
+        then
+          let d = distanceSqBezier2 p0 p1 p2 p t
+          in if d < bestD then (d, t) else (bestD, bestT)
+        else (bestD, bestT)
+  in foldCubicRoots c3 c2 c1 c0 start pick
 
 distanceSqPointLine :: Vec2 -> Vec2 -> Vec2 -> Double
 distanceSqPointLine (px', py') (x0, y0) (x1, y1) =
@@ -148,16 +158,89 @@ distanceSqPointLine (px', py') (x0, y0) (x1, y1) =
 
 distanceSqPointQuad :: Vec2 -> Vec2 -> Vec2 -> Vec2 -> Double
 distanceSqPointQuad p0 p1 p2 p =
-  let a = vecSub (vecAdd p0 p2) (vecScale 2 p1)
-      b = vecScale 2 (vecSub p1 p0)
-      c = vecSub p0 p
-      c3 = 2 * dot a a
-      c2 = 3 * dot a b
-      c1 = dot b b + 2 * dot a c
-      c0 = dot b c
-      roots = solveCubic c3 c2 c1 c0
-      ts = filter (\t -> t >= 0 && t <= 1) roots ++ [0, 1]
-  in minimum [ distanceSq (bezier p0 p1 p2 t) p | t <- ts ]
+  let (x0, y0) = p0
+      (x1, y1) = p1
+      (x2, y2) = p2
+      (px, py) = p
+      ax = x0 - 2 * x1 + x2
+      ay = y0 - 2 * y1 + y2
+      bx = 2 * (x1 - x0)
+      by = 2 * (y1 - y0)
+      cx = x0 - px
+      cy = y0 - py
+      c3 = 2 * (ax * ax + ay * ay)
+      c2 = 3 * (ax * bx + ay * by)
+      c1 = (bx * bx + by * by) + 2 * (ax * cx + ay * cy)
+      c0 = bx * cx + by * cy
+      d0 = distanceSq p0 p
+      d1 = distanceSq p2 p
+      start = if d0 < d1 then d0 else d1
+      pick t best =
+        if t >= 0 && t <= 1
+        then min best (distanceSqBezier2 p0 p1 p2 p t)
+        else best
+  in foldCubicRoots c3 c2 c1 c0 start pick
+
+distanceSqBezier2 :: Vec2 -> Vec2 -> Vec2 -> Vec2 -> Double -> Double
+distanceSqBezier2 (x0, y0) (x1, y1) (x2, y2) (px, py) t =
+  let u = 1 - t
+      uu = u * u
+      tt = t * t
+      x = uu * x0 + 2 * u * t * x1 + tt * x2
+      y = uu * y0 + 2 * u * t * y1 + tt * y2
+      dx = x - px
+      dy = y - py
+  in dx * dx + dy * dy
+
+foldCubicRoots :: Double -> Double -> Double -> Double -> r -> (Double -> r -> r) -> r
+foldCubicRoots a b c d z f
+  | abs a < 1e-12 = foldQuadraticRoots b c d z f
+  | otherwise =
+      let a' = b / a
+          b' = c / a
+          c' = d / a
+          p = b' - a' * a' / 3
+          q = 2 * a' * a' * a' / 27 - a' * b' / 3 + c'
+          disc = (q * q) / 4 + (p * p * p) / 27
+      in if disc > 0
+         then
+           let sqrtDisc = sqrt disc
+               u = cbrt (-q / 2 + sqrtDisc)
+               v = cbrt (-q / 2 - sqrtDisc)
+               t = u + v - a' / 3
+           in f t z
+         else if abs disc < 1e-12
+              then
+                let u = cbrt (-q / 2)
+                    t1 = 2 * u - a' / 3
+                    t2 = -u - a' / 3
+                in f t2 (f t1 z)
+              else
+                let r = sqrt (-(p * p * p) / 27)
+                    phi = acos (-q / (2 * r))
+                    t = 2 * cbrt r
+                    t1 = t * cos (phi / 3) - a' / 3
+                    t2 = t * cos ((phi + 2 * pi) / 3) - a' / 3
+                    t3 = t * cos ((phi + 4 * pi) / 3) - a' / 3
+                in f t3 (f t2 (f t1 z))
+
+foldQuadraticRoots :: Double -> Double -> Double -> r -> (Double -> r -> r) -> r
+foldQuadraticRoots a b c z f
+  | abs a < 1e-12 = foldLinearRoots b c z f
+  | otherwise =
+      let disc = b * b - 4 * a * c
+      in if disc < 0
+         then z
+         else
+           let sqrtDisc = sqrt disc
+               t1 = (-b + sqrtDisc) / (2 * a)
+               t2 = (-b - sqrtDisc) / (2 * a)
+           in f t2 (f t1 z)
+
+foldLinearRoots :: Double -> Double -> r -> (Double -> r -> r) -> r
+foldLinearRoots a b z f
+  | abs a < 1e-12 = z
+  | otherwise = f (-b / a) z
 
 edgeLengthApprox :: Edge -> Double
 edgeLengthApprox (EdgeLine (x0, y0) (x1, y1)) =
@@ -212,53 +295,6 @@ vecSub (x0, y0) (x1, y1) = (x0 - x1, y0 - y1)
 
 vecScale :: Double -> Vec2 -> Vec2
 vecScale s (x, y) = (s * x, s * y)
-
-solveCubic :: Double -> Double -> Double -> Double -> [Double]
-solveCubic a b c d
-  | abs a < 1e-12 = solveQuadratic b c d
-  | otherwise =
-      let a' = b / a
-          b' = c / a
-          c' = d / a
-          p = b' - a' * a' / 3
-          q = 2 * a' * a' * a' / 27 - a' * b' / 3 + c'
-          disc = (q * q) / 4 + (p * p * p) / 27
-      in if disc > 0
-         then
-           let sqrtDisc = sqrt disc
-               u = cbrt (-q / 2 + sqrtDisc)
-               v = cbrt (-q / 2 - sqrtDisc)
-           in [u + v - a' / 3]
-         else if abs disc < 1e-12
-              then
-                let u = cbrt (-q / 2)
-                in [2 * u - a' / 3, -u - a' / 3]
-              else
-                let r = sqrt (-(p * p * p) / 27)
-                    phi = acos (-q / (2 * r))
-                    t = 2 * cbrt r
-                in [ t * cos (phi / 3) - a' / 3
-                   , t * cos ((phi + 2 * pi) / 3) - a' / 3
-                   , t * cos ((phi + 4 * pi) / 3) - a' / 3
-                   ]
-
-solveQuadratic :: Double -> Double -> Double -> [Double]
-solveQuadratic a b c
-  | abs a < 1e-12 = solveLinear b c
-  | otherwise =
-      let disc = b * b - 4 * a * c
-      in if disc < 0
-         then []
-         else
-           let sqrtDisc = sqrt disc
-               t1 = (-b + sqrtDisc) / (2 * a)
-               t2 = (-b - sqrtDisc) / (2 * a)
-           in [t1, t2]
-
-solveLinear :: Double -> Double -> [Double]
-solveLinear a b
-  | abs a < 1e-12 = []
-  | otherwise = [-b / a]
 
 cbrt :: Double -> Double
 cbrt x = if x < 0 then -((abs x) ** (1 / 3)) else x ** (1 / 3)

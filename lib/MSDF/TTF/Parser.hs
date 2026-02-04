@@ -19,6 +19,7 @@ module MSDF.TTF.Parser
   , parseTTFUnsafe
   , glyphOutline
   , glyphOutlineAt
+  , glyphContoursAtVar
   , glyphBBoxRaw
   , glyphBBoxRawAt
   , compositeMetricsGlyph
@@ -30,7 +31,7 @@ import qualified Data.ByteString as BS
 import Data.Array (Array, array, bounds, inRange, (!))
 import Data.Bits (testBit, shiftL, (.|.), (.&.))
 import Data.Char (chr)
-import Data.Int (Int16)
+import Data.Int (Int16, Int8)
 import Data.List (sortOn)
 import Data.Word (Word8, Word16, Word32)
 import MSDF.Binary
@@ -601,8 +602,7 @@ glyphContoursAtVar loc ttf glyphIndex depth =
                    else if depth > 16
                         then ([], (0,0,0,0))
                         else
-                          let baseContours = parseCompositeGlyph loc gvarMaybe bb depth ttf glyphIndex
-                          in (baseContours, (0,0,0,0))
+                          parseCompositeGlyph loc gvarMaybe bb depth ttf glyphIndex
 
 -- | Raw bounding box for a glyph (font units).
 glyphBBoxRaw :: TTF -> Int -> (Int, Int, Int, Int)
@@ -734,31 +734,32 @@ data CompositeComponent = CompositeComponent
   , compTransform :: (Double, Double, Double, Double)
   }
 
-parseCompositeGlyph :: Maybe VariationLocation -> Maybe Gvar -> ByteBuffer -> Int -> TTF -> Int -> [[Point]]
+parseCompositeGlyph :: Maybe VariationLocation -> Maybe Gvar -> ByteBuffer -> Int -> TTF -> Int -> ([[Point]], (Double, Double, Double, Double))
 parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
   let components = readCompositeComponents bb
-      compCount = length components
-      deltas = case (loc, gvar) of
-        (Just loc', Just gv) | compCount > 0 -> Just (componentDeltas gv loc' glyphIndex compCount)
-        _ -> Nothing
+      hasGvar = case gvar of
+        Just gv -> gvarHasData gv glyphIndex
+        Nothing -> False
+      compLoc = if hasGvar then Nothing else loc
   in if depth > 16
-     then []
-     else buildContours components deltas
+     then ([], (0, 0, 0, 0))
+     else
+       let baseContours = buildContours compLoc components
+       in case (loc, gvar) of
+            (Just loc', Just gv) | hasGvar ->
+              applyGvarToContours gv loc' glyphIndex baseContours
+            _ -> (baseContours, (0, 0, 0, 0))
   where
-    buildContours comps deltas =
+    buildContours compLoc comps =
       let go _ acc [] = acc
           go idx acc (c:cs) =
-            let (contours, _) = glyphContoursAtVar loc ttf c.compGlyph (depth + 1)
+            let (contours, _) = glyphContoursAtVar compLoc ttf c.compGlyph (depth + 1)
                 transformedNoTrans = map (map (applyTransform c.compTransform 0 0)) contours
                 argsAreXY = testBit c.compFlags 1
                 (dx0, dy0) =
                   if argsAreXY
-                  then
-                    let (deltaX, deltaY) = componentDeltaAt deltas idx
-                        rawDx = fromIntegral c.arg1 + deltaX
-                        rawDy = fromIntegral c.arg2 + deltaY
-                    in applyComponentOffset c.compFlags c.compTransform (rawDx, rawDy)
-                  else pointMatchOffset acc transformedNoTrans c.arg1 c.arg2
+                  then applyComponentOffset c.compFlags c.compTransform (fromIntegral c.arg1, fromIntegral c.arg2)
+                  else pointMatchOffset acc transformedNoTrans c.arg2 c.arg1
                 (dx1, dy1) =
                   if testBit c.compFlags 2
                   then (fromIntegral (round dx0 :: Int), fromIntegral (round dy0 :: Int))
@@ -768,11 +769,15 @@ parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
             in go (idx + 1) acc' cs
       in go 0 [] comps
 
-    componentDeltaAt Nothing _ = (0, 0)
-    componentDeltaAt (Just (dxs, dys, _phantom)) i =
-      let dx = if inRange (bounds dxs) i then dxs ! i else 0
-          dy = if inRange (bounds dys) i then dys ! i else 0
-      in (dx, dy)
+    gvarHasData gv gi =
+      let offs = gv.offsets
+          (lo, hi) = bounds offs
+      in if lo > hi || gi < lo || gi + 1 > hi
+         then False
+         else
+           let start = offs ! gi
+               end = offs ! (gi + 1)
+           in end > start
 
 readCompositeComponents :: ByteBuffer -> [CompositeComponent]
 readCompositeComponents bb = go 10 []
@@ -784,14 +789,21 @@ readCompositeComponents bb = go 10 []
         let flags = readU16BE bb off
             glyphIndex = fromIntegral (readU16BE bb (off + 2))
             argsAreWords = testBit flags 0
+            argsAreXY = testBit flags 1
             argsLen = if argsAreWords then 4 else 2
         in if not (within bb (off + 4) argsLen)
            then reverse acc
            else
              let (arg1', arg2', offArgs) =
                    if argsAreWords
-                   then (fromIntegral (readS16BE bb (off + 4)), fromIntegral (readS16BE bb (off + 6)), off + 8)
-                   else (fromIntegral (readU8 bb (off + 4)), fromIntegral (readU8 bb (off + 5)), off + 6)
+                   then
+                     if argsAreXY
+                     then (fromIntegral (readS16BE bb (off + 4)), fromIntegral (readS16BE bb (off + 6)), off + 8)
+                     else (fromIntegral (readU16BE bb (off + 4)), fromIntegral (readU16BE bb (off + 6)), off + 8)
+                   else
+                     if argsAreXY
+                     then (fromIntegral (asInt8 (readU8 bb (off + 4))), fromIntegral (asInt8 (readU8 bb (off + 5))), off + 6)
+                     else (fromIntegral (readU8 bb (off + 4)), fromIntegral (readU8 bb (off + 5)), off + 6)
                  transLen = transformSize flags
              in if not (within bb offArgs transLen)
                 then reverse acc
@@ -807,6 +819,8 @@ readCompositeComponents bb = go 10 []
                   in if testBit flags 5 && offTrans <= bb.len
                      then go offTrans (comp : acc)
                      else reverse (comp : acc)
+    asInt8 :: Word8 -> Int8
+    asInt8 = fromIntegral
 
 readTransform :: ByteBuffer -> Int -> Word16 -> ((Double, Double, Double, Double), Int)
 readTransform bb off flags

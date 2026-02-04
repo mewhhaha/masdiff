@@ -367,7 +367,7 @@ testVariableFont ttf = do
           assert (locCoords !! wghtIndex /= 0) "normalized variation coords are all zero"
       case vars.gvar of
         Nothing -> assert False "gvar table missing"
-        Just (Gvar _ _ offsets dataOffset _ buffer) ->
+        Just (Gvar _ _ offsets dataOffset _ buffer _) ->
           let (lo, hi) = bounds offsets
           in if gA < lo || gA + 1 > hi
              then assert False "gvar offsets out of range"
@@ -1046,7 +1046,7 @@ forceGvar ttf =
     Just vars ->
       case vars.gvar of
         Nothing -> ()
-        Just (Gvar _ _ offs _ _ _) ->
+        Just (Gvar _ _ offs _ _ _ _) ->
           let (_lo, _hi) = bounds offs
           in ()
 

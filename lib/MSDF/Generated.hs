@@ -1,28 +1,38 @@
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+
 module MSDF.Generated
   ( generateMSDF
   , generateMSDFWithConfig
   , generateMSDFFromBytes
   , generateMSDFFromTTF
+  , generateMSDFFromTTFWithTimings
   , generateMSDFOrThrow
   , generateMTSDF
   , generateMTSDFWithConfig
   , generateMTSDFFromBytes
   , generateMTSDFFromTTF
   , generateMTSDFOrThrow
+  , BuildTimings(..)
   ) where
 
-import Control.Exception (SomeException, evaluate, try)
-import Control.DeepSeq (deepseq)
-import Control.Monad (forM_)
+import Control.Exception (SomeException, evaluate, try, bracket_)
+import Control.DeepSeq (NFData(..), deepseq)
+import Control.Monad (forM_, when)
 import qualified Data.ByteString as BS
-import Control.Parallel.Strategies (parListChunk, rdeepseq, withStrategy)
+import Control.Parallel.Strategies (parListChunk, rdeepseq, rseq, withStrategy)
 import Data.Array (Array, array, listArray, accumArray, bounds, (!), (//))
-import Data.Array.ST (STUArray, newArray, writeArray, freeze)
+import Data.Array.Base (STUArray(..), UArray(..))
+import Data.Array.ST (newArray, freeze)
 import qualified Data.Array.Unboxed as UA
 import Data.List (groupBy, sortOn, sort)
 import Control.Monad.ST (ST, runST)
 import Data.Word (Word8)
-import MSDF.MSDF
+import GHC.Exts (Int(I#), Int#, copyByteArray#)
+import GHC.ST (ST(..))
+import GHC.Conc (getNumCapabilities, setNumCapabilities)
+import System.CPUTime (getCPUTime)
+import MSDF.MSDF (MSDFConfig(..), AtlasConfig(..), GlyphSet(..), defaultMSDFConfig, glyphMetricsOnlyAt, renderGlyphMSDF)
 import MSDF.TTF.GPOS
   ( KerningPairRaw(..)
   , AnchorRaw(..)
@@ -36,6 +46,17 @@ import MSDF.TTF.Parser
 import MSDF.TTF.Variations (mvarHheaDeltas, mvarVheaDeltas)
 import MSDF.Types
 
+data BuildTimings = BuildTimings
+  { totalMs :: Double
+  , renderMs :: Double
+  , packPlaceMs :: Double
+  , packImageMs :: Double
+  , kerningMs :: Double
+  , marksMs :: Double
+  , packRectCount :: Int
+  , atlasSize :: Maybe (Int, Int)
+  } deriving (Eq, Show)
+
 -- | Generate an MSDF atlas from a TTF file with default config.
 generateMSDF :: FilePath -> IO (Either ParseError MSDFAtlas)
 generateMSDF = generateMSDFWithConfig defaultMSDFConfig
@@ -43,19 +64,33 @@ generateMSDF = generateMSDFWithConfig defaultMSDFConfig
 -- | Generate an MSDF atlas from a TTF file with a custom config.
 generateMSDFWithConfig :: MSDFConfig -> FilePath -> IO (Either ParseError MSDFAtlas)
 generateMSDFWithConfig cfg path = do
-  parsed <- parseTTF path
-  case parsed of
-    Left err -> pure (Left err)
-    Right ttf -> do
-      result <- try (evaluate (forceAtlas (buildAtlas cfg ttf)))
-      case result of
-        Left (e :: SomeException) ->
-          pure (Left (ParseError { context = "buildAtlas", message = show e }))
-        Right atlas -> pure (Right atlas)
+  withCapabilities cfg.parallelism $ do
+    parsed <- parseTTF path
+    case parsed of
+      Left err -> pure (Left err)
+      Right ttf -> do
+        result <- try (evaluate (forceAtlas (buildAtlas cfg ttf)))
+        case result of
+          Left (e :: SomeException) ->
+            pure (Left (ParseError { context = "buildAtlas", message = show e }))
+          Right atlas -> pure (Right atlas)
 
 -- | Generate an MSDF atlas from a parsed TTF.
 generateMSDFFromTTF :: MSDFConfig -> TTF -> MSDFAtlas
 generateMSDFFromTTF cfg ttf = buildAtlas cfg ttf
+
+generateMSDFFromTTFWithTimings :: MSDFConfig -> TTF -> IO (MSDFAtlas, BuildTimings)
+generateMSDFFromTTFWithTimings cfg ttf =
+  withCapabilities cfg.parallelism (buildAtlasWithTimings cfg ttf)
+
+withCapabilities :: Int -> IO a -> IO a
+withCapabilities caps action
+  | caps <= 0 = action
+  | otherwise = do
+      current <- getNumCapabilities
+      if current == caps
+        then action
+        else bracket_ (setNumCapabilities caps) (setNumCapabilities current) action
 
 -- | Generate an MSDF atlas from a TTF ByteString.
 generateMSDFFromBytes :: MSDFConfig -> BS.ByteString -> Either ParseError MSDFAtlas
@@ -102,6 +137,9 @@ buildAtlas cfg ttf =
   let numGlyphs = ttf.maxp.numGlyphs
       unitsPerEm = ttf.head.unitsPerEm
       scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
+      AtlasConfig { packAtlas = packAtlas'
+                  , atlasPadding = atlasPadding'
+                  } = cfg.atlas
       loc = case ttf.variations of
         Nothing -> Nothing
         Just vars -> Just (normalizeLocation vars.fvar vars.avar cfg.variations)
@@ -112,7 +150,7 @@ buildAtlas cfg ttf =
       codepointIndex = arrayFromList codepointEntries
       selector = glyphSelector cfg.glyphSet mappingsUnique
       glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
-      (glyphsPacked, atlasImage) = if cfg.atlas.packAtlas
+      (glyphsPacked, atlasImage) = if packAtlas'
                                    then packAtlas cfg glyphs
                                    else (glyphs, Nothing)
       glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphsPacked)
@@ -163,7 +201,7 @@ buildAtlas cfg ttf =
        , pixelSize = cfg.pixelSize
        , range = cfg.range
        , scale = scale
-       , atlasPadding = cfg.atlas.atlasPadding
+       , atlasPadding = atlasPadding'
        , atlas = atlasImage
       , glyphs = glyphArray
       , codepointIndex = codepointIndex
@@ -172,12 +210,135 @@ buildAtlas cfg ttf =
       , markToMark = markToMark'
       }
 
+buildAtlasWithTimings :: MSDFConfig -> TTF -> IO (MSDFAtlas, BuildTimings)
+buildAtlasWithTimings cfg ttf = do
+  startTotal <- getCPUTime
+  let numGlyphs = ttf.maxp.numGlyphs
+      unitsPerEm = ttf.head.unitsPerEm
+      scale = fromIntegral cfg.pixelSize / fromIntegral unitsPerEm
+      AtlasConfig { packAtlas = packAtlas'
+                  , atlasPadding = atlasPadding'
+                  , buildAtlasImage = buildAtlasImage'
+                  } = cfg.atlas
+      loc = case ttf.variations of
+        Nothing -> Nothing
+        Just vars -> Just (normalizeLocation vars.fvar vars.avar cfg.variations)
+      mappings = ttf.cmap.mappings
+      mappingsUnique = dedupeMappings mappings
+      codepointArr = accumCodepoints numGlyphs mappingsUnique
+      codepointEntries = map (uncurry CodepointMapEntry) mappingsUnique
+      codepointIndex = arrayFromList codepointEntries
+      selector = glyphSelector cfg.glyphSet mappingsUnique
+  (glyphs, tRender) <- timeEval (renderGlyphs cfg ttf codepointArr selector numGlyphs)
+  let pad = max 0 atlasPadding'
+      rects =
+        [ PackRect i (bmp.width + 2 * pad) (bmp.height + 2 * pad) bmp.width bmp.height
+        | (i, g) <- zip [0..] glyphs
+        , let bmp = g.bitmap
+        , bmp.width > 0
+        , bmp.height > 0
+        ]
+  (glyphsPacked, atlasImage, tPlace, tImage, packRectCount', atlasSize') <-
+    if packAtlas' && not (null rects)
+    then do
+      (placementRes, tPlace') <- timeEval (chooseAtlasSize cfg rects)
+      case placementRes of
+        Nothing -> pure (glyphs, Nothing, tPlace', 0, length rects, Nothing)
+        Just (atlasW, atlasH, placements) -> do
+          let placementArr = placementsToArray (length glyphs) atlasW atlasH pad placements
+              glyphs' = [ applyPlacement g (placementArr ! i) | (i, g) <- zip [0..] glyphs ]
+          if buildAtlasImage'
+            then do
+              (atlasImage', tImage') <- timeEval (buildAtlasImage cfg.outputFormat atlasW atlasH pad cfg.parallelism placements glyphs)
+              pure (glyphs', Just atlasImage', tPlace', tImage', length rects, Just (atlasW, atlasH))
+            else pure (glyphs', Nothing, tPlace', 0, length rects, Just (atlasW, atlasH))
+    else pure (glyphs, Nothing, 0, 0, length rects, Nothing)
+  (kernPairs, tKerning) <- timeEval (buildKerning scale ttf.gpos ttf.kern)
+  let kernArray = arrayFromList kernPairs
+  ((markToBase', markToMark'), tMarks) <- timeEval (scaleMarks scale ttf.gposMarks)
+  let fontName = buildFontName ttf.name
+      baseAscent = fromIntegral ttf.hhea.ascent
+      baseDescent = fromIntegral ttf.hhea.descent
+      baseLineGap = fromIntegral ttf.hhea.lineGap
+      (deltaAscent, deltaDescent, deltaLineGap) =
+        case (loc, ttf.variations) of
+          (Just loc', Just vars) ->
+            case vars.mvar of
+              Just mv -> mvarHheaDeltas mv loc'
+              Nothing -> (0, 0, 0)
+          _ -> (0, 0, 0)
+      ascent = round ((baseAscent + deltaAscent) * scale)
+      descent = round ((baseDescent + deltaDescent) * scale)
+      lineGap = round ((baseLineGap + deltaLineGap) * scale)
+      (vAscent, vDescent, vLineGap) =
+        case ttf.vhea of
+          Nothing -> (Nothing, Nothing, Nothing)
+          Just vhea ->
+            let baseVAscent = fromIntegral vhea.ascent
+                baseVDescent = fromIntegral vhea.descent
+                baseVLineGap = fromIntegral vhea.lineGap
+                (deltaVAscent, deltaVDescent, deltaVLineGap) =
+                  case (loc, ttf.variations) of
+                    (Just loc', Just vars) ->
+                      case vars.mvar of
+                        Just mv -> mvarVheaDeltas mv loc'
+                        Nothing -> (0, 0, 0)
+                    _ -> (0, 0, 0)
+                asc = round ((baseVAscent + deltaVAscent) * scale)
+                desc = round ((baseVDescent + deltaVDescent) * scale)
+                gap = round ((baseVLineGap + deltaVLineGap) * scale)
+            in (Just asc, Just desc, Just gap)
+      glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphsPacked)
+      atlas = MSDFAtlas
+        { fontName = fontName
+        , unitsPerEm = unitsPerEm
+        , ascent = ascent
+        , descent = descent
+        , lineGap = lineGap
+        , vAscent = vAscent
+        , vDescent = vDescent
+        , vLineGap = vLineGap
+        , pixelSize = cfg.pixelSize
+        , range = cfg.range
+        , scale = scale
+        , atlasPadding = atlasPadding'
+        , atlas = atlasImage
+        , glyphs = glyphArray
+        , codepointIndex = codepointIndex
+        , kerning = kernArray
+        , markToBase = markToBase'
+        , markToMark = markToMark'
+        }
+  atlas `deepseq` pure ()
+  endTotal <- getCPUTime
+  let totalMs' = fromIntegral (endTotal - startTotal) / 1.0e9
+      timings = BuildTimings
+        { totalMs = totalMs'
+        , renderMs = tRender
+        , packPlaceMs = tPlace
+        , packImageMs = tImage
+        , kerningMs = tKerning
+        , marksMs = tMarks
+        , packRectCount = packRectCount'
+        , atlasSize = atlasSize'
+        }
+  pure (atlas, timings)
+
+timeEval :: NFData a => a -> IO (a, Double)
+timeEval thunk = do
+  start <- getCPUTime
+  result <- evaluate thunk
+  result `deepseq` pure ()
+  end <- getCPUTime
+  let elapsedMs = fromIntegral (end - start) / 1.0e9
+  pure (result, elapsedMs)
+
 buildGlyph :: TTF -> MSDFConfig -> Array Int [Int] -> (Int -> Bool) -> Int -> GlyphMSDF
 buildGlyph ttf cfg codepointArr shouldRender glyphIndex =
   let codepoints = reverse (codepointArr ! glyphIndex)
       base = if shouldRender glyphIndex
              then renderGlyphMSDF cfg ttf glyphIndex
-             else glyphMetricsOnly cfg ttf glyphIndex
+             else glyphMetricsOnlyAt Nothing cfg ttf glyphIndex
   in base { codepoints = codepoints }
 
 accumCodepoints :: Int -> [(Int, Int)] -> Array Int [Int]
@@ -297,7 +458,11 @@ glyphSelector set mappings =
 renderGlyphs :: MSDFConfig -> TTF -> Array Int [Int] -> (Int -> Bool) -> Int -> [GlyphMSDF]
 renderGlyphs cfg ttf codepointArr shouldRender numGlyphs =
   let glyphs = [ buildGlyph ttf cfg codepointArr shouldRender i | i <- [0 .. numGlyphs - 1] ]
-      chunk = cfg.parallelism
+      caps = cfg.parallelism
+      chunk =
+        if caps > 0
+        then max 1 ((numGlyphs + (caps * 2) - 1) `div` (caps * 2))
+        else 0
   in if chunk > 0
      then withStrategy (parListChunk chunk rdeepseq) glyphs
      else glyphs
@@ -322,6 +487,17 @@ data PackPlacement = PackPlacement
   , bmpH :: Int
   }
 
+instance NFData PackPlacement where
+  rnf p =
+    p.glyphIndex `seq`
+    p.slotX `seq`
+    p.slotY `seq`
+    p.slotW `seq`
+    p.slotH `seq`
+    p.bmpW `seq`
+    p.bmpH `seq`
+    ()
+
 data SkylineNode = SkylineNode
   { skyX :: Int
   , skyY :: Int
@@ -331,6 +507,7 @@ data SkylineNode = SkylineNode
 packAtlas :: MSDFConfig -> [GlyphMSDF] -> ([GlyphMSDF], Maybe AtlasImage)
 packAtlas cfg glyphs =
   let pad = max 0 cfg.atlas.atlasPadding
+      buildImage = cfg.atlas.buildAtlasImage
       rects = [ PackRect i (bmp.width + 2 * pad) (bmp.height + 2 * pad) bmp.width bmp.height
               | (i, g) <- zip [0..] glyphs
               , let bmp = g.bitmap
@@ -345,8 +522,11 @@ packAtlas cfg glyphs =
          Just (atlasW, atlasH, placements) ->
            let placementArr = placementsToArray (length glyphs) atlasW atlasH pad placements
                glyphs' = [ applyPlacement g (placementArr ! i) | (i, g) <- zip [0..] glyphs ]
-               atlasImage = buildAtlasImage cfg.outputFormat atlasW atlasH pad placements glyphs
-           in (glyphs', Just atlasImage)
+               atlasImage =
+                 if buildImage
+                 then Just (buildAtlasImage cfg.outputFormat atlasW atlasH pad cfg.parallelism placements glyphs)
+                 else Nothing
+           in (glyphs', atlasImage)
 
 applyPlacement :: GlyphMSDF -> Maybe GlyphPlacement -> GlyphMSDF
 applyPlacement glyph placement =
@@ -379,10 +559,14 @@ toPlacement atlasW atlasH pad p =
 
 chooseAtlasSize :: MSDFConfig -> [PackRect] -> Maybe (Int, Int, [PackPlacement])
 chooseAtlasSize cfg rects =
-  let maxDim = max 1 cfg.atlas.atlasMaxSize
-      minDim0 = max cfg.atlas.atlasMinSize (maximum [ r.slotW | r <- rects ])
-      minDim = if cfg.atlas.atlasPowerOfTwo then nextPow2 minDim0 else minDim0
-      sizes = if cfg.atlas.atlasPowerOfTwo
+  let AtlasConfig { atlasMaxSize = atlasMaxSize'
+                  , atlasMinSize = atlasMinSize'
+                  , atlasPowerOfTwo = atlasPowerOfTwo'
+                  } = cfg.atlas
+      maxDim = max 1 atlasMaxSize'
+      minDim0 = max atlasMinSize' (maximum [ r.slotW | r <- rects ])
+      minDim = if atlasPowerOfTwo' then nextPow2 minDim0 else minDim0
+      sizes = if atlasPowerOfTwo'
               then takeWhile (<= maxDim) (iterate (*2) minDim)
               else [minDim .. maxDim]
       sorted = sortOn (\r -> (-r.slotH, -r.slotW, r.glyphIndex)) rects
@@ -391,7 +575,7 @@ chooseAtlasSize cfg rects =
         case packWithWidth w sorted of
           Nothing -> trySize ws
           Just (placements, hUsed) ->
-            let h = if cfg.atlas.atlasPowerOfTwo then nextPow2 hUsed else hUsed
+            let h = if atlasPowerOfTwo' then nextPow2 hUsed else hUsed
             in if h <= maxDim then Just (w, h, placements) else trySize ws
   in trySize sizes
 
@@ -492,28 +676,102 @@ nextPow2 n
   where
     go k = if k >= n then k else go (k * 2)
 
-buildAtlasImage :: BitmapFormat -> Int -> Int -> Int -> [PackPlacement] -> [GlyphMSDF] -> AtlasImage
-buildAtlasImage fmt width height pad placements glyphs =
+buildAtlasImage :: BitmapFormat -> Int -> Int -> Int -> Int -> [PackPlacement] -> [GlyphMSDF] -> AtlasImage
+buildAtlasImage fmt width height pad parallelism placements glyphs =
   let channels = bitmapChannels fmt
+      glyphMap = array (0, length glyphs - 1) (zip [0..] glyphs)
+      pixels =
+        if parallelism > 1 && height > 1 && length placements > 1
+        then buildAtlasImageParallel fmt width height pad channels parallelism placements glyphMap
+        else buildAtlasImageSeq fmt width height pad channels placements glyphMap
+  in AtlasImage { width = width, height = height, format = fmt, pixels = pixels }
+
+buildAtlasImageSeq :: BitmapFormat -> Int -> Int -> Int -> Int -> [PackPlacement] -> Array Int GlyphMSDF -> UA.UArray Int Word8
+buildAtlasImageSeq _fmt width height pad channels placements glyphMap =
+  let total = width * height * channels
+  in runST $ do
+    -- Fill with black so padding represents "outside" (negative distance).
+    arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
+    forM_ placements $ \p -> do
+      let glyph = glyphMap ! p.glyphIndex
+          bmp = glyph.bitmap
+          bw = p.bmpW
+          bh = p.bmpH
+      when (bw > 0 && bh > 0) $ do
+        let src = bmp.pixels
+            dstX = p.slotX + pad
+            dstY = p.slotY + pad
+            rowBytes = bw * channels
+        forM_ [0 .. bh - 1] $ \y -> do
+          let srcBase = y * rowBytes
+              dstBase = ((dstY + y) * width + dstX) * channels
+          copyBytesST arr dstBase src srcBase rowBytes
+    freeze arr
+
+buildAtlasImageParallel :: BitmapFormat -> Int -> Int -> Int -> Int -> Int -> [PackPlacement] -> Array Int GlyphMSDF -> UA.UArray Int Word8
+buildAtlasImageParallel fmt width height pad channels parallelism placements glyphMap =
+  let bands = bandsForHeight height (min parallelism height)
+      buildBand (yStart, bandH) =
+        AtlasBand yStart bandH (buildAtlasImageBand fmt width pad channels yStart bandH placements glyphMap)
+      bandsBuilt = withStrategy (parListChunk 1 rseq) (map buildBand bands)
       total = width * height * channels
       pixels = runST $ do
-        -- Fill with black so padding represents "outside" (negative distance).
         arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
-        let glyphMap = array (0, length glyphs - 1) (zip [0..] glyphs)
-        forM_ placements $ \p -> do
-          let glyph = glyphMap ! p.glyphIndex
-              bmp = glyph.bitmap
-              src = bmp.pixels
-              dstX = p.slotX + pad
-              dstY = p.slotY + pad
-          forM_ [0 .. p.bmpH - 1] $ \y -> do
-            forM_ [0 .. p.bmpW - 1] $ \x -> do
-              let srcBase = (y * p.bmpW + x) * channels
-                  dstBase = ((dstY + y) * width + (dstX + x)) * channels
-              forM_ [0 .. channels - 1] $ \c ->
-                writeArray arr (dstBase + c) (src UA.! (srcBase + c))
+        forM_ bandsBuilt $ \band -> do
+          let dstOff = band.startRow * width * channels
+              len = band.bandHeight * width * channels
+          copyBytesST arr dstOff band.pixels 0 len
         freeze arr
-  in AtlasImage { width = width, height = height, format = fmt, pixels = pixels }
+  in pixels
+
+data AtlasBand = AtlasBand
+  { startRow :: Int
+  , bandHeight :: Int
+  , pixels :: UA.UArray Int Word8
+  }
+
+bandsForHeight :: Int -> Int -> [(Int, Int)]
+bandsForHeight height bands =
+  let bands' = max 1 (min bands height)
+      bandH = (height + bands' - 1) `div` bands'
+      starts = [0, bandH .. height - 1]
+  in [ (y, min bandH (height - y)) | y <- starts ]
+
+buildAtlasImageBand :: BitmapFormat -> Int -> Int -> Int -> Int -> Int -> [PackPlacement] -> Array Int GlyphMSDF -> UA.UArray Int Word8
+buildAtlasImageBand _fmt width pad channels bandStart bandH placements glyphMap =
+  let total = bandH * width * channels
+      bandEnd = bandStart + bandH
+  in runST $ do
+    arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
+    forM_ placements $ \p -> do
+      let glyph = glyphMap ! p.glyphIndex
+          bmp = glyph.bitmap
+          bw = p.bmpW
+          bh = p.bmpH
+      when (bw > 0 && bh > 0) $ do
+        let dstX = p.slotX + pad
+            dstY = p.slotY + pad
+            glyphTop = dstY
+            glyphBottom = dstY + bh
+        when (glyphBottom > bandStart && glyphTop < bandEnd) $ do
+          let startY = max 0 (bandStart - glyphTop)
+              endY = min bh (bandEnd - glyphTop)
+              rowBytes = bw * channels
+              src = bmp.pixels
+          forM_ [startY .. endY - 1] $ \y -> do
+            let srcBase = y * rowBytes
+                dstBase = ((glyphTop + y - bandStart) * width + dstX) * channels
+            copyBytesST arr dstBase src srcBase rowBytes
+    freeze arr
+
+copyBytesST :: STUArray s Int Word8 -> Int -> UA.UArray Int Word8 -> Int -> Int -> ST s ()
+copyBytesST (STUArray _ _ _ dst#) dstOff (UArray _ _ _ src#) srcOff len =
+  ST $ \s ->
+    case copyByteArray# src# (intToInt# srcOff) dst# (intToInt# dstOff) (intToInt# len) s of
+      s' -> (# s', () #)
+
+intToInt# :: Int -> Int#
+intToInt# (I# i#) = i#
 
 memberSorted :: Maybe (Array Int Int) -> Int -> Bool
 memberSorted Nothing _ = False

@@ -34,6 +34,7 @@ data AtlasConfig = AtlasConfig
   , atlasMinSize :: Int
   , atlasMaxSize :: Int
   , atlasPowerOfTwo :: Bool
+  , buildAtlasImage :: Bool
   }
 
 data OutlineConfig = OutlineConfig

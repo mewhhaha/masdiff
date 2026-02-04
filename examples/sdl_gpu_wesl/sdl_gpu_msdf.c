@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 typedef struct Vertex {
   float x, y;
@@ -124,6 +125,245 @@ typedef struct DemoOutput {
   SDL_GPUTransferBuffer *vtxUpload;
 } DemoOutput;
 
+static int read_u32_le(const Uint8 *data, size_t len, size_t *off, Uint32 *out) {
+  if (*off + 4 > len) {
+    return 0;
+  }
+  const Uint8 *p = data + *off;
+  *out = (Uint32) p[0] | ((Uint32) p[1] << 8) | ((Uint32) p[2] << 16) | ((Uint32) p[3] << 24);
+  *off += 4;
+  return 1;
+}
+
+static int read_f32_le(const Uint8 *data, size_t len, size_t *off, float *out) {
+  Uint32 raw = 0;
+  if (!read_u32_le(data, len, off, &raw)) {
+    return 0;
+  }
+  union { Uint32 u; float f; } v;
+  v.u = raw;
+  *out = v.f;
+  return 1;
+}
+
+static void *read_all_stdin(size_t *outSize) {
+  size_t cap = 65536;
+  size_t size = 0;
+  Uint8 *buf = (Uint8 *) SDL_malloc(cap);
+  if (!buf) {
+    return NULL;
+  }
+  for (;;) {
+    if (size == cap) {
+      cap *= 2;
+      Uint8 *next = (Uint8 *) SDL_realloc(buf, cap);
+      if (!next) {
+        SDL_free(buf);
+        return NULL;
+      }
+      buf = next;
+    }
+    size_t n = fread(buf + size, 1, cap - size, stdin);
+    size += n;
+    if (n == 0) {
+      break;
+    }
+  }
+  if (ferror(stdin)) {
+    SDL_free(buf);
+    return NULL;
+  }
+  *outSize = size;
+  return buf;
+}
+
+static int find_magic(const Uint8 *data, size_t len, const char *magic, size_t magicLen, size_t *outPos) {
+  if (magicLen == 0 || len < magicLen) {
+    return 0;
+  }
+  for (size_t i = 0; i + magicLen <= len; i++) {
+    if (memcmp(data + i, magic, magicLen) == 0) {
+      *outPos = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int load_blob_from_stdin(DemoOutput **outOutputs, int *outCount,
+                                void **outVs, size_t *outVsSize,
+                                void **outFs, size_t *outFsSize) {
+  const char *magic = "MSDFBLB1";
+  size_t blobSize = 0;
+  Uint8 *blob = (Uint8 *) read_all_stdin(&blobSize);
+  if (!blob || blobSize == 0) {
+    SDL_free(blob);
+    return -1;
+  }
+  size_t magicPos = 0;
+  if (!find_magic(blob, blobSize, magic, 8, &magicPos)) {
+    SDL_free(blob);
+    return -1;
+  }
+  size_t off = magicPos + 8;
+  Uint32 version = 0;
+  if (!read_u32_le(blob, blobSize, &off, &version) || version != 1) {
+    SDL_free(blob);
+    return -1;
+  }
+  Uint32 vsSize = 0, fsSize = 0;
+  if (!read_u32_le(blob, blobSize, &off, &vsSize) ||
+      !read_u32_le(blob, blobSize, &off, &fsSize)) {
+    SDL_free(blob);
+    return -1;
+  }
+  if (off + vsSize + fsSize > blobSize) {
+    SDL_free(blob);
+    return -1;
+  }
+  void *vsCode = SDL_malloc(vsSize);
+  void *fsCode = SDL_malloc(fsSize);
+  if (!vsCode || !fsCode) {
+    SDL_free(vsCode);
+    SDL_free(fsCode);
+    SDL_free(blob);
+    return -1;
+  }
+  memcpy(vsCode, blob + off, vsSize);
+  off += vsSize;
+  memcpy(fsCode, blob + off, fsSize);
+  off += fsSize;
+
+  Uint32 count = 0;
+  if (!read_u32_le(blob, blobSize, &off, &count) || count == 0) {
+    SDL_free(vsCode);
+    SDL_free(fsCode);
+    SDL_free(blob);
+    return -1;
+  }
+  DemoOutput *outputs = (DemoOutput *) SDL_calloc(count, sizeof(DemoOutput));
+  if (!outputs) {
+    SDL_free(vsCode);
+    SDL_free(fsCode);
+    SDL_free(blob);
+    return -1;
+  }
+  for (Uint32 i = 0; i < count; i++) {
+    Uint32 labelLen = 0;
+    if (!read_u32_le(blob, blobSize, &off, &labelLen) || off + labelLen > blobSize) {
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    char *label = (char *) SDL_malloc(labelLen + 1);
+    if (!label) {
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    memcpy(label, blob + off, labelLen);
+    label[labelLen] = '\0';
+    off += labelLen;
+
+    float formatFlag = 0.0f;
+    if (!read_f32_le(blob, blobSize, &off, &formatFlag)) {
+      SDL_free(label);
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+
+    Uint32 atlasW = 0, atlasH = 0, pixelSize = 0, screenW = 0, screenH = 0;
+    Uint32 vertexCount = 0, atlasSize = 0, vertSize = 0;
+    float pxRange = 0.0f;
+    if (!read_u32_le(blob, blobSize, &off, &atlasW) ||
+        !read_u32_le(blob, blobSize, &off, &atlasH) ||
+        !read_u32_le(blob, blobSize, &off, &pixelSize) ||
+        !read_u32_le(blob, blobSize, &off, &screenW) ||
+        !read_u32_le(blob, blobSize, &off, &screenH) ||
+        !read_f32_le(blob, blobSize, &off, &pxRange) ||
+        !read_u32_le(blob, blobSize, &off, &vertexCount) ||
+        !read_u32_le(blob, blobSize, &off, &atlasSize) ||
+        !read_u32_le(blob, blobSize, &off, &vertSize)) {
+      SDL_free(label);
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    (void) pixelSize;
+    (void) vertexCount;
+    if (atlasSize != (Uint32) atlasW * (Uint32) atlasH * 4u) {
+      SDL_free(label);
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    if (vertSize % sizeof(Vertex) != 0) {
+      SDL_free(label);
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    if (off + atlasSize + vertSize > blobSize) {
+      SDL_free(label);
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    void *atlasData = SDL_malloc(atlasSize);
+    void *vertData = SDL_malloc(vertSize);
+    if (!atlasData || !vertData) {
+      SDL_free(atlasData);
+      SDL_free(vertData);
+      SDL_free(label);
+      SDL_free(outputs);
+      SDL_free(vsCode);
+      SDL_free(fsCode);
+      SDL_free(blob);
+      return -1;
+    }
+    memcpy(atlasData, blob + off, atlasSize);
+    off += atlasSize;
+    memcpy(vertData, blob + off, vertSize);
+    off += vertSize;
+
+    outputs[i].label = label;
+    outputs[i].formatFlag = formatFlag;
+    outputs[i].meta.atlasW = (int) atlasW;
+    outputs[i].meta.atlasH = (int) atlasH;
+    outputs[i].meta.screenW = (int) screenW;
+    outputs[i].meta.screenH = (int) screenH;
+    outputs[i].meta.pxRange = pxRange;
+    outputs[i].meta.vertexCount = (Uint32) (vertSize / sizeof(Vertex));
+    outputs[i].atlasData = atlasData;
+    outputs[i].atlasSize = atlasSize;
+    outputs[i].vertData = vertData;
+    outputs[i].vertSize = vertSize;
+  }
+  SDL_free(blob);
+  *outOutputs = outputs;
+  *outCount = (int) count;
+  *outVs = vsCode;
+  *outVsSize = vsSize;
+  *outFs = fsCode;
+  *outFsSize = fsSize;
+  return 0;
+}
+
 static int load_meta(const char *path, MetaInfo *meta) {
   FILE *f = fopen(path, "r");
   if (!f) {
@@ -151,7 +391,12 @@ static int load_meta(const char *path, MetaInfo *meta) {
 }
 
 int main(int argc, char **argv) {
-  (void) argc; (void) argv;
+  bool inMemory = SDL_getenv("SDL_MSDF_IN_MEMORY") != NULL;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--stdin") == 0 || strcmp(argv[i], "--blob") == 0) {
+      inMemory = true;
+    }
+  }
 
   bool forceHeadless = SDL_getenv("SDL_MSDF_HEADLESS") != NULL;
   if (forceHeadless) {
@@ -233,16 +478,165 @@ int main(int argc, char **argv) {
     }
   }
 
-  const char *outDir = resolve_out_dir();
-  if (!outDir) {
-    die("could not locate out/meta_msdf.txt or out/meta.txt");
-  }
-
-  const int outputTotal = 1;
-  DemoOutput outputs[1] = {
-    { .label = "mtsdf", .formatFlag = 1.f }
-  };
+  const char *outDir = NULL;
+  DemoOutput *outputs = NULL;
+  int outputTotal = 0;
   int outputCount = 0;
+  void *vsCode = NULL;
+  void *fsCode = NULL;
+  size_t vsSize = 0;
+  size_t fsSize = 0;
+  bool outputsOwned = false;
+  int screenW = 1280;
+  int screenH = 720;
+  char path[256];
+
+  if (inMemory) {
+    if (load_blob_from_stdin(&outputs, &outputCount, &vsCode, &vsSize, &fsCode, &fsSize) != 0) {
+      die("load in-memory blob");
+    }
+    outputTotal = outputCount;
+    outputsOwned = true;
+    const char *outEnv = SDL_getenv("SDL_MSDF_OUT_DIR");
+    outDir = (outEnv && outEnv[0] != '\0') ? outEnv : ".";
+    if (outputCount > 0) {
+      if (outputs[0].meta.screenW > 0) {
+        screenW = outputs[0].meta.screenW;
+      }
+      if (outputs[0].meta.screenH > 0) {
+        screenH = outputs[0].meta.screenH;
+      }
+    }
+    for (int i = 0; i < outputTotal; i++) {
+      if (outputs[i].meta.pxRange <= 0.f) {
+        outputs[i].meta.pxRange = 4.f;
+      }
+    }
+  } else {
+    outDir = resolve_out_dir();
+    if (!outDir) {
+      die("could not locate out/meta_msdf.txt or out/meta.txt");
+    }
+
+    bool pairWeights = false;
+    const char *pairEnv = SDL_getenv("SDL_MSDF_VARIATION_PAIR");
+    if (pairEnv && pairEnv[0] != '\0') {
+      pairWeights = true;
+    }
+    const char *pairEnv2 = SDL_getenv("SDL_MSDF_PAIR_WEIGHTS");
+    if (pairEnv2 && pairEnv2[0] != '\0') {
+      pairWeights = true;
+    }
+    outputTotal = pairWeights ? 2 : 1;
+    outputs = (DemoOutput *) SDL_calloc(outputTotal, sizeof(DemoOutput));
+    if (!outputs) {
+      die("alloc outputs");
+    }
+    outputsOwned = true;
+    outputs[0].label = pairWeights ? "w400" : "mtsdf";
+    outputs[0].formatFlag = 1.f;
+    if (outputTotal > 1) {
+      outputs[1].label = "w900";
+      outputs[1].formatFlag = 1.f;
+    }
+
+    for (int i = 0; i < outputTotal; i++) {
+      DemoOutput *out = &outputs[i];
+      MetaInfo meta = {0};
+      bool metaOk = false;
+      if (out->label) {
+        SDL_snprintf(path, sizeof(path), "%s/meta_%s.txt", outDir, out->label);
+        if (load_meta(path, &meta) == 0) {
+          metaOk = true;
+        }
+      }
+      if (!metaOk && i == 0) {
+        make_path(path, sizeof(path), outDir, "meta.txt");
+        if (load_meta(path, &meta) == 0) {
+          metaOk = true;
+        }
+      }
+      if (!metaOk) {
+        continue;
+      }
+      if (meta.pxRange <= 0.f) {
+        meta.pxRange = 4.f;
+      }
+      out->meta = meta;
+      if (outputCount == 0) {
+        screenW = meta.screenW > 0 ? meta.screenW : screenW;
+        screenH = meta.screenH > 0 ? meta.screenH : screenH;
+      }
+
+      size_t atlasSize = 0;
+      void *atlasData = NULL;
+      if (out->label) {
+        SDL_snprintf(path, sizeof(path), "%s/atlas_%s.rgba", outDir, out->label);
+        atlasData = SDL_LoadFile(path, &atlasSize);
+      }
+      if (!atlasData && i == 0) {
+        make_path(path, sizeof(path), outDir, "atlas.rgba");
+        atlasData = SDL_LoadFile(path, &atlasSize);
+      }
+      if (!atlasData) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "load atlas for %s failed", out->label);
+        continue;
+      }
+      if (atlasSize != (size_t) meta.atlasW * (size_t) meta.atlasH * 4u) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "atlas size mismatch for %s", out->label);
+        SDL_free(atlasData);
+        continue;
+      }
+      out->atlasData = atlasData;
+      out->atlasSize = atlasSize;
+
+      size_t vertSize = 0;
+      void *vertData = NULL;
+      if (out->label) {
+        SDL_snprintf(path, sizeof(path), "%s/vertices_%s.bin", outDir, out->label);
+        vertData = SDL_LoadFile(path, &vertSize);
+      }
+      if (!vertData && i == 0) {
+        make_path(path, sizeof(path), outDir, "vertices.bin");
+        vertData = SDL_LoadFile(path, &vertSize);
+      }
+      if (!vertData) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "load vertices for %s failed", out->label);
+        SDL_free(atlasData);
+        out->atlasData = NULL;
+        continue;
+      }
+      if (vertSize % sizeof(Vertex) != 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex size mismatch for %s", out->label);
+        SDL_free(atlasData);
+        SDL_free(vertData);
+        out->atlasData = NULL;
+        continue;
+      }
+      out->vertData = vertData;
+      out->vertSize = vertSize;
+      out->meta.vertexCount = (Uint32) (vertSize / sizeof(Vertex));
+      outputCount++;
+    }
+
+    if (outputCount == 0) {
+      die("no demo outputs found (missing meta/atlas/vertices)");
+    }
+
+    make_path(path, sizeof(path), outDir, "msdf.vert.spv");
+    vsCode = SDL_LoadFile(path, &vsSize);
+    if (!vsCode) {
+      die("load msdf.vert.spv");
+    }
+    make_path(path, sizeof(path), outDir, "msdf.frag.spv");
+    fsCode = SDL_LoadFile(path, &fsSize);
+    if (!fsCode) {
+      die("load msdf.frag.spv");
+    }
+  }
+  if (outputTotal == 0) {
+    die("no demo outputs found");
+  }
 
   bool wantScreenshot = SDL_getenv("SDL_MSDF_SCREENSHOT") != NULL;
   bool captured = false;
@@ -252,105 +646,6 @@ int main(int argc, char **argv) {
                                         : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
   if (headless) {
     wantScreenshot = true;
-  }
-
-  int screenW = 1280;
-  int screenH = 720;
-  char path[256];
-  for (int i = 0; i < outputTotal; i++) {
-    DemoOutput *out = &outputs[i];
-    MetaInfo meta = {0};
-    bool metaOk = false;
-    if (out->label) {
-      SDL_snprintf(path, sizeof(path), "%s/meta_%s.txt", outDir, out->label);
-      if (load_meta(path, &meta) == 0) {
-        metaOk = true;
-      }
-    }
-    if (!metaOk && i == 0) {
-      make_path(path, sizeof(path), outDir, "meta.txt");
-      if (load_meta(path, &meta) == 0) {
-        metaOk = true;
-      }
-    }
-    if (!metaOk) {
-      continue;
-    }
-    if (meta.pxRange <= 0.f) {
-      meta.pxRange = 4.f;
-    }
-    out->meta = meta;
-    if (outputCount == 0) {
-      screenW = meta.screenW > 0 ? meta.screenW : screenW;
-      screenH = meta.screenH > 0 ? meta.screenH : screenH;
-    }
-
-    size_t atlasSize = 0;
-    void *atlasData = NULL;
-    if (out->label) {
-      SDL_snprintf(path, sizeof(path), "%s/atlas_%s.rgba", outDir, out->label);
-      atlasData = SDL_LoadFile(path, &atlasSize);
-    }
-    if (!atlasData && i == 0) {
-      make_path(path, sizeof(path), outDir, "atlas.rgba");
-      atlasData = SDL_LoadFile(path, &atlasSize);
-    }
-    if (!atlasData) {
-      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "load atlas for %s failed", out->label);
-      continue;
-    }
-    if (atlasSize != (size_t) meta.atlasW * (size_t) meta.atlasH * 4u) {
-      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "atlas size mismatch for %s", out->label);
-      SDL_free(atlasData);
-      continue;
-    }
-    out->atlasData = atlasData;
-    out->atlasSize = atlasSize;
-
-    size_t vertSize = 0;
-    void *vertData = NULL;
-    if (out->label) {
-      SDL_snprintf(path, sizeof(path), "%s/vertices_%s.bin", outDir, out->label);
-      vertData = SDL_LoadFile(path, &vertSize);
-    }
-    if (!vertData && i == 0) {
-      make_path(path, sizeof(path), outDir, "vertices.bin");
-      vertData = SDL_LoadFile(path, &vertSize);
-    }
-    if (!vertData) {
-      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "load vertices for %s failed", out->label);
-      SDL_free(atlasData);
-      out->atlasData = NULL;
-      continue;
-    }
-    if (vertSize % sizeof(Vertex) != 0) {
-      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vertex size mismatch for %s", out->label);
-      SDL_free(atlasData);
-      SDL_free(vertData);
-      out->atlasData = NULL;
-      continue;
-    }
-    out->vertData = vertData;
-    out->vertSize = vertSize;
-    out->meta.vertexCount = (Uint32) (vertSize / sizeof(Vertex));
-    outputCount++;
-  }
-
-  if (outputCount == 0) {
-    die("no demo outputs found (missing meta/atlas/vertices)");
-  }
-
-  size_t vsSize = 0;
-  make_path(path, sizeof(path), outDir, "msdf.vert.spv");
-  void *vsCode = SDL_LoadFile(path, &vsSize);
-  if (!vsCode) {
-    die("load msdf.vert.spv");
-  }
-  size_t fsSize = 0;
-  make_path(path, sizeof(path), outDir, "msdf.frag.spv");
-  void *fsCode = SDL_LoadFile(path, &fsSize);
-  if (!fsCode) {
-    die("load msdf.frag.spv");
   }
 
   SDL_GPUShader *vs = SDL_CreateGPUShader(gpu, &(SDL_GPUShaderCreateInfo){
@@ -699,6 +994,9 @@ int main(int argc, char **argv) {
     if (out->vertData) {
       SDL_free(out->vertData);
     }
+    if (inMemory && out->label) {
+      SDL_free((void *) out->label);
+    }
     if (out->texUpload) {
       SDL_ReleaseGPUTransferBuffer(gpu, out->texUpload);
     }
@@ -711,6 +1009,9 @@ int main(int argc, char **argv) {
     if (out->atlasTex) {
       SDL_ReleaseGPUTexture(gpu, out->atlasTex);
     }
+  }
+  if (outputsOwned) {
+    SDL_free(outputs);
   }
   if (renderTarget) {
     SDL_ReleaseGPUTexture(gpu, renderTarget);

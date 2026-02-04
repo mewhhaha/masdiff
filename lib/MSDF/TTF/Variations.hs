@@ -21,6 +21,9 @@ module MSDF.TTF.Variations
   , normalizeLocation
   , applyGvarToContours
   , componentDeltas
+  , gvarTupleScalars
+  , gvarTupleHeaderStats
+  , gvarDeltaSum
   , hvarDeltas
   , vvarDeltas
   , mvarDelta
@@ -31,11 +34,14 @@ module MSDF.TTF.Variations
 import Data.Array (Array, array, accumArray, bounds, inRange, (!))
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
 import Data.Int (Int8, Int16, Int32)
-import Data.List (zipWith4)
+import Data.IORef (IORef, newIORef, readIORef, atomicModifyIORef')
+import qualified Data.IntMap.Strict as IntMap
+import Data.List (foldl', zipWith4)
 import Data.Ix (Ix)
 import Data.Word (Word16)
 import MSDF.Binary
 import MSDF.Outline (Point(..))
+import System.IO.Unsafe (unsafePerformIO)
 
 data Fvar = Fvar
   { axes :: [FvarAxis]
@@ -68,6 +74,7 @@ data Gvar = Gvar
   , dataOffset :: Int
   , flags :: Word16
   , buffer :: ByteBuffer
+  , tupleCache :: IORef (IntMap.IntMap GlyphTupleData)
   }
 
 data Hvar = Hvar
@@ -106,6 +113,18 @@ data VariationIndex = VariationIndex
   { outer :: Int
   , inner :: Int
   } deriving (Eq, Show)
+
+data GlyphTupleData = GlyphTupleData
+  { tuplePointCount :: Int
+  , tupleTuples :: [DecodedTuple]
+  }
+
+data DecodedTuple = DecodedTuple
+  { tupleHeader :: TupleHeader
+  , tuplePoints :: [Int]
+  , tupleDX :: [Int]
+  , tupleDY :: [Int]
+  }
 
 data RegionAxis = RegionAxis
   { start :: Double
@@ -187,6 +206,10 @@ parseAvar bb =
             off' = segOff + maxSegs * 4
         in readMaps bb' off' (n - 1) (segments : acc)
 
+newGvarCache :: Int -> IORef (IntMap.IntMap GlyphTupleData)
+newGvarCache salt = salt `seq` unsafePerformIO (newIORef IntMap.empty)
+{-# NOINLINE newGvarCache #-}
+
 parseGvar :: Int -> ByteBuffer -> Gvar
 parseGvar glyphCount bb =
   if bb.len < 20
@@ -226,7 +249,8 @@ parseGvar glyphCount bb =
                      then array (0, -1) []
                      else array (0, length offsetsList - 1) (zip [0..] offsetsList)
         sharedTuples' = readSharedTuples bb sharedTupleOffset axisCount' sharedTupleCount
-    in Gvar axisCount' sharedTuples' offsetsArr dataOffset' flags' bb
+        cacheRef' = newGvarCache (glyphCount' + bb.len)
+    in Gvar axisCount' sharedTuples' offsetsArr dataOffset' flags' bb cacheRef'
 
 parseHvar :: ByteBuffer -> Maybe Hvar
 parseHvar bb =
@@ -315,6 +339,11 @@ normalizeLocation fvar' avar' settings =
         Just av -> zipWith applyAvar (av.maps ++ repeat []) normalized
   in VariationLocation mapped
 
+coordsForAxis :: Int -> VariationLocation -> [Double]
+coordsForAxis n loc' =
+  let cs = loc'.coords
+  in if length cs >= n then cs else cs ++ replicate (n - length cs) 0
+
 axisCoord :: [(String, Double)] -> FvarAxis -> Double
 axisCoord settings axis =
   case lookup axis.tag settings of
@@ -402,14 +431,101 @@ applyDeltas contours dxs dys = go 0 contours
 glyphDeltas :: Gvar -> VariationLocation -> Int -> Int -> (Array Int Double, Array Int Double)
 glyphDeltas gvar loc glyphIndex pointCount =
   let bounds' = (0, pointCount - 1)
-  in case glyphVariationData gvar loc glyphIndex pointCount of
+  in case getGlyphTupleData gvar glyphIndex pointCount of
        Nothing -> (accumArray' (+) 0 bounds' [], accumArray' (+) 0 bounds' [])
        Just tuples ->
-         let contribX = concatMap fst tuples
-             contribY = concatMap snd tuples
+         let coords' = coordsForAxis gvar.axisCount loc
+             contribs = map (tupleContribCached coords' pointCount) tuples.tupleTuples
+             contribX = concatMap fst contribs
+             contribY = concatMap snd contribs
              arrX = accumArray' (+) 0 bounds' contribX
              arrY = accumArray' (+) 0 bounds' contribY
          in (arrX, arrY)
+
+getGlyphTupleData :: Gvar -> Int -> Int -> Maybe GlyphTupleData
+getGlyphTupleData gvar glyphIndex pointCount = unsafePerformIO $ do
+  let ref = gvar.tupleCache
+  cache <- readIORef ref
+  case IntMap.lookup glyphIndex cache of
+    Just entry | entry.tuplePointCount == pointCount -> pure (Just entry)
+    _ ->
+      case decodeGlyphData gvar glyphIndex pointCount of
+        Nothing -> pure Nothing
+        Just entry -> do
+          atomicModifyIORef' ref (\m -> (IntMap.insert glyphIndex entry m, ()))
+          pure (Just entry)
+
+decodeGlyphData :: Gvar -> Int -> Int -> Maybe GlyphTupleData
+decodeGlyphData gvar glyphIndex pointCount =
+  let offs = gvar.offsets
+      (lo, hi) = boundsSafe offs
+  in if lo > hi || glyphIndex < lo || glyphIndex + 1 > hi
+     then Nothing
+     else
+       let start = offs ! glyphIndex
+           end = offs ! (glyphIndex + 1)
+           dataStart = gvar.dataOffset + start
+           dataLen = end - start
+       in if dataLen <= 0 || dataStart < 0 || dataStart + dataLen > gvar.buffer.len
+          then Just (GlyphTupleData pointCount [])
+          else Just (parseGlyphDataRaw (slice gvar.buffer dataStart dataLen) gvar pointCount)
+
+parseGlyphDataRaw :: ByteBuffer -> Gvar -> Int -> GlyphTupleData
+parseGlyphDataRaw bb gvar pointCount =
+  if bb.len < 4
+  then GlyphTupleData pointCount []
+  else
+    let tupleCountRaw = readU16BE bb 0
+        tupleCount = fromIntegral (tupleCountRaw .&. 0x0FFF) :: Int
+        tupleFlags = tupleCountRaw .&. 0xF000
+        dataOffset = fromIntegral (readU16BE bb 2)
+        _ = if tupleCount > ((bb.len - 4) `div` 6)
+            then error "gvar: tuple count exceeds header capacity"
+            else ()
+        (headers, headersEnd) = readTupleHeadersAuto bb 4 tupleCount dataOffset gvar
+        _ = if dataOffset < headersEnd || dataOffset > bb.len
+            then error "gvar: data offset overlaps headers or out of bounds"
+            else ()
+        (sharedPoints, dataBase) =
+          if testBit tupleFlags 15
+          then readPackedPoints bb dataOffset pointCount
+          else ([], dataOffset)
+        tuples = [ t | Just t <- map (decodeTuple bb gvar pointCount dataBase sharedPoints) headers ]
+    in GlyphTupleData pointCount tuples
+
+decodeTuple :: ByteBuffer -> Gvar -> Int -> Int -> [Int] -> TupleHeader -> Maybe DecodedTuple
+decodeTuple bb _gvar pointCount dataBase sharedPoints header =
+  let dataStart = dataBase + header.tupleDataOffset
+      dataLen = header.tupleSize
+  in if dataStart < 0 || dataStart + dataLen > bb.len
+     then Nothing
+     else
+       let tb = slice bb dataStart dataLen
+           (points, dataOff) =
+             if testBit header.tupleIndex 13
+             then readPackedPoints tb 0 pointCount
+             else if null sharedPoints then ([0 .. pointCount - 1], 0) else (sharedPoints, 0)
+           (dxs, offX) = readPackedDeltas tb dataOff (length points)
+           (dys, _) = readPackedDeltas tb offX (length points)
+       in Just (DecodedTuple header points dxs dys)
+
+tupleContribCached :: [Double] -> Int -> DecodedTuple -> ([(Int, Double)], [(Int, Double)])
+tupleContribCached coords' pointCount tup =
+  let scalar = tupleScalar coords' tup.tupleHeader
+  in if scalar == 0
+     then ([], [])
+     else
+       let xs = [ (p, scalar * fromIntegral d)
+                | (p, d) <- zip tup.tuplePoints tup.tupleDX
+                , p >= 0
+                , p < pointCount
+                ]
+           ys = [ (p, scalar * fromIntegral d)
+                | (p, d) <- zip tup.tuplePoints tup.tupleDY
+                , p >= 0
+                , p < pointCount
+                ]
+       in (xs, ys)
 
 glyphVariationData :: Gvar -> VariationLocation -> Int -> Int -> Maybe ([([(Int, Double)], [(Int, Double)])])
 glyphVariationData gvar loc glyphIndex pointCount =
@@ -426,6 +542,70 @@ glyphVariationData gvar loc glyphIndex pointCount =
           then Nothing
           else Just (parseGlyphData (slice gvar.buffer dataStart dataLen) gvar loc pointCount)
 
+gvarTupleScalars :: Gvar -> VariationLocation -> Int -> Maybe (Int, Int, [Double])
+gvarTupleScalars gvar loc glyphIndex =
+  let offs = gvar.offsets
+      (lo, hi) = boundsSafe offs
+  in if lo > hi || glyphIndex < lo || glyphIndex + 1 > hi
+     then Nothing
+     else
+       let start = offs ! glyphIndex
+           end = offs ! (glyphIndex + 1)
+           dataStart = gvar.dataOffset + start
+           dataLen = end - start
+       in if dataLen <= 0 || dataStart < 0 || dataStart + dataLen > gvar.buffer.len
+          then Nothing
+          else
+            let bb = slice gvar.buffer dataStart dataLen
+            in if bb.len < 4
+               then Just (0, dataLen, [])
+               else
+                 let tupleCountRaw = readU16BE bb 0
+                     tupleCount = fromIntegral (tupleCountRaw .&. 0x0FFF) :: Int
+                     dataOffset = fromIntegral (readU16BE bb 2)
+                     (headers, _) = readTupleHeadersAuto bb 4 tupleCount dataOffset gvar
+                     coords' = coordsForAxis gvar.axisCount loc
+                     scalars = map (tupleScalar coords') headers
+                 in Just (tupleCount, dataLen, scalars)
+
+gvarTupleHeaderStats :: Gvar -> Int -> Maybe (Int, Int, [(Int, Int)])
+gvarTupleHeaderStats gvar glyphIndex =
+  let offs = gvar.offsets
+      (lo, hi) = boundsSafe offs
+  in if lo > hi || glyphIndex < lo || glyphIndex + 1 > hi
+     then Nothing
+     else
+       let start = offs ! glyphIndex
+           end = offs ! (glyphIndex + 1)
+           dataStart = gvar.dataOffset + start
+           dataLen = end - start
+       in if dataLen <= 0 || dataStart < 0 || dataStart + dataLen > gvar.buffer.len
+          then Nothing
+          else
+            let bb = slice gvar.buffer dataStart dataLen
+            in if bb.len < 4
+               then Just (dataLen, 0, [])
+               else
+                 let tupleCountRaw = readU16BE bb 0
+                     _tupleCount = fromIntegral (tupleCountRaw .&. 0x0FFF) :: Int
+                     dataOffset = fromIntegral (readU16BE bb 2)
+                     (headers, _) = readTupleHeadersAuto bb 4 _tupleCount dataOffset gvar
+                     pairs = [ (h.tupleDataOffset, h.tupleSize) | h <- headers ]
+                 in Just (dataLen, dataOffset, pairs)
+
+gvarDeltaSum :: Gvar -> VariationLocation -> Int -> Int -> Double
+gvarDeltaSum gvar loc glyphIndex pointCount =
+  case getGlyphTupleData gvar glyphIndex pointCount of
+    Nothing -> 0
+    Just tuples ->
+      let coords' = coordsForAxis gvar.axisCount loc
+          sumTuple tup =
+            let (xs, ys) = tupleContribCached coords' pointCount tup
+                sx = sum (map (abs . snd) xs)
+                sy = sum (map (abs . snd) ys)
+            in sx + sy
+      in sum (map sumTuple tuples.tupleTuples)
+
 parseGlyphData :: ByteBuffer -> Gvar -> VariationLocation -> Int -> [([(Int, Double)], [(Int, Double)])]
 parseGlyphData bb gvar loc pointCount =
   if bb.len < 4
@@ -438,15 +618,14 @@ parseGlyphData bb gvar loc pointCount =
         _ = if tupleCount > ((bb.len - 4) `div` 6)
             then error "gvar: tuple count exceeds header capacity"
             else ()
-        (headers, headersEnd) = readTupleHeaders bb 4 tupleCount gvar
+        (headers, headersEnd) = readTupleHeadersAuto bb 4 tupleCount dataOffset gvar
         _ = if dataOffset < headersEnd || dataOffset > bb.len
             then error "gvar: data offset overlaps headers or out of bounds"
             else ()
-        (sharedPoints, _) =
+        (sharedPoints, dataBase) =
           if testBit tupleFlags 15
-          then readPackedPoints bb headersEnd pointCount
-          else ([], headersEnd)
-        dataBase = dataOffset
+          then readPackedPoints bb dataOffset pointCount
+          else ([], dataOffset)
     in concatMap (tupleContrib bb gvar loc pointCount dataBase sharedPoints) headers
 
 data TupleHeader = TupleHeader
@@ -457,8 +636,19 @@ data TupleHeader = TupleHeader
   , intermediate :: Maybe ([Double], [Double])
   }
 
-readTupleHeaders :: ByteBuffer -> Int -> Int -> Gvar -> ([TupleHeader], Int)
-readTupleHeaders bb off count gvar =
+readTupleHeadersAuto :: ByteBuffer -> Int -> Int -> Int -> Gvar -> ([TupleHeader], Int)
+readTupleHeadersAuto bb off count dataOffset gvar =
+  let (headersLong, endLong) = readTupleHeadersLong bb off count gvar
+      dataBytes = max 0 (bb.len - dataOffset)
+      validLong =
+        dataOffset >= endLong
+        && all (\h -> h.tupleDataOffset >= 0 && h.tupleDataOffset + h.tupleSize <= dataBytes) headersLong
+  in if validLong
+     then (headersLong, endLong)
+     else readTupleHeadersPacked bb off count gvar
+
+readTupleHeadersLong :: ByteBuffer -> Int -> Int -> Gvar -> ([TupleHeader], Int)
+readTupleHeadersLong bb off count gvar =
   go off count []
   where
     go cur 0 acc = (reverse acc, cur)
@@ -483,6 +673,34 @@ readTupleHeaders bb off count gvar =
               else (Nothing, cur2)
             header = TupleHeader tIndex tSize tOff peak inter
         in go cur3 (n - 1) (header : acc)
+
+readTupleHeadersPacked :: ByteBuffer -> Int -> Int -> Gvar -> ([TupleHeader], Int)
+readTupleHeadersPacked bb off count gvar =
+  go off count [] 0
+  where
+    go cur 0 acc _ = (reverse acc, cur)
+    go cur n acc dataOff =
+      if not (within bb cur 4)
+      then (reverse acc, cur)
+      else
+        let tSize = fromIntegral (readU16BE bb cur)
+            tIndex = readU16BE bb (cur + 2)
+            tOff = dataOff
+            cur1 = cur + 4
+            (peak, cur2) =
+              if testBit tIndex 15
+              then readTuple bb cur1 gvar.axisCount
+              else (sharedTuple gvar (fromIntegral (tIndex .&. 0x0FFF)), cur1)
+            (inter, cur3) =
+              if testBit tIndex 14
+              then
+                let (start, curS) = readTuple bb cur2 gvar.axisCount
+                    (end, curE) = readTuple bb curS gvar.axisCount
+                in (Just (start, end), curE)
+              else (Nothing, cur2)
+            header = TupleHeader tIndex tSize tOff peak inter
+            nextOff = dataOff + tSize
+        in go cur3 (n - 1) (header : acc) nextOff
 
 readTuple :: ByteBuffer -> Int -> Int -> ([Double], Int)
 readTuple bb off count =
@@ -522,10 +740,6 @@ tupleContrib bb gvar loc pointCount dataBase sharedPoints header =
                 xs = [ (p, scalar * fromIntegral d) | (p, d) <- pts, p >= 0, p < pointCount ]
                 ys = [ (p, scalar * fromIntegral d) | (p, d) <- ptsY, p >= 0, p < pointCount ]
             in [(xs, ys)]
-  where
-    coordsForAxis n loc' =
-      let cs = loc'.coords
-      in if length cs >= n then cs else cs ++ replicate (n - length cs) 0
 
 tupleScalar :: [Double] -> TupleHeader -> Double
 tupleScalar coords' header =
@@ -600,24 +814,35 @@ readPackedDeltas bb off count = go off count []
       then (reverse (replicate n 0 ++ acc), idx)
       else
         let header = readU8 bb idx
-            isWord = testBit header 7
-            isZero = testBit header 6
+            sizeTag = header .&. 0xC0
             runCount = fromIntegral (header .&. 0x3F) + 1
             n' = min n runCount
-        in if isZero
+        in if sizeTag == 0x80
            then go (idx + 1) (n - n') (replicate n' 0 ++ acc)
            else
-             let (vals, idx') = readRunSigned bb (idx + 1) n' isWord
+             let size =
+                   case sizeTag of
+                     0x00 -> 1
+                     0x40 -> 2
+                     0xC0 -> 4
+                     _ -> 1
+                 (vals, idx') = readRunSigned bb (idx + 1) n' size
              in go idx' (n - n') (reverse vals ++ acc)
 
-readRunSigned :: ByteBuffer -> Int -> Int -> Bool -> ([Int], Int)
-readRunSigned bb off count isWord =
-  let size = if isWord then 2 else 1
-      maxCount = if off >= bb.len then 0 else min count ((bb.len - off) `div` size)
-      vals = [ if isWord
-               then fromIntegral (readS16BE bb (off + i * 2)) :: Int
-               else fromIntegral (fromIntegral (readU8 bb (off + i)) :: Int8)
-             | i <- [0 .. maxCount - 1] ]
+readRunSigned :: ByteBuffer -> Int -> Int -> Int -> ([Int], Int)
+readRunSigned bb off count size =
+  let maxCount = if off >= bb.len then 0 else min count ((bb.len - off) `div` size)
+      vals = case size of
+        1 -> [ fromIntegral (fromIntegral (readU8 bb (off + i)) :: Int8) :: Int
+             | i <- [0 .. maxCount - 1]
+             ]
+        2 -> [ fromIntegral (readS16BE bb (off + i * 2)) :: Int
+             | i <- [0 .. maxCount - 1]
+             ]
+        4 -> [ fromIntegral (readS32BE bb (off + i * 4)) :: Int
+             | i <- [0 .. maxCount - 1]
+             ]
+        _ -> []
       off' = off + maxCount * size
       padding = replicate (count - maxCount) 0
   in (vals ++ padding, off')

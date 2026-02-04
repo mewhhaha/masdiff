@@ -43,6 +43,7 @@ library
     exposed-modules:  MSDF.Types
                     , MSDF.Config
                     , MSDF.Binary
+                    , MSDF.LazyAtlas
                     , MSDF.TTF.Parser
                     , MSDF.TTF.GPOS
                     , MSDF.TTF.Variations
@@ -87,6 +88,7 @@ executable msdf-bench
     other-modules:    Paths_masdiff
     autogen-modules:  Paths_masdiff
     build-depends:    base ^>=4.21.0.0
+                    , array ^>=0.5.8.0
                     , deepseq ^>=1.5.0.0
                     , masdiff
     default-language: GHC2024
