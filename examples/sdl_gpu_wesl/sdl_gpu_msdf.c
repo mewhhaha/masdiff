@@ -14,7 +14,7 @@ typedef struct Vertex {
 
 typedef struct FragUniforms {
   float textColor[4];
-  float params[4]; /* params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF), params.z = debug */
+  float params[4]; /* params.x = pxRange, params.y = 0 (MSDF) / 1 (MTSDF), params.z = debug mode, params.w = render alpha SDF */
   float atlasSize[2];
   float screenSize[2];
 } FragUniforms;
@@ -448,6 +448,7 @@ int main(int argc, char **argv) {
     debugMode = 1.f;
   }
   bool forceNearest = SDL_getenv("SDL_MSDF_NEAREST") != NULL;
+  bool renderAlphaSdf = SDL_getenv("SDL_MSDF_RENDER_ALPHA") != NULL;
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0) {
     die("SDL_Init");
@@ -456,7 +457,7 @@ int main(int argc, char **argv) {
   SDL_Window *window = NULL;
   bool headless = forceHeadless;
   if (!headless) {
-    window = SDL_CreateWindow("masdiff SDL_gpu", 1280, 720, SDL_WINDOW_RESIZABLE);
+    window = SDL_CreateWindow("masdiff SDL_gpu", 1920, 1080, SDL_WINDOW_RESIZABLE);
     if (!window) {
       SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow failed: %s (falling back to headless)", SDL_GetError());
       headless = true;
@@ -661,6 +662,10 @@ int main(int argc, char **argv) {
   }
   if (outputTotal == 0) {
     die("no demo outputs found");
+  }
+
+  if (window && screenW > 0 && screenH > 0) {
+    SDL_SetWindowSize(window, screenW, screenH);
   }
 
   bool wantScreenshot = SDL_getenv("SDL_MSDF_SCREENSHOT") != NULL;
@@ -943,7 +948,7 @@ int main(int argc, char **argv) {
           SDL_SetGPUScissor(pass, &scissor);
           FragUniforms fu = {
             { 1.f, 1.f, 1.f, 1.f },
-            { out->meta.pxRange, out->formatFlag, modes[m], 0.f },
+            { out->meta.pxRange, out->formatFlag, modes[m], renderAlphaSdf ? 1.f : 0.f },
             { (float) out->meta.atlasW, (float) out->meta.atlasH },
             { (float) cellW, (float) cellH }
           };
@@ -957,7 +962,7 @@ int main(int argc, char **argv) {
         SDL_SetGPUScissor(pass, &scissor);
         FragUniforms fu = {
           { 1.f, 1.f, 1.f, 1.f },
-          { out->meta.pxRange, out->formatFlag, debugMode, 0.f },
+          { out->meta.pxRange, out->formatFlag, debugMode, renderAlphaSdf ? 1.f : 0.f },
           { (float) out->meta.atlasW, (float) out->meta.atlasH },
           { (float) swapW, (float) swapH }
         };

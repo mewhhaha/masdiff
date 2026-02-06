@@ -7,6 +7,7 @@ module MSDF.Generated
   , generateMSDFFromBytes
   , generateMSDFFromTTF
   , generateMSDFFromTTFWithTimings
+  , generateMSDFFromTTFWithTimingsNoCaps
   , generateMSDFOrThrow
   , generateMTSDF
   , generateMTSDFWithConfig
@@ -18,21 +19,28 @@ module MSDF.Generated
 
 import Control.Exception (SomeException, evaluate, try, bracket_)
 import Control.DeepSeq (NFData(..), deepseq)
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when, replicateM_)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import qualified Data.ByteString as BS
-import Control.Parallel.Strategies (parListChunk, rdeepseq, rseq, withStrategy)
-import Data.Array (Array, array, listArray, accumArray, bounds, (!), (//))
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Array (Array, array, listArray, bounds, (!), (//))
 import Data.Array.Base (STUArray(..), UArray(..))
-import Data.Array.ST (newArray, freeze)
+import Data.Array.ST (newArray, freeze, thaw, runSTUArray)
+import Data.Array.MArray (readArray, writeArray)
+import qualified Data.Array.IO as IOA
 import qualified Data.Array.Unboxed as UA
 import Data.List (groupBy, sortOn, sort)
+import qualified Data.Map.Strict as Map
 import Control.Monad.ST (ST, runST)
 import Data.Word (Word8)
 import GHC.Exts (Int(I#), Int#, copyByteArray#)
 import GHC.ST (ST(..))
 import GHC.Conc (getNumCapabilities, setNumCapabilities)
+import System.IO.Unsafe (unsafePerformIO)
+import Numeric (showFFloat)
 import System.CPUTime (getCPUTime)
-import MSDF.MSDF (MSDFConfig(..), AtlasConfig(..), GlyphSet(..), defaultMSDFConfig, glyphMetricsOnlyAt, renderGlyphMSDF)
+import MSDF.MSDF (MSDFConfig(..), AtlasConfig(..), GlyphSet(..), defaultMSDFConfig, renderGlyphMSDF, effectiveParallelism)
 import MSDF.TTF.GPOS
   ( KerningPairRaw(..)
   , AnchorRaw(..)
@@ -83,14 +91,21 @@ generateMSDFFromTTFWithTimings :: MSDFConfig -> TTF -> IO (MSDFAtlas, BuildTimin
 generateMSDFFromTTFWithTimings cfg ttf =
   withCapabilities cfg.parallelism (buildAtlasWithTimings cfg ttf)
 
+-- | Generate an MSDF atlas from a parsed TTF without altering RTS capabilities.
+generateMSDFFromTTFWithTimingsNoCaps :: MSDFConfig -> TTF -> IO (MSDFAtlas, BuildTimings)
+generateMSDFFromTTFWithTimingsNoCaps cfg ttf =
+  buildAtlasWithTimings cfg ttf
+
 withCapabilities :: Int -> IO a -> IO a
 withCapabilities caps action
-  | caps <= 0 = action
+  | caps' <= 0 = action
   | otherwise = do
       current <- getNumCapabilities
-      if current == caps
+      if current == caps'
         then action
-        else bracket_ (setNumCapabilities caps) (setNumCapabilities current) action
+        else bracket_ (setNumCapabilities caps') (setNumCapabilities current) action
+  where
+    caps' = effectiveParallelism caps
 
 -- | Generate an MSDF atlas from a TTF ByteString.
 generateMSDFFromBytes :: MSDFConfig -> BS.ByteString -> Either ParseError MSDFAtlas
@@ -149,15 +164,15 @@ buildAtlas cfg ttf =
       codepointEntries = map (uncurry CodepointMapEntry) mappingsUnique
       codepointIndex = arrayFromList codepointEntries
       selector = glyphSelector cfg.glyphSet mappingsUnique
+      fontName = buildFontName ttf.name
       glyphs = renderGlyphs cfg ttf codepointArr selector numGlyphs
       (glyphsPacked, atlasImage) = if packAtlas'
                                    then packAtlas cfg glyphs
                                    else (glyphs, Nothing)
       glyphArray = array (0, numGlyphs - 1) (zip [0..] glyphsPacked)
-      kernPairs = buildKerning scale ttf.gpos ttf.kern
+      kernPairs = getKerningCached fontName unitsPerEm scale ttf.gpos ttf.kern
       kernArray = arrayFromList kernPairs
-      (markToBase', markToMark') = scaleMarks scale ttf.gposMarks
-      fontName = buildFontName ttf.name
+      (markToBase', markToMark') = getMarksCached fontName unitsPerEm scale ttf.gposMarks
       baseAscent = fromIntegral ttf.hhea.ascent
       baseDescent = fromIntegral ttf.hhea.descent
       baseLineGap = fromIntegral ttf.hhea.lineGap
@@ -229,6 +244,7 @@ buildAtlasWithTimings cfg ttf = do
       codepointEntries = map (uncurry CodepointMapEntry) mappingsUnique
       codepointIndex = arrayFromList codepointEntries
       selector = glyphSelector cfg.glyphSet mappingsUnique
+      fontName = buildFontName ttf.name
   (glyphs, tRender) <- timeEval (renderGlyphs cfg ttf codepointArr selector numGlyphs)
   let pad = max 0 atlasPadding'
       rects =
@@ -253,11 +269,10 @@ buildAtlasWithTimings cfg ttf = do
               pure (glyphs', Just atlasImage', tPlace', tImage', length rects, Just (atlasW, atlasH))
             else pure (glyphs', Nothing, tPlace', 0, length rects, Just (atlasW, atlasH))
     else pure (glyphs, Nothing, 0, 0, length rects, Nothing)
-  (kernPairs, tKerning) <- timeEval (buildKerning scale ttf.gpos ttf.kern)
+  (kernPairs, tKerning) <- timeEval (getKerningCached fontName unitsPerEm scale ttf.gpos ttf.kern)
   let kernArray = arrayFromList kernPairs
-  ((markToBase', markToMark'), tMarks) <- timeEval (scaleMarks scale ttf.gposMarks)
-  let fontName = buildFontName ttf.name
-      baseAscent = fromIntegral ttf.hhea.ascent
+  ((markToBase', markToMark'), tMarks) <- timeEval (getMarksCached fontName unitsPerEm scale ttf.gposMarks)
+  let baseAscent = fromIntegral ttf.hhea.ascent
       baseDescent = fromIntegral ttf.hhea.descent
       baseLineGap = fromIntegral ttf.hhea.lineGap
       (deltaAscent, deltaDescent, deltaLineGap) =
@@ -333,19 +348,92 @@ timeEval thunk = do
   let elapsedMs = fromIntegral (end - start) / 1.0e9
   pure (result, elapsedMs)
 
-buildGlyph :: TTF -> MSDFConfig -> Array Int [Int] -> (Int -> Bool) -> Int -> GlyphMSDF
-buildGlyph ttf cfg codepointArr shouldRender glyphIndex =
-  let codepoints = reverse (codepointArr ! glyphIndex)
-      base = if shouldRender glyphIndex
-             then renderGlyphMSDF cfg ttf glyphIndex
-             else glyphMetricsOnlyAt Nothing cfg ttf glyphIndex
-  in base { codepoints = codepoints }
+emptyGlyph :: MSDFConfig -> Int -> GlyphMSDF
+emptyGlyph cfg glyphIndex =
+  GlyphMSDF
+    { index = glyphIndex
+    , codepoints = []
+    , advance = 0
+    , bearingX = 0
+    , bearingY = 0
+    , bbox = BBox 0 0 0 0
+    , bitmap = emptyBitmapFor cfg.outputFormat
+    , vertical = Nothing
+    , placement = Nothing
+    }
 
-accumCodepoints :: Int -> [(Int, Int)] -> Array Int [Int]
+emptyBitmapFor :: BitmapFormat -> MSDFBitmap
+emptyBitmapFor fmt =
+  MSDFBitmap
+    { width = 0
+    , height = 0
+    , offsetX = 0
+    , offsetY = 0
+    , format = fmt
+    , pixels = UA.listArray (0, -1) []
+    }
+
+data CodepointMap = CodepointMap
+  { cpOffsets :: UA.UArray Int Int
+  , cpCounts :: UA.UArray Int Int
+  , cpValues :: UA.UArray Int Int
+  }
+
+accumCodepoints :: Int -> [(Int, Int)] -> CodepointMap
 accumCodepoints numGlyphs mappings =
-  let pairs = [ (g, c) | (c, g) <- mappings, g >= 0, g < numGlyphs ]
-      arr = accumArray (flip (:)) [] (0, numGlyphs - 1) pairs
-  in fmap uniqueSorted arr
+  let pairs0 = [ (g, c) | (c, g) <- mappings, g >= 0, g < numGlyphs ]
+      pairs = sortOn (\(g, c) -> (g, c)) pairs0
+      uniquePairs = dedupePairs pairs
+      countsArr =
+        if numGlyphs <= 0
+        then UA.listArray (0, -1) []
+        else runSTUArray $ do
+          arr <- newArray (0, numGlyphs - 1) 0 :: ST s (STUArray s Int Int)
+          forM_ uniquePairs $ \(g, _) -> do
+            cur <- readArray arr g
+            writeArray arr g (cur + 1)
+          pure arr
+      countsList =
+        if numGlyphs <= 0
+        then []
+        else [ countsArr UA.! i | i <- [0 .. numGlyphs - 1] ]
+      offsetsList = scanl (+) 0 countsList
+      totalVals = if null offsetsList then 0 else last offsetsList
+      offsetsArr =
+        if numGlyphs <= 0
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, numGlyphs - 1) (take numGlyphs offsetsList)
+      valuesArr =
+        if totalVals <= 0
+        then UA.listArray (0, -1) []
+        else runSTUArray $ do
+          arr <- newArray (0, totalVals - 1) 0 :: ST s (STUArray s Int Int)
+          posArr <- (thaw offsetsArr :: ST s (STUArray s Int Int))
+          forM_ uniquePairs $ \(g, c) -> do
+            pos <- readArray posArr g
+            writeArray arr pos c
+            writeArray posArr g (pos + 1)
+          pure arr
+  in CodepointMap { cpOffsets = offsetsArr, cpCounts = countsArr, cpValues = valuesArr }
+
+dedupePairs :: [(Int, Int)] -> [(Int, Int)]
+dedupePairs pairs =
+  case pairs of
+    [] -> []
+    (p:ps) -> p : go p ps
+  where
+    go _ [] = []
+    go prev@(g0, c0) (x@(g1, c1):xs)
+      | g0 == g1 && c0 == c1 = go prev xs
+      | otherwise = x : go x xs
+
+codepointsForGlyph :: CodepointMap -> Int -> [Int]
+codepointsForGlyph cmap i =
+  let off = cmap.cpOffsets UA.! i
+      cnt = cmap.cpCounts UA.! i
+  in if cnt <= 0
+     then []
+     else [ cmap.cpValues UA.! j | j <- [off .. off + cnt - 1] ]
 
 arrayFromList :: [a] -> Array Int a
 arrayFromList xs =
@@ -399,6 +487,42 @@ buildFontName nt =
        (f, "") -> f
        ("", s) -> s
        (f, s) -> f ++ " " ++ s
+
+{-# NOINLINE kerningCache #-}
+kerningCache :: IORef (Map.Map String [KerningPair])
+kerningCache = unsafePerformIO (newIORef Map.empty)
+
+{-# NOINLINE marksCache #-}
+marksCache :: IORef (Map.Map String ([MarkToBase], [MarkToMark]))
+marksCache = unsafePerformIO (newIORef Map.empty)
+
+kerningCacheKey :: String -> Int -> Double -> String
+kerningCacheKey fontName unitsPerEm scale =
+  fontName ++ "|" ++ show unitsPerEm ++ "|" ++ showFFloat (Just 8) scale ""
+
+getKerningCached :: String -> Int -> Double -> [KerningPairRaw] -> [KerningPairRaw] -> [KerningPair]
+getKerningCached fontName unitsPerEm scale gpos kern =
+  unsafePerformIO $ do
+    let key = kerningCacheKey fontName unitsPerEm scale
+    cached <- readIORef kerningCache
+    case Map.lookup key cached of
+      Just val -> pure val
+      Nothing -> do
+        let val = buildKerning scale gpos kern
+        atomicModifyIORef' kerningCache (\m -> (Map.insert key val m, ()))
+        pure val
+
+getMarksCached :: String -> Int -> Double -> GPOSMarksRaw -> ([MarkToBase], [MarkToMark])
+getMarksCached fontName unitsPerEm scale marks =
+  unsafePerformIO $ do
+    let key = kerningCacheKey fontName unitsPerEm scale
+    cached <- readIORef marksCache
+    case Map.lookup key cached of
+      Just val -> pure val
+      Nothing -> do
+        let val = scaleMarks scale marks
+        atomicModifyIORef' marksCache (\m -> (Map.insert key val m, ()))
+        pure val
 
 scaleMarks :: Double -> GPOSMarksRaw -> ([MarkToBase], [MarkToMark])
 scaleMarks scale marks =
@@ -455,17 +579,64 @@ glyphSelector set mappings =
           allowedArr = if null allowed then Nothing else Just (listArray (0, length allowed - 1) allowed)
       in memberSorted allowedArr
 
-renderGlyphs :: MSDFConfig -> TTF -> Array Int [Int] -> (Int -> Bool) -> Int -> [GlyphMSDF]
-renderGlyphs cfg ttf codepointArr shouldRender numGlyphs =
-  let glyphs = [ buildGlyph ttf cfg codepointArr shouldRender i | i <- [0 .. numGlyphs - 1] ]
-      caps = cfg.parallelism
-      chunk =
-        if caps > 0
-        then max 1 ((numGlyphs + (caps * 2) - 1) `div` (caps * 2))
-        else 0
-  in if chunk > 0
-     then withStrategy (parListChunk chunk rdeepseq) glyphs
-     else glyphs
+renderGlyphs :: MSDFConfig -> TTF -> CodepointMap -> (Int -> Bool) -> Int -> [GlyphMSDF]
+renderGlyphs cfg ttf codepointMap shouldRender numGlyphs =
+  let selected = [ i | i <- [0 .. numGlyphs - 1], shouldRender i ]
+      selCount = length selected
+      caps = effectiveParallelism cfg.parallelism
+      parallel = caps > 1 && selCount >= parallelMinGlyphs
+      cfgRender = if parallel then cfg { parallelism = 1 } else cfg
+      renderOne i = renderGlyphMSDF cfgRender ttf i
+      buildGlyphAt glyph i =
+        let codepoints = codepointsForGlyph codepointMap i
+        in glyph { codepoints = codepoints }
+  in if parallel
+     then unsafePerformIO $ do
+       let sentinel = (emptyGlyph cfg (-1)) { codepoints = [] }
+       arr <- IOA.newArray (0, numGlyphs - 1) sentinel :: IO (IOA.IOArray Int GlyphMSDF)
+       chan <- newChan
+       let workers = max 1 (min caps selCount)
+           writeTask :: Int -> IO ()
+           writeTask = writeChan chan . Just
+           writeStop :: IO ()
+           writeStop = writeChan chan Nothing
+           worker :: Chan (Maybe Int) -> IOA.IOArray Int GlyphMSDF -> IO () -> IO ()
+           worker q arr' done = do
+             mi <- readChan q
+             case mi of
+               Nothing -> done
+               Just i -> do
+                 let g = renderOne i
+                 g `deepseq` IOA.writeArray arr' i (buildGlyphAt g i)
+                 worker q arr' done
+       doneVars <- forM [1 .. workers] (\_ -> newEmptyMVar)
+       forM_ doneVars $ \mv -> do
+         let done = putMVar mv ()
+         _ <- forkIO (worker chan arr done)
+         pure ()
+       forM_ selected writeTask
+       replicateM_ workers writeStop
+       mapM_ takeMVar doneVars
+       glyphs <- forM [0 .. numGlyphs - 1] $ \i -> do
+         g <- IOA.readArray arr i
+         if g.index == (-1)
+           then pure (buildGlyphAt (emptyGlyph cfg i) i)
+           else pure g
+       pure glyphs
+     else
+       let rendered = zip selected (map renderOne selected)
+           buildGlyphs i pairs
+             | i >= numGlyphs = []
+             | otherwise =
+                 case pairs of
+                   (j, g):rest | i == j ->
+                     buildGlyphAt g i : buildGlyphs (i + 1) rest
+                   _ ->
+                     buildGlyphAt (emptyGlyph cfg i) i : buildGlyphs (i + 1) pairs
+       in buildGlyphs 0 rendered
+
+parallelMinGlyphs :: Int
+parallelMinGlyphs = 512
 
 -- Atlas packing -------------------------------------------------------------
 
@@ -677,13 +848,10 @@ nextPow2 n
     go k = if k >= n then k else go (k * 2)
 
 buildAtlasImage :: BitmapFormat -> Int -> Int -> Int -> Int -> [PackPlacement] -> [GlyphMSDF] -> AtlasImage
-buildAtlasImage fmt width height pad parallelism placements glyphs =
+buildAtlasImage fmt width height pad _parallelism placements glyphs =
   let channels = bitmapChannels fmt
       glyphMap = array (0, length glyphs - 1) (zip [0..] glyphs)
-      pixels =
-        if parallelism > 1 && height > 1 && length placements > 1
-        then buildAtlasImageParallel fmt width height pad channels parallelism placements glyphMap
-        else buildAtlasImageSeq fmt width height pad channels placements glyphMap
+      pixels = buildAtlasImageSeq fmt width height pad channels placements glyphMap
   in AtlasImage { width = width, height = height, format = fmt, pixels = pixels }
 
 buildAtlasImageSeq :: BitmapFormat -> Int -> Int -> Int -> Int -> [PackPlacement] -> Array Int GlyphMSDF -> UA.UArray Int Word8
@@ -708,61 +876,6 @@ buildAtlasImageSeq _fmt width height pad channels placements glyphMap =
           copyBytesST arr dstBase src srcBase rowBytes
     freeze arr
 
-buildAtlasImageParallel :: BitmapFormat -> Int -> Int -> Int -> Int -> Int -> [PackPlacement] -> Array Int GlyphMSDF -> UA.UArray Int Word8
-buildAtlasImageParallel fmt width height pad channels parallelism placements glyphMap =
-  let bands = bandsForHeight height (min parallelism height)
-      buildBand (yStart, bandH) =
-        AtlasBand yStart bandH (buildAtlasImageBand fmt width pad channels yStart bandH placements glyphMap)
-      bandsBuilt = withStrategy (parListChunk 1 rseq) (map buildBand bands)
-      total = width * height * channels
-      pixels = runST $ do
-        arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
-        forM_ bandsBuilt $ \band -> do
-          let dstOff = band.startRow * width * channels
-              len = band.bandHeight * width * channels
-          copyBytesST arr dstOff band.pixels 0 len
-        freeze arr
-  in pixels
-
-data AtlasBand = AtlasBand
-  { startRow :: Int
-  , bandHeight :: Int
-  , pixels :: UA.UArray Int Word8
-  }
-
-bandsForHeight :: Int -> Int -> [(Int, Int)]
-bandsForHeight height bands =
-  let bands' = max 1 (min bands height)
-      bandH = (height + bands' - 1) `div` bands'
-      starts = [0, bandH .. height - 1]
-  in [ (y, min bandH (height - y)) | y <- starts ]
-
-buildAtlasImageBand :: BitmapFormat -> Int -> Int -> Int -> Int -> Int -> [PackPlacement] -> Array Int GlyphMSDF -> UA.UArray Int Word8
-buildAtlasImageBand _fmt width pad channels bandStart bandH placements glyphMap =
-  let total = bandH * width * channels
-      bandEnd = bandStart + bandH
-  in runST $ do
-    arr <- (newArray (0, total - 1) 0 :: ST s (STUArray s Int Word8))
-    forM_ placements $ \p -> do
-      let glyph = glyphMap ! p.glyphIndex
-          bmp = glyph.bitmap
-          bw = p.bmpW
-          bh = p.bmpH
-      when (bw > 0 && bh > 0) $ do
-        let dstX = p.slotX + pad
-            dstY = p.slotY + pad
-            glyphTop = dstY
-            glyphBottom = dstY + bh
-        when (glyphBottom > bandStart && glyphTop < bandEnd) $ do
-          let startY = max 0 (bandStart - glyphTop)
-              endY = min bh (bandEnd - glyphTop)
-              rowBytes = bw * channels
-              src = bmp.pixels
-          forM_ [startY .. endY - 1] $ \y -> do
-            let srcBase = y * rowBytes
-                dstBase = ((glyphTop + y - bandStart) * width + dstX) * channels
-            copyBytesST arr dstBase src srcBase rowBytes
-    freeze arr
 
 copyBytesST :: STUArray s Int Word8 -> Int -> UA.UArray Int Word8 -> Int -> Int -> ST s ()
 copyBytesST (STUArray _ _ _ dst#) dstOff (UArray _ _ _ src#) srcOff len =

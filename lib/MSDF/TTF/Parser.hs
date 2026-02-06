@@ -577,6 +577,9 @@ glyphContoursAtVar loc ttf glyphIndex depth =
       loca = ttf.loca
       offsets = loca.offsets
       (offLo, offHi) = bounds offsets
+      loc' = case loc of
+        Just l | isDefaultLocation l -> Nothing
+        _ -> loc
   in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
         || glyphIndex < offLo || glyphIndex + 1 > offHi
      then ([], (0,0,0,0))
@@ -593,16 +596,16 @@ glyphContoursAtVar loc ttf glyphIndex depth =
                              Nothing -> Nothing
            in if bb.len < 2
               then ([], (0,0,0,0))
-              else if numContours >= 0
+           else if numContours >= 0
                    then
                      let baseContours = parseSimpleGlyph bb numContours
-                     in case (loc, gvarMaybe) of
+                     in case (loc', gvarMaybe) of
                           (Just loc', Just gv) -> applyGvarToContours gv loc' glyphIndex baseContours
                           _ -> (baseContours, (0,0,0,0))
                    else if depth > 16
                         then ([], (0,0,0,0))
                         else
-                          parseCompositeGlyph loc gvarMaybe bb depth ttf glyphIndex
+                          parseCompositeGlyph loc' gvarMaybe bb depth ttf glyphIndex
 
 -- | Raw bounding box for a glyph (font units).
 glyphBBoxRaw :: TTF -> Int -> (Int, Int, Int, Int)
@@ -616,6 +619,9 @@ glyphBBoxRawAt loc ttf glyphIndex =
       loca = ttf.loca
       offsets = loca.offsets
       (offLo, offHi) = bounds offsets
+      loc' = case loc of
+        Just l | isDefaultLocation l -> Nothing
+        _ -> loc
   in if glyphIndex < 0 || glyphIndex + 1 >= numGlyphs
         || glyphIndex < offLo || glyphIndex + 1 > offHi
      then (0,0,0,0)
@@ -625,7 +631,7 @@ glyphBBoxRawAt loc ttf glyphIndex =
        in if end <= start || end > glyf.len
           then (0,0,0,0)
           else
-            case loc of
+            case loc' of
               Nothing ->
                 let bb = slice glyf start (end - start)
                     xMin = fromIntegral (readS16BE bb 2)
@@ -741,18 +747,23 @@ parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
       hasGvar = case gvar of
         Just gv -> gvarHasData gv glyphIndex
         Nothing -> False
-      compLoc = if hasGvar then Nothing else loc
-      (compDxs, compDys, compPhantom) =
-        case (loc, gvar, hasGvar) of
-          (Just loc', Just gv, True) -> componentDeltas gv loc' glyphIndex compCount
-          _ -> (array (0, -1) [], array (0, -1) [], (0, 0, 0, 0))
+      compLoc = loc
   in if depth > 16
      then ([], (0, 0, 0, 0))
      else
-       let baseContours = buildContours compLoc components compDxs compDys
+       let baseContoursNoVar = buildContours compLoc components (array (0, -1) []) (array (0, -1) [])
+           numPoints = sum (map length baseContoursNoVar)
+           pointCount = numPoints + 4
        in case (loc, gvar, hasGvar) of
-            (Just _, Just _, True) -> (baseContours, compPhantom)
-            _ -> (baseContours, (0, 0, 0, 0))
+            (Just loc', Just gv, True) ->
+              if compositeUsesPointDeltas gv loc' glyphIndex compCount pointCount
+                then applyGvarToContours gv loc' glyphIndex baseContoursNoVar
+                else
+                  let (compDxs, compDys, compPhantom) = componentDeltas gv loc' glyphIndex compCount
+                      contours' = buildContours compLoc components compDxs compDys
+                  in (contours', compPhantom)
+            _ ->
+              (baseContoursNoVar, (0, 0, 0, 0))
   where
     buildContours compLoc comps dxs dys =
       let go _ acc [] = acc
@@ -763,7 +774,7 @@ parseCompositeGlyph loc gvar bb depth ttf glyphIndex =
                 (dx0, dy0) =
                   if argsAreXY
                   then applyComponentOffset c.compFlags c.compTransform (fromIntegral c.arg1, fromIntegral c.arg2)
-                  else pointMatchOffset acc transformedNoTrans c.arg2 c.arg1
+                  else pointMatchOffset acc transformedNoTrans c.arg1 c.arg2
                 (dx1, dy1) =
                   if testBit c.compFlags 2
                   then (fromIntegral (round dx0 :: Int), fromIntegral (round dy0 :: Int))

@@ -37,6 +37,7 @@ common warnings
 
 library
     import:           warnings
+    ghc-options:      -O2
     default-extensions: DuplicateRecordFields
                         , NoFieldSelectors
                         , OverloadedRecordDot
@@ -61,7 +62,6 @@ library
                     , bytestring ^>=0.12.1.0
                     , containers ^>=0.7
                     , deepseq ^>=1.5.0.0
-                    , parallel ^>=3.2.2.0
     hs-source-dirs:   lib
     default-language: GHC2024
 
@@ -83,6 +83,7 @@ test-suite msdf-tests
 
 executable msdf-bench
     import:           warnings
+    ghc-options:      -O2 -threaded -rtsopts -with-rtsopts=-N
     hs-source-dirs:   bench
     main-is:          MSDFBench.hs
     other-modules:    Paths_masdiff
@@ -96,8 +97,25 @@ executable msdf-bench
                         , NoFieldSelectors
                         , OverloadedRecordDot
 
+executable msdf-batch
+    import:           warnings
+    ghc-options:      -O2 -threaded -rtsopts -with-rtsopts=-N
+    hs-source-dirs:   bench
+    main-is:          MSDFBatch.hs
+    other-modules:    Paths_masdiff
+    autogen-modules:  Paths_masdiff
+    build-depends:    base ^>=4.21.0.0
+                    , array ^>=0.5.8.0
+                    , deepseq ^>=1.5.0.0
+                    , masdiff
+    default-language: GHC2024
+    default-extensions: DuplicateRecordFields
+                        , NoFieldSelectors
+                        , OverloadedRecordDot
+
 executable msdf-dump
     import:           warnings
+    ghc-options:      -O2 -threaded -rtsopts -with-rtsopts=-N
     hs-source-dirs:   tools
     main-is:          MSDFDump.hs
     other-modules:    Paths_masdiff

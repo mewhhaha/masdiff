@@ -21,7 +21,7 @@ import MSDF.Types (BBox(..))
 colorEdges :: EdgeColoringConfig -> [[Edge]] -> [ColoredEdge]
 colorEdges cfg contours =
   let colored = concatMap (colorContour cfg) (zip [0..] contours)
-  in map promoteTwoChannel (resolveConflicts cfg colored)
+  in resolveConflicts cfg colored
 
 promoteTwoChannel :: ColoredEdge -> ColoredEdge
 promoteTwoChannel (ColoredEdge c er) =
@@ -242,11 +242,8 @@ recolorOnce cfg edges =
       idxB = buildEdgeIndex 1 bb edgesB
       distTo idx er =
         minimum [ minDistance idx p | p <- edgeSamplePoints er.edge ]
-      pickColor cur er =
-        let dR = distTo idxR er
-            dG = distTo idxG er
-            dB = distTo idxB er
-            otherA = case cur of
+      pickColorFrom cur dR dG dB =
+        let otherA = case cur of
               ColorRed -> Just (ColorGreen, dG, ColorBlue, dB)
               ColorGreen -> Just (ColorRed, dR, ColorBlue, dB)
               ColorBlue -> Just (ColorRed, dR, ColorGreen, dG)
@@ -254,13 +251,18 @@ recolorOnce cfg edges =
         in case otherA of
              Just (c1, d1, c2, d2) -> if d1 < d2 then c1 else c2
              Nothing -> cur
-  in
-  [ let d1 = case c of
-          ColorRed -> distTo idxG er < cfg.conflictDistance && distTo idxB er < cfg.conflictDistance
-          ColorGreen -> distTo idxR er < cfg.conflictDistance && distTo idxB er < cfg.conflictDistance
-          ColorBlue -> distTo idxR er < cfg.conflictDistance && distTo idxG er < cfg.conflictDistance
+      conflicted c dR dG dB =
+        case c of
+          ColorRed -> dG < cfg.conflictDistance && dB < cfg.conflictDistance
+          ColorGreen -> dR < cfg.conflictDistance && dB < cfg.conflictDistance
+          ColorBlue -> dR < cfg.conflictDistance && dG < cfg.conflictDistance
           _ -> False
-    in if d1 then ColoredEdge (pickColor c er) er else ColoredEdge c er
+  in
+  [ let dR = distTo idxR er
+        dG = distTo idxG er
+        dB = distTo idxB er
+        c' = if conflicted c dR dG dB then pickColorFrom c dR dG dB else c
+    in ColoredEdge c' er
   | ColoredEdge c er <- edges
   ]
 

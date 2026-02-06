@@ -49,7 +49,7 @@ invariants for masdiff.
 - `pixelSize`: output pixel size (used for scaling from font units).
 - `range`: MSDF pixel range (see shader expectations in README).
 - `glyphSet`: which glyphs to rasterize (others get metrics only).
-- `parallelism`: `0` disables parallel rendering, otherwise chunk size for `parListChunk`.
+- `parallelism`: `0` disables parallel rendering, otherwise worker count for bitmap generation.
 - `variations`: axis settings like `[("wght", 700)]` (user-space values).
 - `outputFormat`: `BitmapMSDF` (RGB) or `BitmapMTSDF` (RGBA with alpha SDF).
 - `atlas`: atlas packing options (`packAtlas`, `atlasPadding`, `atlasMinSize`, `atlasMaxSize`, `atlasPowerOfTwo`).

@@ -42,6 +42,7 @@ data OutlineConfig = OutlineConfig
   , contourEpsilon :: Double
   , normalizeOrientation :: Bool
   , splitIntersections :: Bool
+  , preprocess :: Bool
   }
 
 data EdgeColoringConfig = EdgeColoringConfig

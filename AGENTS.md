@@ -10,6 +10,13 @@ It is the single source of truth for scope, sequencing, and exit criteria.
 - Preserve an in‑memory workflow: TTF → MSDF/MTSDF bytes without disk round‑trips.
 - Provide a clean public API with explicit knobs that map to msdfgen concepts.
 
+## Agent Execution Rules
+
+- Never use a local Cabal directory setup in this repo.
+- Hard prohibition: never create or use repo-local `.cabal` or `.cabal-logs`.
+- Do not set `CABAL_DIR` or `CABAL_LOGDIR` (including one-off command prefixes).
+- If Cabal execution needs any local-dir/logdir override or sandbox escape, stop and hand off to the user with the exact command to run manually.
+
 ## Research anchors (source of truth)
 
 - **msdfgen README**: modes (`sdf`, `psdf`, `msdf`, `mtsdf`) and that **MTSDF stores true SDF in alpha**.
@@ -56,6 +63,13 @@ It is the single source of truth for scope, sequencing, and exit criteria.
 - Exit when alpha (true SDF) is free of crossbar/join breaks on reference glyphs.
 **Status:** Partially done — exact/pseudo distance paths, scanline sign + fill rule, overlap filtering are in place. **Blocking:** crossbar/join artifacts persist because edges are not split at intersections.
 
+### Phase 3.1 — Variable Font Delta Correctness
+- Validate gvar tuple header parsing (packed format) and shared-point offsets.
+- Ensure decoded deltas are within sane bounds (no multi-million unit bboxes).
+- Composite glyphs: detect point-based vs component-based deltas; apply correctly.
+- Add regression on Inter variable: `wght=900` glyphs (`i`, `j`, `z`, `e`, `:`) match msdfgen output.
+**Status:** In progress — packed header parsing enforced; remaining composite detection + regression comparison pending.
+
 ### Phase 4 — MSDF/MTSDF Generation (true SDF in alpha)
 - MSDF: median of RGB from edge‑colored channels.
 - MTSDF: RGB = MSDF, **alpha = true SDF** (msdfgen semantics).
@@ -77,11 +91,61 @@ It is the single source of truth for scope, sequencing, and exit criteria.
 - Exit when atlas layout is stable across runs and matches reference metrics.
 **Status:** Done — deterministic skyline packer, stable ordering, PoT controls, metadata outputs.
 
-### Phase 7 — Performance + Determinism
-- Add spatial indexing + caching where it does not alter output.
-- Ensure multithreaded execution is deterministic (stable ordering + seeded coloring).
-- Exit when performance matches targets without visual regressions.
-**Status:** Done — edge grid indexing, glyph cache, deterministic ordering + tests.
+### Phase 7 — Performance + Determinism (re-opened)
+Goal: close the performance gap vs msdfgen while preserving output quality.
+
+#### Phase 7.1 — Bench Harness + Baseline
+- Maintain msdf-bench/msdf-batch wall-clock timings (single atlas + batch).
+- Keep wall vs CPU time reporting to avoid misreads under parallelism.
+- Track msdfgen baseline (e.g., Inter variable font, 24px/28px, full glyph set).
+**Status:** Done — msdf-batch exists, wall-time reporting added.
+
+#### Phase 7.2 — Parallel Scheduling + Overhead Reduction
+- Prefer dynamic worker pools over static chunking for glyph rendering.
+- Avoid nested parallelism (atlas-level and per-glyph row workers).
+- Gate per-glyph row parallelism by pixel count threshold.
+**Status:** In progress — dynamic glyph worker pool added; row parallel threshold added.
+
+#### Phase 7.3 — Render Buffer Data Layout
+- Convert per-pixel distance buffers from `Double` to `Float` (or fixed-point).
+- Keep geometric math in `Double`, store buffers in `Float` to reduce bandwidth.
+- Preserve output parity; add a toggle if needed for strict regression tests.
+**Status:** Done — distance buffers are `Float` while geometry math remains `Double`.
+
+#### Phase 7.4 — Edge Index Construction
+- Replace list-to-array builds in `buildEdgeIndexInfo` with mutable array fills.
+- Reduce intermediate list allocation in edge/segment preprocessing.
+- Migrate edge/segment collections to unboxed/storable vectors for cache-friendly scans.
+**Status:** In progress — edge params/bboxes unboxed; edge masks + overlap flags unboxed; edge segments packed into SoA arrays with offsets/counts.
+
+#### Phase 7.5 — Compact Auxiliary Structures
+- Replace inside-mask `Bool` arrays with packed bitsets.
+- Consider packed storage for edge attributes (single contiguous buffer).
+- Reduce codepoint mapping overhead (avoid `Array Int [Int]` cons chains).
+**Status:** Done — inside mask is a packed bitset; codepoint mapping uses compact offsets/counts.
+
+#### Phase 7.6 — Verification + Guardrails
+- For each optimization, run reference renders and msdfgen compare.
+- Ensure determinism (seeded edge coloring, stable ordering).
+**Status:** Pending.
+
+#### Phase 7.7 — Data Structure Review (Performance Track)
+Focus on layout to reduce GC churn and pointer chasing in hot paths.
+
+- `EdgeIndexInfo`:
+  - Move remaining boxed fields to SoA form (edge masks + overlaps + segments).
+  - Replace `Array Int [LineSeg]` with SoA segment arrays (offsets/counts + coords).
+- Inside mask:
+  - Packed bitset with bit-test helper (no per-pixel `Word8`).
+- Cell index:
+  - Replace `UArray Int Int` with `PrimArray Int` or `Vector Int` to enable tight loops.
+- Glyph mapping:
+  - Replace `Array Int [Int]`/list chains in codepoint→glyph mapping with compact offsets/counts arrays.
+- Distance buffers:
+  - Consider `PrimArray Float` or `Storable` buffers for cache-friendly contiguous writes.
+**Status:** Identified — implement incrementally with correctness checks.
+
+**Exit when:** full-glyph Inter atlas at 24px is within ~2x msdfgen wall time and no visual regressions.
 
 ### Phase 8 — Docs, Examples, & Acceptance
 - Update render guide and SDL example to match msdfgen semantics (alpha is true SDF).

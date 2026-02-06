@@ -10,33 +10,33 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 import Data.ByteString.Builder (Builder, byteString, floatLE, word32LE, word8, toLazyByteString)
 import qualified Data.ByteString.Lazy as BL
-import Data.Bits ((.&.))
-import Data.Char (isSpace, ord, toLower)
-import Data.List (foldl', isPrefixOf, sortOn)
+import Data.Bits ((.&.), xor)
+import Data.Char (isAlphaNum, isSpace, ord, toLower)
+import Data.List (foldl', intercalate, isPrefixOf, sortOn)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
-import Numeric (showHex)
+import Numeric (showFFloat, showHex)
 import Control.Monad (foldM, forM_, when)
 import qualified Data.Map.Strict as Map
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>), takeBaseName, (<.>))
-import Data.Word (Word8, Word16)
+import Data.Word (Word8, Word16, Word64)
 import Text.Read (readMaybe)
 import qualified Data.IntMap.Strict as IntMap
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import System.IO (BufferMode(..), hPutStrLn, hSetBinaryMode, hSetBuffering, stderr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 
 import qualified MSDF.MSDF as MSDF
-import MSDF.MSDF (GlyphSet(..))
-import MSDF.Generated (generateMSDFFromTTF)
+import MSDF.MSDF (GlyphSet(..), glyphMetricsOnlyAt)
+import MSDF.Generated (BuildTimings(..), generateMSDFFromTTF, generateMSDFFromTTFWithTimings)
 import MSDF.Render (glyphQuad, glyphUV, pixelRangeForAtlas)
 import MSDF.Binary (ByteBuffer(..), readU8)
 import MSDF.Outline (Point(..))
 import MSDF.Types (AtlasImage(..), BitmapFormat(..), GlyphMSDF(..), MSDFAtlas(..), MSDFBitmap(..), lookupCodepoint)
-import MSDF.TTF.Parser (Cmap(..), ParseError(..), glyphBBoxRawAt, glyphOutlineAt, parseTTF, TTF(..))
-import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), Variations(..), gvarDeltaSum, gvarTupleDeltaStats, gvarTupleHeaderStats, gvarTupleScalars, normalizeLocation)
+import MSDF.TTF.Parser (Cmap(..), Head(..), Hhea(..), ParseError(..), glyphBBoxRawAt, glyphOutlineAt, parseTTF, TTF(..))
+import MSDF.TTF.Variations (Fvar(..), FvarAxis(..), Gvar(..), Variations(..), gvarDeltaSum, gvarTupleDeltaStats, gvarTupleHeaderStats, gvarTupleScalars, isDefaultLocation, normalizeLocation)
 import MSDF.LazyAtlas (LazyAtlas, LazyAtlasConfig(..), defaultLazyAtlasConfig, ensureGlyph, newLazyAtlas, snapshotAtlasImage)
 import MSDF.Config (AtlasConfig(..))
 import Spirdo.Wesl (compile, renderCompileError, sourceFile, shaderSpirv)
@@ -48,15 +48,22 @@ outDirName :: FilePath
 outDirName = "out"
 
 screenW, screenH :: Double
-screenW = 1280
-screenH = 720
+screenW = 1920
+screenH = 1080
 
 pangramText :: String
 pangramText = "The quick brown fox jumps over the lazy dog"
 
 defaultSampleText :: String
-defaultSampleText = "f"
+defaultSampleText = pangramText <> " Pack my box with five dozen liquor jugs."
 
+defaultDemoTexts :: [String]
+defaultDemoTexts =
+  [ "Regular:\nThe quick brown fox jumps over the lazy dog."
+  , "Bold:\nSphinx of black quartz, judge my vow."
+  , "Italic:\nCozy lummox gives smart squid who asks for job pen."
+  , "Bold Italic:\nVexing wizards quickly jab the gnomes."
+  ]
 data CliOptions = CliOptions
   { fontPathOpt :: Maybe FilePath
   , pixelSizeOpt :: Maybe Int
@@ -68,6 +75,7 @@ data CliOptions = CliOptions
   , hardOpt :: Maybe Double
   , conflictOpt :: Maybe Double
   , flatnessOpt :: Maybe Double
+  , splitOpt :: Maybe Bool
   , signModeOpt :: Maybe MSDF.SignMode
   , fillRuleOpt :: Maybe MSDF.FillRule
   , overlapOpt :: Maybe Bool
@@ -93,6 +101,7 @@ defaultCliOptions =
     , hardOpt = Nothing
     , conflictOpt = Nothing
     , flatnessOpt = Nothing
+    , splitOpt = Nothing
     , signModeOpt = Nothing
     , fillRuleOpt = Nothing
     , overlapOpt = Nothing
@@ -116,6 +125,7 @@ usage =
     [ "msdf-sdl-gen [--font PATH] [--pixel-size N] [--range N] [--padding N]"
     , "             [--correction X] [--edge-threshold X] [--hard-threshold X]"
     , "             [--conflict X] [--flatness X] [--lazy-atlas]"
+    , "             [--split-intersections | --no-split-intersections]"
     , "             [--sign-mode winding|scanline] [--fill-rule nonzero|odd|positive|negative]"
     , "             [--overlap | --no-overlap] [--overlap-epsilon X]"
     , "             [--coloring simple|inktrap|distance] [--pseudo-distance | --no-pseudo-distance]"
@@ -149,6 +159,8 @@ data OutputSpec = OutputSpec
   , specFormat :: BitmapFormat
   , specCenterX :: Double
   , specCenterY :: Double
+  , specMaxWidth :: Maybe Double
+  , specMaxHeight :: Maybe Double
   , specWriteDefault :: Bool
   , specVars :: [(String, Double)]
   , specText :: String
@@ -176,18 +188,33 @@ type AtlasCache = IORef (Map.Map String MSDFAtlas)
 atlasCacheRef :: AtlasCache
 atlasCacheRef = unsafePerformIO (newIORef Map.empty)
 
-getCachedAtlas :: Bool -> String -> MSDF.MSDFConfig -> TTF -> IO MSDFAtlas
-getCachedAtlas useCache key cfg ttf =
+type OutputCache = IORef (Map.Map String OutputData)
+
+{-# NOINLINE outputCacheRef #-}
+outputCacheRef :: OutputCache
+outputCacheRef = unsafePerformIO (newIORef Map.empty)
+
+getCachedAtlas :: Bool -> Bool -> String -> MSDF.MSDFConfig -> TTF -> IO (MSDFAtlas, Maybe BuildTimings, Bool)
+getCachedAtlas useCache timingsEnabled key cfg ttf =
   if not useCache
-    then pure (generateMSDFFromTTF cfg ttf)
+    then do
+      (atlas, timings) <- buildOnce
+      pure (atlas, timings, False)
     else do
       cache <- readIORef atlasCacheRef
       case Map.lookup key cache of
-        Just atlas -> pure atlas
+        Just atlas -> pure (atlas, Nothing, True)
         Nothing -> do
-          let atlas = generateMSDFFromTTF cfg ttf
+          (atlas, timings) <- buildOnce
           writeIORef atlasCacheRef (Map.insert key atlas cache)
-          pure atlas
+          pure (atlas, timings, False)
+  where
+    buildOnce =
+      if timingsEnabled
+        then do
+          (atlas, timings) <- generateMSDFFromTTFWithTimings cfg ttf
+          pure (atlas, Just timings)
+        else pure (generateMSDFFromTTF cfg ttf, Nothing)
 
 atlasCacheKey :: FilePath -> MSDF.MSDFConfig -> String
 atlasCacheKey fontKey cfg =
@@ -233,6 +260,98 @@ atlasCacheKey fontKey cfg =
       , "corrHard=" <> show corrCfg.hardThreshold
       ]
 
+outputCacheKey :: FilePath -> MSDF.MSDFConfig -> Int -> String -> Double -> Double -> String
+outputCacheKey fontKey cfg renderPixelSize sampleText centerX centerY =
+  atlasCacheKey fontKey cfg
+  <> "renderPixelSize=" <> show renderPixelSize <> "\n"
+  <> "text=" <> show sampleText <> "\n"
+  <> "centerX=" <> show centerX <> "\n"
+  <> "centerY=" <> show centerY <> "\n"
+
+fnv1a64 :: String -> Word64
+fnv1a64 =
+  let offset = 14695981039346656037 :: Word64
+      prime = 1099511628211 :: Word64
+      step h c = (h `xor` fromIntegral (ord c)) * prime
+  in foldl' step offset
+
+cacheKeyHash :: String -> String
+cacheKeyHash key = showHex (fnv1a64 key) ""
+
+sanitizeLabel :: String -> String
+sanitizeLabel =
+  let keep c
+        | isAlphaNum c = c
+        | c == '-' = c
+        | c == '_' = c
+        | otherwise = '_'
+  in map keep
+
+cachePaths :: FilePath -> String -> String -> (FilePath, FilePath, FilePath)
+cachePaths dir label key =
+  let base = sanitizeLabel label <> "_" <> cacheKeyHash key
+  in ( dir </> (base <.> "rgba")
+     , dir </> (base <.> "bin")
+     , dir </> (base <.> "txt")
+     )
+
+readMetaFile :: FilePath -> IO (Maybe MetaInfo)
+readMetaFile path = do
+  ok <- doesFileExist path
+  if not ok
+    then pure Nothing
+    else do
+      raw <- readFile path
+      let step acc line =
+            case words line of
+              ["atlasWidth", v] -> acc { metaAtlasW = readDef 0 v }
+              ["atlasHeight", v] -> acc { metaAtlasH = readDef 0 v }
+              ["pixelSize", v] -> acc { metaPixelSize = readDef 0 v }
+              ["screenW", v] -> acc { metaScreenW = readDef 0 v }
+              ["screenH", v] -> acc { metaScreenH = readDef 0 v }
+              ["pxRange", v] -> acc { metaPxRange = readDefD 0 v }
+              ["vertexCount", v] -> acc { metaVertexCount = readDef 0 v }
+              _ -> acc
+          readDef def v = fromMaybe def (readMaybe v)
+          readDefD def v = fromMaybe def (readMaybe v)
+          base = MetaInfo 0 0 0 0 0 0 0
+          meta = foldl' step base (lines raw)
+      if meta.metaAtlasW > 0 && meta.metaAtlasH > 0
+        then pure (Just meta)
+        else pure Nothing
+
+readOutputCache :: FilePath -> String -> String -> BitmapFormat -> IO (Maybe OutputData)
+readOutputCache dir label key fmt = do
+  let (atlasPath, vertPath, metaPath) = cachePaths dir label key
+  metaMb <- readMetaFile metaPath
+  case metaMb of
+    Nothing -> pure Nothing
+    Just meta -> do
+      atlasOk <- doesFileExist atlasPath
+      vertOk <- doesFileExist vertPath
+      if not (atlasOk && vertOk)
+        then pure Nothing
+        else do
+          atlasBytes <- BS.readFile atlasPath
+          vertBytes <- BS.readFile vertPath
+          let expected = meta.metaAtlasW * meta.metaAtlasH * 4
+              atlasSizeOk = expected <= 0 || BS.length atlasBytes == expected
+              vertsOk = not (BS.null vertBytes)
+          if not (atlasSizeOk && vertsOk)
+            then pure Nothing
+            else pure (Just OutputData
+              { outLabel = label
+              , outFormatFlag = formatFlagFor fmt
+              , outMeta = meta
+              , outAtlasBytes = atlasBytes
+              , outVertexBytes = vertBytes
+              })
+
+writeOutputCache :: FilePath -> String -> String -> OutputData -> IO ()
+writeOutputCache dir label key output = do
+  let (atlasPath, vertPath, metaPath) = cachePaths dir label key
+  writeOutputs atlasPath vertPath metaPath output
+
 normalizeVars :: [(String, Double)] -> [(String, Double)]
 normalizeVars = uniqueVars . sortOn fst
   where
@@ -265,7 +384,6 @@ main = do
 
   sampleText <- resolveSampleText
   variations <- resolveVariations
-  lazyAtlasEnv <- resolveLazyAtlas
   textDebug <- resolveTextDebug
   fastEnv <- resolveFastMode
   fastVariationsEnv <- resolveFastVariations
@@ -273,9 +391,12 @@ main = do
   pairOpsz <- resolvePairOpsz
   pixelSizeEnv <- resolvePixelSizeOverride
   rangeEnv <- resolveRangeOverride
-  cacheEnv <- resolveCacheMode
-  batchEnv <- resolveBatchMode
   demoVariants <- resolveDemoVariants
+  demoTextsRaw <- resolveDemoTexts
+  timingsEnabled <- resolveTimings
+  genPixelSizeEnv <- resolveGenPixelSizeOverride
+  diskCacheEnabled <- resolveDiskCacheMode
+  diskCacheDirEnv <- resolveDiskCacheDir
   args <- getArgs
   opts <- case parseArgs args defaultCliOptions of
     ParseHelp -> do
@@ -295,19 +416,23 @@ main = do
     hSetBuffering stderr LineBuffering
   when (not emitBlob) $
     createDirectoryIfMissing True outDir
+  let diskCacheDir =
+        if diskCacheEnabled
+        then Just (fromMaybe (outDir </> "cache") diskCacheDirEnv)
+        else Nothing
+  case diskCacheDir of
+    Nothing -> pure ()
+    Just dir -> createDirectoryIfMissing True dir
   vertSpv <- compileWesl (not emitBlob) outDir (shaderDir </> "msdf.vert.wesl")
   fragSpv <- compileWesl (not emitBlob) outDir (shaderDir </> "msdf.frag.wesl")
 
-  let cacheEnabled = cacheEnv || opts.cacheOpt
-      batchEnabled = batchEnv || opts.batchOpt
-      lazyAtlas = if cacheEnabled || batchEnabled
-                  then False
-                  else fromMaybe lazyAtlasEnv opts.lazyAtlasOpt
+  let cacheEnabled = True
+      lazyAtlas = True
       hasVariations = (not (null variations) || isJust pairWeights)
       autoFast = False
       fastEnabled = fastEnv || (fastVariationsEnv && hasVariations) || autoFast
       basePixelSize = 256
-      baseRange = 12
+      baseRange = 16
       pixelSizeBase =
         case opts.pixelSizeOpt of
           Just _ -> basePixelSize
@@ -351,12 +476,23 @@ main = do
           }
         else cfgBase
       cfg = applyCliOverrides opts cfgFast
+      renderPixelSize = max 1 cfg.pixelSize
+      genPixelSize = max 1 (fromMaybe renderPixelSize genPixelSizeEnv)
+      renderScale =
+        if genPixelSize <= 0
+        then 1
+        else fromIntegral renderPixelSize / fromIntegral genPixelSize
+      cfgGen =
+        if genPixelSize == cfg.pixelSize
+        then cfg
+        else cfg { MSDF.pixelSize = genPixelSize }
   when fastEnabled $
     logMsg "text debug: fast mode enabled (set SDL_MSDF_FAST=0 and SDL_MSDF_FAST_VARIATIONS=0 for full quality)"
-  when batchEnabled $
-    logMsg "text debug: batch mode enabled (lazy atlas disabled)"
   when cacheEnabled $
-    logMsg "text debug: atlas cache enabled (keyed by font+config+glyph set)"
+    logMsg "text debug: lazy atlas + cache forced (quality mode)"
+  when textDebug $
+    when (renderPixelSize /= genPixelSize) $
+      logMsg ("text debug: renderPixelSize=" <> show renderPixelSize <> " genPixelSize=" <> show genPixelSize <> " scale=" <> showFFloat (Just 3) renderScale "")
   when demoVariants $
     logMsg "text debug: demo variants enabled (regular/bold/italic/bolditalic)"
   fontPath <- resolveFontPath baseDir opts
@@ -383,20 +519,32 @@ main = do
             Right ttfItalic -> pure ttfItalic
       let baseVars = maybe [] (\o -> [("opsz", o)]) pairOpsz
           (wRegular, wBold) = fromMaybe (400, 900) pairWeights
+          demoTexts =
+            case demoTextsRaw of
+              [] -> replicate 4 (pangramText <> ".")
+              xs -> xs
+          demoTextList =
+            if length demoTexts >= 4
+            then take 4 demoTexts
+            else take 4 (cycle demoTexts)
+          [demoTextRegular, demoTextItalic, demoTextBold, demoTextBoldItalic] = demoTextList
           outputs =
             if demoVariants
             then
-              [ OutputSpec "regular" BitmapMTSDF (screenW * 0.5) (screenH * 0.78) False (("wght", wRegular) : baseVars)
-                  "Regular: The quick brown fox jumps over the lazy dog."
+              let boxW = Just (screenW * 0.48)
+                  boxH = Just (screenH * 0.44)
+              in
+              [ OutputSpec "regular" BitmapMTSDF (screenW * 0.26) (screenH * 0.72) boxW boxH False (("wght", wRegular) : baseVars)
+                  demoTextRegular
                   fontPath ttf
-              , OutputSpec "bold" BitmapMTSDF (screenW * 0.5) (screenH * 0.60) False (("wght", wBold) : baseVars)
-                  "Bold: Sphinx of black quartz, judge my vow."
-                  fontPath ttf
-              , OutputSpec "italic" BitmapMTSDF (screenW * 0.5) (screenH * 0.42) False (("wght", wRegular) : baseVars)
-                  "Italic: Pack my box with five dozen liquor jugs."
+              , OutputSpec "italic" BitmapMTSDF (screenW * 0.74) (screenH * 0.72) boxW boxH False (("wght", wRegular) : baseVars)
+                  demoTextItalic
                   italicFontPath italicTtf
-              , OutputSpec "bolditalic" BitmapMTSDF (screenW * 0.5) (screenH * 0.24) False (("wght", wBold) : baseVars)
-                  "Bold Italic: How vexingly quick daft zebras jump."
+              , OutputSpec "bold" BitmapMTSDF (screenW * 0.26) (screenH * 0.28) boxW boxH False (("wght", wBold) : baseVars)
+                  demoTextBold
+                  fontPath ttf
+              , OutputSpec "bolditalic" BitmapMTSDF (screenW * 0.74) (screenH * 0.28) boxW boxH False (("wght", wBold) : baseVars)
+                  demoTextBoldItalic
                   italicFontPath italicTtf
               ]
             else
@@ -404,17 +552,19 @@ main = do
                 Just (w0, w1) ->
                   let vars0 = ("wght", w0) : baseVars
                       vars1 = ("wght", w1) : baseVars
-                  in [ OutputSpec "w400" BitmapMTSDF (screenW * 0.33) (screenH * 0.5) False vars0 sampleText fontPath ttf
-                     , OutputSpec "w900" BitmapMTSDF (screenW * 0.67) (screenH * 0.5) False vars1 sampleText fontPath ttf
+                      boxW = Just (screenW * 0.44)
+                      boxH = Just (screenH * 0.40)
+                  in [ OutputSpec "w400" BitmapMTSDF (screenW * 0.28) (screenH * 0.72) boxW boxH False vars0 sampleText fontPath ttf
+                     , OutputSpec "w900" BitmapMTSDF (screenW * 0.72) (screenH * 0.28) boxW boxH False vars1 sampleText fontPath ttf
                      ]
                 Nothing ->
-                  [ OutputSpec "mtsdf" BitmapMTSDF (screenW * 0.5) (screenH * 0.5) False variations sampleText fontPath ttf
+                  [ OutputSpec "mtsdf" BitmapMTSDF (screenW * 0.5) (screenH * 0.5) Nothing Nothing False variations sampleText fontPath ttf
                   ]
       if emitBlob
         then do
-          outs <- mapM (buildAtlas cfg lazyAtlas textDebug cacheEnabled) outputs
+          outs <- mapM (buildAtlas cfgGen renderPixelSize diskCacheDir lazyAtlas textDebug cacheEnabled timingsEnabled) outputs
           emitBlobOutputs vertSpv fragSpv outs
-        else mapM_ (writeAtlas outDir cfg lazyAtlas textDebug cacheEnabled) outputs
+        else mapM_ (writeAtlas outDir cfgGen renderPixelSize diskCacheDir lazyAtlas textDebug cacheEnabled timingsEnabled) outputs
 
 resolveSampleText :: IO String
 resolveSampleText = do
@@ -470,6 +620,11 @@ resolvePixelSizeOverride = do
   val <- lookupEnv "SDL_MSDF_PIXEL_SIZE"
   pure (val >>= readMaybe . trim)
 
+resolveGenPixelSizeOverride :: IO (Maybe Int)
+resolveGenPixelSizeOverride = do
+  val <- lookupEnv "SDL_MSDF_GEN_PIXEL_SIZE"
+  pure (val >>= readMaybe . trim)
+
 resolveRangeOverride :: IO (Maybe Int)
 resolveRangeOverride = do
   val <- lookupEnv "SDL_MSDF_RANGE"
@@ -485,6 +640,19 @@ resolveCacheMode = do
     Just "on" -> True
     _ -> False)
 
+resolveDiskCacheMode :: IO Bool
+resolveDiskCacheMode = do
+  val <- lookupEnv "SDL_MSDF_DISK_CACHE"
+  pure (case fmap (map toLower) val of
+    Just "1" -> True
+    Just "true" -> True
+    Just "yes" -> True
+    Just "on" -> True
+    _ -> False)
+
+resolveDiskCacheDir :: IO (Maybe FilePath)
+resolveDiskCacheDir = lookupEnv "SDL_MSDF_CACHE_DIR"
+
 resolveBatchMode :: IO Bool
 resolveBatchMode = do
   val <- lookupEnv "SDL_MSDF_BATCH"
@@ -498,6 +666,29 @@ resolveBatchMode = do
 resolveDemoVariants :: IO Bool
 resolveDemoVariants = do
   val <- lookupEnv "SDL_MSDF_DEMO_VARIANTS"
+  case fmap (map toLower) val of
+    Just "1" -> pure True
+    Just "true" -> pure True
+    Just "yes" -> pure True
+    Just "on" -> pure True
+    _ -> do
+      pairA <- lookupEnv "SDL_MSDF_VARIATION_PAIR"
+      pairB <- lookupEnv "SDL_MSDF_PAIR_WEIGHTS"
+      let hasPair = maybe False (not . null . trim) pairA || maybe False (not . null . trim) pairB
+      pure hasPair
+
+resolveDemoTexts :: IO [String]
+resolveDemoTexts = do
+  val <- lookupEnv "SDL_MSDF_DEMO_TEXTS"
+  case val of
+    Nothing -> pure []
+    Just raw ->
+      let parts = map trim (splitOn '|' raw)
+      in pure (filter (not . null) parts)
+
+resolveTimings :: IO Bool
+resolveTimings = do
+  val <- lookupEnv "SDL_MSDF_TIMINGS"
   pure (case fmap (map toLower) val of
     Just "1" -> True
     Just "true" -> True
@@ -666,84 +857,127 @@ formatFlagFor fmt =
     BitmapMSDF -> 0
     BitmapMTSDF -> 1
 
-buildAtlas :: MSDF.MSDFConfig -> Bool -> Bool -> Bool -> OutputSpec -> IO OutputData
-buildAtlas cfgBase lazyAtlas textDebug cacheEnabled spec = do
+buildAtlas :: MSDF.MSDFConfig -> Int -> Maybe FilePath -> Bool -> Bool -> Bool -> Bool -> OutputSpec -> IO OutputData
+buildAtlas cfgBase renderPixelSize diskCacheDir lazyAtlas textDebug cacheEnabled timingsEnabled spec = do
   let label = spec.specLabel
       fmt = spec.specFormat
       centerX = spec.specCenterX
       centerY = spec.specCenterY
+      maxHeight = spec.specMaxHeight
       vars = spec.specVars
       sampleText = spec.specText
       fontKey = spec.specFontPath
       ttf = spec.specTTF
+      genPixelSize = max 1 cfgBase.pixelSize
+      renderPx = max 1 renderPixelSize
+      renderScale = fromIntegral renderPx / fromIntegral genPixelSize
+  let cfgPre = cfgBase
+        { MSDF.outputFormat = fmt
+        , MSDF.variations = vars
+        }
+      wrapWidth = fromMaybe (screenW * 0.94) spec.specMaxWidth
+      renderText = wrapTextForWidth wrapWidth renderScale cfgPre ttf sampleText
+      cfg = cfgPre
+        { MSDF.glyphSet = GlyphSetCodepoints (map ord renderText)
+        }
   when textDebug $ do
-    let glyphCount = IntMap.size (buildGlyphMap ttf sampleText)
+    let glyphCount = IntMap.size (buildGlyphMap ttf renderText)
     logMsg ("text debug: label=" <> label <> " lazy=" <> show lazyAtlas <> " glyphs=" <> show glyphCount <> " vars=" <> show vars)
   debugEnv <- lookupEnv "SDL_MSDF_VARIATION_DEBUG"
   when (isJust debugEnv) $ debugVariations label ttf vars sampleText
-  let cfg = cfgBase
-        { MSDF.outputFormat = fmt
-        , MSDF.variations = vars
-        , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
-        }
-  if lazyAtlas
-    then buildAtlasLazy sampleText cfg ttf label centerX centerY textDebug
-    else do
-      let cacheKey = atlasCacheKey fontKey cfg
-      atlas <- getCachedAtlas cacheEnabled cacheKey cfg ttf
-      case atlas of
-        MSDFAtlas { atlas = Nothing, glyphs = glyphArr } -> do
-          let hasBitmap = any (\g -> g.bitmap.width > 0 && g.bitmap.height > 0) (elems glyphArr)
-          if hasBitmap
+  let outputKey = outputCacheKey fontKey cfg renderPx renderText centerX centerY
+  cachedDisk <-
+    case diskCacheDir of
+      Nothing -> pure Nothing
+      Just dir -> readOutputCache dir label outputKey fmt
+  case cachedDisk of
+    Just out -> do
+      when cacheEnabled $
+        modifyIORef' outputCacheRef (Map.insert outputKey out)
+      pure out
+    Nothing ->
+      if lazyAtlas
+        then do
+          cachedMem <-
+            if cacheEnabled
             then do
-              logMsg "atlas packing failed (packAtlas was true)"
-              exitFailure
-            else do
-              logMsg ("atlas empty (no glyph bitmaps); skipping output " <> label)
-              let meta = MetaInfo
-                    { metaAtlasW = 0
-                    , metaAtlasH = 0
-                    , metaPixelSize = 0
+              cache <- readIORef outputCacheRef
+              pure (Map.lookup outputKey cache)
+            else pure Nothing
+          case cachedMem of
+            Just out -> pure out
+            Nothing -> do
+              out <- buildAtlasLazy renderScale renderText cfg ttf label centerX centerY spec.specMaxWidth maxHeight textDebug
+              when cacheEnabled $
+                modifyIORef' outputCacheRef (Map.insert outputKey out)
+              forM_ diskCacheDir (\dir -> writeOutputCache dir label outputKey out)
+              pure out
+        else do
+          let cacheKey = atlasCacheKey fontKey cfg
+          (atlas, timings, cacheHit) <- getCachedAtlas cacheEnabled timingsEnabled cacheKey cfg ttf
+          when timingsEnabled $ do
+            case timings of
+              Just t -> logTimings label t
+              Nothing ->
+                when cacheHit $
+                  logMsg ("timing[" <> label <> "]: cache hit")
+          case atlas of
+            MSDFAtlas { atlas = Nothing, glyphs = glyphArr } -> do
+              let hasBitmap = any (\g -> g.bitmap.width > 0 && g.bitmap.height > 0) (elems glyphArr)
+              if hasBitmap
+                then do
+                  logMsg "atlas packing failed (packAtlas was true)"
+                  exitFailure
+                else do
+                  logMsg ("atlas empty (no glyph bitmaps); skipping output " <> label)
+                  let meta = MetaInfo
+                        { metaAtlasW = 0
+                        , metaAtlasH = 0
+                        , metaPixelSize = 0
+                        , metaScreenW = round screenW
+                        , metaScreenH = round screenH
+                        , metaPxRange = 0
+                        , metaVertexCount = 0
+                        }
+                  pure OutputData
+                    { outLabel = label
+                    , outFormatFlag = formatFlagFor fmt
+                    , outMeta = meta
+                    , outAtlasBytes = BS.empty
+                    , outVertexBytes = BS.empty
+                    }
+            MSDFAtlas { atlas = Just img, pixelSize = ps } -> do
+              let AtlasImage { width = aw, height = ah, format = fmtImg, pixels = px } = img
+                  rgbaBytes = bitmapToRgbaBytes fmtImg px
+                  boundsRaw = scaleBounds renderScale (textBounds atlas renderText)
+                  fitScale = fitScaleToBox wrapWidth maxHeight boundsRaw
+                  bounds = scaleBounds fitScale boundsRaw
+                  pxRange = pixelRangeForAtlas atlas (fromIntegral renderPx * fitScale)
+                  penStart' = snapPen (penForCenter (centerX, centerY) bounds)
+                  texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
+                  verts = buildTextVerticesScaled (renderScale * fitScale) atlas (screenW, screenH) penStart' texel renderText
+                  vtxBytes = BL.toStrict (toLazyByteString (floatListBuilder verts))
+                  meta = MetaInfo
+                    { metaAtlasW = aw
+                    , metaAtlasH = ah
+                    , metaPixelSize = ps
                     , metaScreenW = round screenW
                     , metaScreenH = round screenH
-                    , metaPxRange = 0
-                    , metaVertexCount = 0
+                    , metaPxRange = pxRange
+                    , metaVertexCount = length verts `div` 4
                     }
-              pure OutputData
-                { outLabel = label
-                , outFormatFlag = formatFlagFor fmt
-                , outMeta = meta
-                , outAtlasBytes = BS.empty
-                , outVertexBytes = BS.empty
-                }
-        MSDFAtlas { atlas = Just img, pixelSize = ps } -> do
-          let AtlasImage { width = aw, height = ah, format = fmtImg, pixels = px } = img
-              rgbaBytes = bitmapToRgbaBytes fmtImg px
-              pxRange = pixelRangeForAtlas atlas (fromIntegral ps :: Double)
-              bounds = textBounds atlas sampleText
-              penStart' = snapPen (penForCenter (centerX, centerY) bounds)
-              texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
-              verts = buildTextVertices atlas (screenW, screenH) penStart' texel sampleText
-              vtxBytes = BL.toStrict (toLazyByteString (floatListBuilder verts))
-              meta = MetaInfo
-                { metaAtlasW = aw
-                , metaAtlasH = ah
-                , metaPixelSize = ps
-                , metaScreenW = round screenW
-                , metaScreenH = round screenH
-                , metaPxRange = pxRange
-                , metaVertexCount = length verts `div` 4
-                }
-          pure OutputData
-                { outLabel = label
-                , outFormatFlag = formatFlagFor fmt
-                , outMeta = meta
-                , outAtlasBytes = rgbaBytes
-                , outVertexBytes = vtxBytes
-                }
+                  out = OutputData
+                    { outLabel = label
+                    , outFormatFlag = formatFlagFor fmt
+                    , outMeta = meta
+                    , outAtlasBytes = rgbaBytes
+                    , outVertexBytes = vtxBytes
+                    }
+              forM_ diskCacheDir (\dir -> writeOutputCache dir label outputKey out)
+              pure out
 
-buildAtlasLazy :: String -> MSDF.MSDFConfig -> TTF -> String -> Double -> Double -> Bool -> IO OutputData
-buildAtlasLazy sampleText cfg ttf label centerX centerY textDebug = do
+buildAtlasLazy :: Double -> String -> MSDF.MSDFConfig -> TTF -> String -> Double -> Double -> Maybe Double -> Maybe Double -> Bool -> IO OutputData
+buildAtlasLazy renderScale renderText cfg ttf label centerX centerY maxWidth maxHeight textDebug = do
   let AtlasConfig { atlasMaxSize = maxSize, atlasPadding = pad } = cfg.atlas
       lazyCfg = (defaultLazyAtlasConfig cfg)
         { atlasWidth = max 1 maxSize
@@ -752,20 +986,23 @@ buildAtlasLazy sampleText cfg ttf label centerX centerY textDebug = do
         , debugEnabled = textDebug
         }
   lazy <- newLazyAtlas cfg ttf lazyCfg
-  let glyphMap = buildGlyphMap ttf sampleText
+  let glyphMap = buildGlyphMap ttf renderText
   glyphsMap <-
     foldM
-      (ensureLazyGlyph cfg.outputFormat lazyCfg.atlasWidth lazyCfg.atlasHeight lazyCfg.atlasPadding lazy)
+      (ensureLazyGlyph textDebug cfg.outputFormat lazyCfg.atlasWidth lazyCfg.atlasHeight lazyCfg.atlasPadding lazy)
       IntMap.empty
       (IntMap.elems glyphMap)
   atlasImg <- snapshotAtlasImage lazy
   let AtlasImage { width = aw, height = ah, format = fmtImg, pixels = px } = atlasImg
       rgbaBytes = bitmapToRgbaBytes fmtImg px
-      pxRange = fromIntegral cfg.range
-      bounds = textBoundsLazy glyphsMap sampleText ttf
+      boundsRaw = scaleBounds renderScale (textBoundsLazy glyphsMap renderText ttf cfg)
+      wrapWidth = fromMaybe (screenW * 0.94) maxWidth
+      fitScale = fitScaleToBox wrapWidth maxHeight boundsRaw
+      bounds = scaleBounds fitScale boundsRaw
+      pxRange = fromIntegral cfg.range * renderScale * fitScale
       penStart' = snapPen (penForCenter (centerX, centerY) bounds)
       texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
-      verts = buildTextVerticesLazy glyphsMap (screenW, screenH) penStart' texel sampleText ttf
+      verts = buildTextVerticesLazyScaled (renderScale * fitScale) glyphsMap (screenW, screenH) penStart' texel renderText ttf cfg
       vtxBytes = BL.toStrict (toLazyByteString (floatListBuilder verts))
       meta = MetaInfo
         { metaAtlasW = aw
@@ -784,9 +1021,9 @@ buildAtlasLazy sampleText cfg ttf label centerX centerY textDebug = do
     , outVertexBytes = vtxBytes
     }
 
-writeAtlas :: FilePath -> MSDF.MSDFConfig -> Bool -> Bool -> Bool -> OutputSpec -> IO ()
-writeAtlas outDir cfgBase lazyAtlas textDebug cacheEnabled spec = do
-  output <- buildAtlas cfgBase lazyAtlas textDebug cacheEnabled spec
+writeAtlas :: FilePath -> MSDF.MSDFConfig -> Int -> Maybe FilePath -> Bool -> Bool -> Bool -> Bool -> OutputSpec -> IO ()
+writeAtlas outDir cfgBase renderPixelSize diskCacheDir lazyAtlas textDebug cacheEnabled timingsEnabled spec = do
+  output <- buildAtlas cfgBase renderPixelSize diskCacheDir lazyAtlas textDebug cacheEnabled timingsEnabled spec
   let emptyOutput = BS.null output.outAtlasBytes
                 || BS.null output.outVertexBytes
                 || output.outMeta.metaAtlasW <= 0
@@ -819,8 +1056,8 @@ buildGlyphMap ttf text =
         Nothing -> acc
   in foldl' add IntMap.empty text
 
-ensureLazyGlyph :: BitmapFormat -> Int -> Int -> Int -> LazyAtlas -> IntMap.IntMap GlyphMSDF -> Int -> IO (IntMap.IntMap GlyphMSDF)
-ensureLazyGlyph outFmt aw ah pad lazy m glyphIndex =
+ensureLazyGlyph :: Bool -> BitmapFormat -> Int -> Int -> Int -> LazyAtlas -> IntMap.IntMap GlyphMSDF -> Int -> IO (IntMap.IntMap GlyphMSDF)
+ensureLazyGlyph debugEnabled outFmt aw ah pad lazy m glyphIndex =
   case IntMap.lookup glyphIndex m of
     Just _ -> pure m
     Nothing -> do
@@ -835,43 +1072,100 @@ ensureLazyGlyph outFmt aw ah pad lazy m glyphIndex =
                     "too large (need " <> show (bw + 2 * pad) <> "x" <> show (bh + 2 * pad)
                       <> " atlas " <> show aw <> "x" <> show ah <> ")"
                 | otherwise = "no space (atlas full?)"
-          logMsg ("lazy atlas: skip glyph " <> show glyphIndex <> " (" <> reason <> ")")
+          let shouldLog = debugEnabled || reason /= "empty bitmap"
+          when shouldLog $
+            logMsg ("lazy atlas: skip glyph " <> show glyphIndex <> " (" <> reason <> ")")
           pure m
         Just _ -> pure (IntMap.insert glyphIndex glyph m)
 
-buildTextVerticesLazy :: IntMap.IntMap GlyphMSDF -> (Double, Double) -> (Double, Double) -> (Double, Double) -> String -> TTF -> [Float]
-buildTextVerticesLazy glyphs screen (penX0, penY) texel text ttf =
-  let step (acc, penX) ch =
-        case lookupCodepointLazy ttf ch of
-          Nothing -> (acc, penX)
-          Just gi ->
-            case IntMap.lookup gi glyphs of
-              Nothing -> (acc, penX)
-              Just glyph ->
-                let GlyphMSDF { advance = adv } = glyph
-                    quad = quadVerts screen (penX, penY) texel glyph
-                    penX' = penX + adv
-                in (quad : acc, penX')
-      (chunks, _) = foldl' step ([], penX0) text
+buildTextVerticesLazy :: IntMap.IntMap GlyphMSDF -> (Double, Double) -> (Double, Double) -> (Double, Double) -> String -> TTF -> MSDF.MSDFConfig -> [Float]
+buildTextVerticesLazy glyphs screen (penX0, penY) texel text ttf cfg =
+  let lineAdvance = lineAdvanceTTF cfg ttf
+      spaceAdv = spaceAdvanceCfg cfg
+      step (acc, penX, penY') ch
+        | ch == '\n' = (acc, penX0, penY' - lineAdvance)
+        | isSpace ch =
+            case lookupCodepointLazy ttf ch of
+              Nothing -> (acc, penX + spaceAdv, penY')
+              Just gi ->
+                case IntMap.lookup gi glyphs of
+                  Nothing -> (acc, penX + spaceAdv, penY')
+                  Just glyph ->
+                    let GlyphMSDF { advance = adv } = glyph
+                    in (acc, penX + adv, penY')
+        | otherwise =
+            case lookupCodepointLazy ttf ch of
+              Nothing -> (acc, penX, penY')
+              Just gi ->
+                case IntMap.lookup gi glyphs of
+                  Nothing -> (acc, penX, penY')
+                  Just glyph ->
+                    let GlyphMSDF { advance = adv } = glyph
+                        quad = quadVerts screen (penX, penY') texel glyph
+                        penX' = penX + adv
+                    in (quad : acc, penX', penY')
+      (chunks, _, _) = foldl' step ([], penX0, penY) text
   in concat (reverse chunks)
 
-textBoundsLazy :: IntMap.IntMap GlyphMSDF -> String -> TTF -> (Double, Double, Double, Double)
-textBoundsLazy glyphs text ttf =
-  let step (penX, acc) ch =
-        case lookupCodepointLazy ttf ch of
-          Nothing -> (penX, acc)
-          Just gi ->
-            case IntMap.lookup gi glyphs of
-              Nothing -> (penX, acc)
-              Just glyph ->
-                let GlyphMSDF { advance = adv } = glyph
-                    (x0, y0, x1, y1) = glyphQuad glyph (penX, 0)
-                    acc' = case acc of
-                      Nothing -> Just (x0, y0, x1, y1)
-                      Just (mnx, mny, mxx, mxy) ->
-                        Just (min mnx x0, min mny y0, max mxx x1, max mxy y1)
-                in (penX + adv, acc')
-      (_, bounds) = foldl' step (0, Nothing) text
+buildTextVerticesLazyScaled :: Double -> IntMap.IntMap GlyphMSDF -> (Double, Double) -> (Double, Double) -> (Double, Double) -> String -> TTF -> MSDF.MSDFConfig -> [Float]
+buildTextVerticesLazyScaled scale glyphs screen (penX0, penY) texel text ttf cfg =
+  let lineAdvance = lineAdvanceTTF cfg ttf * scale
+      spaceAdv = spaceAdvanceCfg cfg * scale
+      step (acc, penX, penY') ch
+        | ch == '\n' = (acc, penX0, penY' - lineAdvance)
+        | isSpace ch =
+            case lookupCodepointLazy ttf ch of
+              Nothing -> (acc, penX + spaceAdv, penY')
+              Just gi ->
+                case IntMap.lookup gi glyphs of
+                  Nothing -> (acc, penX + spaceAdv, penY')
+                  Just glyph ->
+                    let GlyphMSDF { advance = adv } = glyph
+                    in (acc, penX + adv * scale, penY')
+        | otherwise =
+            case lookupCodepointLazy ttf ch of
+              Nothing -> (acc, penX, penY')
+              Just gi ->
+                case IntMap.lookup gi glyphs of
+                  Nothing -> (acc, penX, penY')
+                  Just glyph ->
+                    let GlyphMSDF { advance = adv } = glyph
+                        quad = quadVertsScaled scale screen (penX, penY') texel glyph
+                        penX' = penX + adv * scale
+                    in (quad : acc, penX', penY')
+      (chunks, _, _) = foldl' step ([], penX0, penY) text
+  in concat (reverse chunks)
+
+textBoundsLazy :: IntMap.IntMap GlyphMSDF -> String -> TTF -> MSDF.MSDFConfig -> (Double, Double, Double, Double)
+textBoundsLazy glyphs text ttf cfg =
+  let lineAdvance = lineAdvanceTTF cfg ttf
+      spaceAdv = spaceAdvanceCfg cfg
+      step (penX, penY', acc) ch
+        | ch == '\n' = (0, penY' - lineAdvance, acc)
+        | isSpace ch =
+            case lookupCodepointLazy ttf ch of
+              Nothing -> (penX + spaceAdv, penY', acc)
+              Just gi ->
+                case IntMap.lookup gi glyphs of
+                  Nothing -> (penX + spaceAdv, penY', acc)
+                  Just glyph ->
+                    let GlyphMSDF { advance = adv } = glyph
+                    in (penX + adv, penY', acc)
+        | otherwise =
+            case lookupCodepointLazy ttf ch of
+              Nothing -> (penX, penY', acc)
+              Just gi ->
+                case IntMap.lookup gi glyphs of
+                  Nothing -> (penX, penY', acc)
+                  Just glyph ->
+                    let GlyphMSDF { advance = adv } = glyph
+                        (x0, y0, x1, y1) = glyphQuad glyph (penX, penY')
+                        acc' = case acc of
+                          Nothing -> Just (x0, y0, x1, y1)
+                          Just (mnx, mny, mxx, mxy) ->
+                            Just (min mnx x0, min mny y0, max mxx x1, max mxy y1)
+                    in (penX + adv, penY', acc')
+      (_, _, bounds) = foldl' step (0, 0, Nothing) text
   in case bounds of
        Just b -> b
        Nothing -> (0, 0, 0, 0)
@@ -1038,6 +1332,7 @@ applyCliOverrides opts cfg =
         }
     , MSDF.outline = outlineCfg
         { MSDF.windingFlatness = fromMaybe outlineCfg.windingFlatness opts.flatnessOpt
+        , MSDF.splitIntersections = fromMaybe outlineCfg.splitIntersections opts.splitOpt
         }
     , MSDF.distance = distCfg
         { MSDF.signMode = fromMaybe distCfg.signMode opts.signModeOpt
@@ -1070,6 +1365,8 @@ parseArgs ("--conflict":x:rest) opts =
   parseDouble "conflict" x (\v -> opts { conflictOpt = Just v }) rest
 parseArgs ("--flatness":x:rest) opts =
   parseDouble "flatness" x (\v -> opts { flatnessOpt = Just v }) rest
+parseArgs ("--split-intersections":rest) opts = parseArgs rest opts { splitOpt = Just True }
+parseArgs ("--no-split-intersections":rest) opts = parseArgs rest opts { splitOpt = Just False }
 parseArgs ("--sign-mode":v:rest) opts =
   case parseSignMode v of
     Just mode -> parseArgs rest opts { signModeOpt = Just mode }
@@ -1167,24 +1464,113 @@ bitmapToRgbaBytes fmt arr =
 floatListBuilder :: [Float] -> Builder
 floatListBuilder = foldMap floatLE
 
+formatMs :: Double -> String
+formatMs ms = showFFloat (Just 2) ms "ms"
+
+logTimings :: String -> BuildTimings -> IO ()
+logTimings label timings =
+  let BuildTimings
+        { totalMs = total
+        , renderMs = render
+        , packPlaceMs = place
+        , packImageMs = image
+        , kerningMs = kern
+        , marksMs = marks
+        , packRectCount = rects
+        , atlasSize = atlas
+        } = timings
+      atlasStr = case atlas of
+        Nothing -> "none"
+        Just (w, h) -> show w <> "x" <> show h
+  in logMsg
+      ( "timing[" <> label <> "]: total=" <> formatMs total
+        <> " render=" <> formatMs render
+        <> " packPlace=" <> formatMs place
+        <> " packImage=" <> formatMs image
+        <> " kerning=" <> formatMs kern
+        <> " marks=" <> formatMs marks
+        <> " rects=" <> show rects
+        <> " atlas=" <> atlasStr
+      )
+
 buildTextVertices :: MSDFAtlas -> (Double, Double) -> (Double, Double) -> (Double, Double) -> String -> [Float]
 buildTextVertices atlas screen (penX0, penY) texel text =
   let MSDFAtlas { glyphs = glyphsArr } = atlas
-      step (acc, penX) ch =
-        case lookupCodepoint atlas (ord ch) of
-          Nothing -> (acc, penX)
-          Just gi ->
-            let glyph = glyphsArr ! gi
-                GlyphMSDF { advance = adv } = glyph
-                quad = quadVerts screen (penX, penY) texel glyph
-                penX' = penX + adv
-            in (quad : acc, penX')
-      (chunks, _) = foldl' step ([], penX0) text
+      lineAdvance = lineAdvanceAtlas atlas
+      spaceAdv = spaceAdvanceAtlas atlas
+      step (acc, penX, penY') ch
+        | ch == '\n' = (acc, penX0, penY' - lineAdvance)
+        | isSpace ch =
+            case lookupCodepoint atlas (ord ch) of
+              Nothing -> (acc, penX + spaceAdv, penY')
+              Just gi ->
+                let glyph = glyphsArr ! gi
+                    GlyphMSDF { advance = adv } = glyph
+                in (acc, penX + adv, penY')
+        | otherwise =
+            case lookupCodepoint atlas (ord ch) of
+              Nothing -> (acc, penX, penY')
+              Just gi ->
+                let glyph = glyphsArr ! gi
+                    GlyphMSDF { advance = adv } = glyph
+                    quad = quadVerts screen (penX, penY') texel glyph
+                    penX' = penX + adv
+                in (quad : acc, penX', penY')
+      (chunks, _, _) = foldl' step ([], penX0, penY) text
+  in concat (reverse chunks)
+
+buildTextVerticesScaled :: Double -> MSDFAtlas -> (Double, Double) -> (Double, Double) -> (Double, Double) -> String -> [Float]
+buildTextVerticesScaled scale atlas screen (penX0, penY) texel text =
+  let MSDFAtlas { glyphs = glyphsArr } = atlas
+      lineAdvance = lineAdvanceAtlas atlas * scale
+      spaceAdv = spaceAdvanceAtlas atlas * scale
+      step (acc, penX, penY') ch
+        | ch == '\n' = (acc, penX0, penY' - lineAdvance)
+        | isSpace ch =
+            case lookupCodepoint atlas (ord ch) of
+              Nothing -> (acc, penX + spaceAdv, penY')
+              Just gi ->
+                let glyph = glyphsArr ! gi
+                    GlyphMSDF { advance = adv } = glyph
+                in (acc, penX + adv * scale, penY')
+        | otherwise =
+            case lookupCodepoint atlas (ord ch) of
+              Nothing -> (acc, penX, penY')
+              Just gi ->
+                let glyph = glyphsArr ! gi
+                    GlyphMSDF { advance = adv } = glyph
+                    quad = quadVertsScaled scale screen (penX, penY') texel glyph
+                    penX' = penX + adv * scale
+                in (quad : acc, penX', penY')
+      (chunks, _, _) = foldl' step ([], penX0, penY) text
   in concat (reverse chunks)
 
 quadVerts :: (Double, Double) -> (Double, Double) -> (Double, Double) -> GlyphMSDF -> [Float]
 quadVerts screen pen texel glyph =
   let (x0, y0, x1, y1) = glyphQuad glyph pen
+      (u0, v0, u1, v1) = insetUV texel (glyphUV glyph)
+      (cx0, cy0) = toClip screen (x0, y0)
+      (cx1, cy1) = toClip screen (x1, y1)
+  in [ cx0, cy0, realToFrac u0, realToFrac v0
+     , cx1, cy0, realToFrac u1, realToFrac v0
+     , cx1, cy1, realToFrac u1, realToFrac v1
+     , cx0, cy0, realToFrac u0, realToFrac v0
+     , cx1, cy1, realToFrac u1, realToFrac v1
+     , cx0, cy1, realToFrac u0, realToFrac v1
+     ]
+
+glyphQuadScaled :: Double -> GlyphMSDF -> (Double, Double) -> (Double, Double, Double, Double)
+glyphQuadScaled scale glyph (penX, penY) =
+  let bmp = glyph.bitmap
+      x0 = penX + bmp.offsetX * scale
+      y0 = penY + bmp.offsetY * scale
+      x1 = x0 + fromIntegral bmp.width * scale
+      y1 = y0 + fromIntegral bmp.height * scale
+  in (x0, y0, x1, y1)
+
+quadVertsScaled :: Double -> (Double, Double) -> (Double, Double) -> (Double, Double) -> GlyphMSDF -> [Float]
+quadVertsScaled scale screen pen texel glyph =
+  let (x0, y0, x1, y1) = glyphQuadScaled scale glyph pen
       (u0, v0, u1, v1) = insetUV texel (glyphUV glyph)
       (cx0, cy0) = toClip screen (x0, y0)
       (cx1, cy1) = toClip screen (x1, y1)
@@ -1211,22 +1597,151 @@ insetUV (du, dv) (u0, v0, u1, v1) =
 textBounds :: MSDFAtlas -> String -> (Double, Double, Double, Double)
 textBounds atlas text =
   let MSDFAtlas { glyphs = glyphsArr } = atlas
-      step (penX, acc) ch =
-        case lookupCodepoint atlas (ord ch) of
-          Nothing -> (penX, acc)
-          Just gi ->
-            let glyph = glyphsArr ! gi
-                GlyphMSDF { advance = adv } = glyph
-                (x0, y0, x1, y1) = glyphQuad glyph (penX, 0)
-                acc' = case acc of
-                  Nothing -> Just (x0, y0, x1, y1)
-                  Just (mnx, mny, mxx, mxy) ->
-                    Just (min mnx x0, min mny y0, max mxx x1, max mxy y1)
-            in (penX + adv, acc')
-      (_, bounds) = foldl' step (0, Nothing) text
+      lineAdvance = lineAdvanceAtlas atlas
+      spaceAdv = spaceAdvanceAtlas atlas
+      step (penX, penY', acc) ch
+        | ch == '\n' = (0, penY' - lineAdvance, acc)
+        | isSpace ch =
+            case lookupCodepoint atlas (ord ch) of
+              Nothing -> (penX + spaceAdv, penY', acc)
+              Just gi ->
+                let glyph = glyphsArr ! gi
+                    GlyphMSDF { advance = adv } = glyph
+                in (penX + adv, penY', acc)
+        | otherwise =
+            case lookupCodepoint atlas (ord ch) of
+              Nothing -> (penX, penY', acc)
+              Just gi ->
+                let glyph = glyphsArr ! gi
+                    GlyphMSDF { advance = adv } = glyph
+                    (x0, y0, x1, y1) = glyphQuad glyph (penX, penY')
+                    acc' = case acc of
+                      Nothing -> Just (x0, y0, x1, y1)
+                      Just (mnx, mny, mxx, mxy) ->
+                        Just (min mnx x0, min mny y0, max mxx x1, max mxy y1)
+                in (penX + adv, penY', acc')
+      (_, _, bounds) = foldl' step (0, 0, Nothing) text
   in case bounds of
        Just b -> b
        Nothing -> (0, 0, 0, 0)
+
+scaleBounds :: Double -> (Double, Double, Double, Double) -> (Double, Double, Double, Double)
+scaleBounds scale (x0, y0, x1, y1) =
+  (x0 * scale, y0 * scale, x1 * scale, y1 * scale)
+
+fitScaleToWidth :: Double -> (Double, Double, Double, Double) -> Double
+fitScaleToWidth maxWidth (x0, _y0, x1, _y1) =
+  let w = max 0 (x1 - x0)
+  in if w <= 0
+     then 1
+     else min 1 (maxWidth / w)
+
+fitScaleToBox :: Double -> Maybe Double -> (Double, Double, Double, Double) -> Double
+fitScaleToBox maxWidth maxHeight bounds =
+  let widthScale = fitScaleToWidth maxWidth bounds
+      heightScale = case maxHeight of
+        Nothing -> 1
+        Just mh ->
+          let h = max 0 (boundsHeight bounds)
+          in if h <= 0 then 1 else min 1 (mh / h)
+  in min widthScale heightScale
+
+boundsHeight :: (Double, Double, Double, Double) -> Double
+boundsHeight (_x0, y0, _x1, y1) = y1 - y0
+
+lineAdvanceAtlas :: MSDFAtlas -> Double
+lineAdvanceAtlas atlas =
+  fromIntegral (atlas.ascent - atlas.descent + atlas.lineGap)
+
+lineAdvanceTTF :: MSDF.MSDFConfig -> TTF -> Double
+lineAdvanceTTF cfg ttf =
+  let MSDF.TTF.Parser.Head { unitsPerEm = upem } = ttf.head
+      MSDF.TTF.Parser.Hhea { ascent = asc, descent = desc, lineGap = gap0 } = ttf.hhea
+      unitsPerEm = fromIntegral upem :: Double
+      scale = fromIntegral cfg.pixelSize / unitsPerEm
+      ascent = fromIntegral asc :: Double
+      descent = fromIntegral desc :: Double
+      gap = fromIntegral gap0 :: Double
+  in (ascent - descent + gap) * scale
+
+spaceAdvanceAtlas :: MSDFAtlas -> Double
+spaceAdvanceAtlas atlas =
+  fromIntegral atlas.pixelSize * 0.5
+
+spaceAdvanceCfg :: MSDF.MSDFConfig -> Double
+spaceAdvanceCfg cfg =
+  fromIntegral cfg.pixelSize * 0.5
+
+wrapTextForWidth :: Double -> Double -> MSDF.MSDFConfig -> TTF -> String -> String
+wrapTextForWidth maxWidth scale cfg ttf text =
+  let Cmap maps = ttf.cmap
+      loc =
+        case ttf.variations of
+          Nothing -> Nothing
+          Just vars ->
+            let loc' = normalizeLocation vars.fvar vars.avar cfg.variations
+            in if isDefaultLocation loc' then Nothing else Just loc'
+      spaceAdv = spaceAdvanceCfg cfg
+      advanceForGlyph =
+        let go cache gi =
+              case IntMap.lookup gi cache of
+                Just v -> (v, cache)
+                Nothing ->
+                  let GlyphMSDF { advance = adv } = glyphMetricsOnlyAt loc cfg ttf gi
+                      cache' = IntMap.insert gi adv cache
+                  in (adv, cache')
+        in go
+      advanceForChar cache ch =
+        case lookup (ord ch) maps of
+          Just gi ->
+            let (adv, cache') = advanceForGlyph cache gi
+            in (adv, cache')
+          Nothing ->
+            if isSpace ch
+            then (spaceAdv, cache)
+            else (0, cache)
+      tokenized = tokenizeWrap text
+      spaceWidth = spaceAdv * scale
+      wordWidth cache w =
+        foldl' (\(acc, c) ch -> let (adv, c') = advanceForChar c ch in (acc + adv * scale, c')) (0, cache) w
+      go [] cache lineWords lineW lines =
+        let line = unwords (reverse lineWords)
+            lines' = if null line then lines else line : lines
+        in (reverse lines', cache)
+      go (tok:toks) cache lineWords lineW lines =
+        case tok of
+          WrapNewline ->
+            let line = unwords (reverse lineWords)
+                lines' = if null line then lines else line : lines
+            in go toks cache [] 0 lines'
+          WrapWord w ->
+            let (wWidth, cache') = wordWidth cache w
+                extra = if null lineWords then 0 else spaceWidth
+                newW = lineW + extra + wWidth
+            in if lineW > 0 && newW > maxWidth
+               then
+                 let line = unwords (reverse lineWords)
+                     lines' = if null line then lines else line : lines
+                 in go toks cache' [w] wWidth lines'
+               else
+                 go toks cache' (w : lineWords) newW lines
+      (linesOut, _) = go tokenized IntMap.empty [] 0 []
+  in case linesOut of
+       [] -> ""
+       _ -> intercalate "\n" linesOut
+
+data WrapToken = WrapWord String | WrapNewline
+
+tokenizeWrap :: String -> [WrapToken]
+tokenizeWrap =
+  let flush acc toks =
+        if null acc then toks else WrapWord (reverse acc) : toks
+      go acc toks [] = reverse (flush acc toks)
+      go acc toks (c:cs)
+        | c == '\n' = go [] (WrapNewline : flush acc toks) cs
+        | isSpace c = go [] (flush acc toks) cs
+        | otherwise = go (c:acc) toks cs
+  in go [] []
 
 penForCenter :: (Double, Double) -> (Double, Double, Double, Double) -> (Double, Double)
 penForCenter (cx, cy) (minX, minY, maxX, maxY) =

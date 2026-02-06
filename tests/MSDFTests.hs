@@ -113,6 +113,7 @@ main = do
     , runTest "bitmap hash" (testBitmapHash ttf cfgSmall)
     , runTest "bitmap hash variable" (testBitmapHashVariable ttf)
     , runTest "bitmap hash italic" (testBitmapHashItalic ttfItalic)
+    , runTest "split preprocess regression" (testSplitPreprocessRegression ttf)
     , runTest "atlas speckle msdf" (testAtlasSpeckle ttf BitmapMSDF)
     , runTest "atlas speckle mtsdf" (testAtlasSpeckle ttf BitmapMTSDF)
     , runTest "composite variation" (testCompositeVariation ttf)
@@ -862,6 +863,60 @@ testBitmapHashItalic ttf = do
       h2 = bitmapHash glyph2
   assertEq "bitmap hash italic stable" h1 h2 ("bitmap hash italic changed between runs: " ++ show h1 ++ " vs " ++ show h2)
 
+testSplitPreprocessRegression :: TTF -> IO ()
+testSplitPreprocessRegression ttf = do
+  let cfg0 = defaultMSDFConfig
+      cfgSplit = cfg0
+        { MSDF.pixelSize = 128
+        , MSDF.range = 12
+        , MSDF.outputFormat = BitmapMSDF
+        , MSDF.outline = cfg0.outline
+            { MSDF.splitIntersections = True
+            , MSDF.preprocess = False
+            }
+        , MSDF.distance = cfg0.distance
+            { MSDF.signMode = MSDF.SignScanline
+            , MSDF.overlapSupport = True
+            , MSDF.pseudoDistance = True
+            }
+        }
+      cfgPre = cfgSplit
+        { MSDF.outline = cfgSplit.outline
+            { MSDF.preprocess = True
+            }
+        }
+      cps = [101, 111] -- e, o
+  mapM_ (checkGlyph cfgSplit cfgPre) cps
+  where
+    checkGlyph cfgSplit cfgPre cp =
+      case lookupCodepointList cp ttf.cmap.mappings of
+        Nothing -> assert False ("missing glyph for codepoint " ++ show cp)
+        Just glyphIndex -> do
+          let glyphSplit = renderGlyphMSDF cfgSplit ttf glyphIndex
+              glyphPre1 = renderGlyphMSDF cfgPre ttf glyphIndex
+              glyphPre2 = renderGlyphMSDF cfgPre ttf glyphIndex
+              bmpSplit = glyphSplit.bitmap
+              bmpPre = glyphPre1.bitmap
+              hPre1 = bitmapHash glyphPre1
+              hPre2 = bitmapHash glyphPre2
+          assertEq ("split+preprocess deterministic cp " ++ show cp) hPre1 hPre2
+            ("split+preprocess hash changed between runs for cp " ++ show cp)
+          assert (bmpSplit.width == bmpPre.width && bmpSplit.height == bmpPre.height)
+            ("split/preprocess bitmap dimensions mismatch for cp " ++ show cp)
+          let total = bmpSplit.width * bmpSplit.height
+              insideSplit = bitmapInsideCount bmpSplit
+              insidePre = bitmapInsideCount bmpPre
+              changed = insideMaskDiffCount bmpSplit bmpPre
+              insideDelta = abs (insidePre - insideSplit)
+              maxChanged = max 64 (total `div` 20) -- 5%
+              maxInsideDelta = max 48 (total `div` 25) -- 4%
+          assert (insidePre > total `div` 20 && insidePre < (total * 19) `div` 20)
+            ("split+preprocess produced degenerate coverage for cp " ++ show cp)
+          assert (changed <= maxChanged)
+            ("split+preprocess changed too many inside pixels for cp " ++ show cp ++ ": " ++ show changed ++ " / " ++ show total)
+          assert (insideDelta <= maxInsideDelta)
+            ("split+preprocess coverage drift too high for cp " ++ show cp ++ ": " ++ show insideDelta ++ " / " ++ show total)
+
 testAtlasSpeckle :: TTF -> BitmapFormat -> IO ()
 testAtlasSpeckle ttf fmt = do
   let sampleText = "masdiff"
@@ -1126,6 +1181,36 @@ findSpecklePixels img range =
        , let insideNeighbors = length [ () | sdN <- stableNeighbors, isInside sdN ]
        , insideNeighbors >= 7
        ]
+
+bitmapInsideCount :: MSDFBitmap -> Int
+bitmapInsideCount bmp =
+  let total = bmp.width * bmp.height
+  in foldl' (\acc i -> if bitmapInsideAt bmp i then acc + 1 else acc) 0 [0 .. total - 1]
+
+insideMaskDiffCount :: MSDFBitmap -> MSDFBitmap -> Int
+insideMaskDiffCount a b =
+  let totalA = a.width * a.height
+      totalB = b.width * b.height
+      total = min totalA totalB
+  in foldl'
+      (\acc i -> if bitmapInsideAt a i /= bitmapInsideAt b i then acc + 1 else acc)
+      0
+      [0 .. total - 1]
+
+bitmapInsideAt :: MSDFBitmap -> Int -> Bool
+bitmapInsideAt bmp i =
+  let channels = bitmapChannels bmp.format
+      base = i * channels
+      chan ix = fromIntegral (bmp.pixels UA.! (base + ix)) / 255
+  in case bmp.format of
+       BitmapMSDF ->
+         let r = chan 0
+             g = chan 1
+             b = chan 2
+         in median3 r g b > 0.5
+       BitmapMTSDF ->
+         let a = chan 3
+         in a > 0.5
 
 median3 :: Double -> Double -> Double -> Double
 median3 a b c = max (min a b) (min (max a b) c)

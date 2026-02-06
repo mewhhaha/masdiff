@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+
 module MSDF.Distance
   ( EdgeIndex(..)
   , buildEdgeIndex
@@ -67,17 +69,12 @@ minDistanceSq idx p@(px', py') =
      else
        let (cx, cy) = pointCell idx p
            maxR = max idx.gridW idx.gridH
-           go r bestSq =
+           go !r !bestSq =
              let minX = max 0 (cx - r)
                  maxX = min (idx.gridW - 1) (cx + r)
                  minY = max 0 (cy - r)
                  maxY = min (idx.gridH - 1) (cy + r)
-                 bestSq' = foldl' (scanCell idx p) bestSq
-                              [ (x, y)
-                              | y <- [minY .. maxY]
-                              , x <- [minX .. maxX]
-                              , r == 0 || x == minX || x == maxX || y == minY || y == maxY
-                              ]
+                 bestSq' = scanRing r minX maxX minY maxY bestSq
                  minBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py')
                  fullGrid = minX == 0 && maxX == idx.gridW - 1 && minY == 0 && maxY == idx.gridH - 1
              in if bestSq' < 1e18 && bestSq' <= minBoundary * minBoundary
@@ -85,13 +82,29 @@ minDistanceSq idx p@(px', py') =
                 else if fullGrid || r >= maxR
                      then bestSq'
                      else go (r + 1) bestSq'
+           scanRing !r !minX !maxX !minY !maxY !best0 = goY minY best0
+             where
+               goY !y !best
+                 | y > maxY = best
+                 | otherwise = goY (y + 1) (goX y minX best)
+               goX !y !x !best
+                 | x > maxX = best
+                 | r /= 0 && x /= minX && x /= maxX && y /= minY && y /= maxY = goX y (x + 1) best
+                 | otherwise =
+                     let !best' = scanCell idx p best (x, y)
+                     in goX y (x + 1) best'
        in go 0 1e18
 
 scanCell :: EdgeIndex -> Vec2 -> Double -> (Int, Int) -> Double
 scanCell idx p bestSq (x, y) =
   let cellIdx = cellIndex idx.gridW x y
       edgeIdxs = idx.cells ! cellIdx
-  in foldl' (\acc i -> min acc (edgeDistanceSq p (idx.edges ! i).edge)) bestSq edgeIdxs
+      go !acc [] = acc
+      go !acc (i:is) =
+        let !d = edgeDistanceSq p (idx.edges ! i).edge
+            !acc' = if d < acc then d else acc
+        in go acc' is
+  in go bestSq edgeIdxs
 
 distanceToBoundary :: EdgeIndex -> (Int, Int) -> (Int, Int) -> Vec2 -> Double
 distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py') =

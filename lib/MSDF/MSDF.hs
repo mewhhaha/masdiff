@@ -14,6 +14,7 @@ module MSDF.MSDF
   , GlyphCache(..)
   , GlyphCacheLazy(..)
   , defaultMSDFConfig
+  , effectiveParallelism
   , prepareGlyphCache
   , prepareGlyphCacheLazy
   , renderGlyphMSDF
@@ -23,21 +24,28 @@ module MSDF.MSDF
   , glyphMetricsOnlyAt
   ) where
 
-import Control.Monad (forM_, foldM)
-import Control.Monad.ST (ST, runST)
+import Control.Monad (forM, forM_, foldM, when)
+import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar)
+import GHC.Clock (getMonotonicTimeNSec)
+import Text.Printf (printf)
 import Data.Array (Array, array, accumArray)
 import Data.Array.IArray (bounds, (!))
-import Data.Array.ST (STUArray, newArray, readArray, writeArray, freeze)
+import Data.Array.IO (IOUArray)
+import Data.Array.MArray (newArray, readArray, writeArray, freeze)
+import Data.Array.ST (STUArray, runSTUArray, thaw)
 import Data.Array.Unboxed (UArray, listArray)
+import qualified Data.Array.Unboxed as UA
+import Control.Monad.ST (ST, runST)
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
-import Data.List (sortOn, foldl')
+import Data.List (sort, sortOn, mapAccumL)
 import Data.Maybe (mapMaybe)
 import Data.Char (toLower)
 import qualified Data.IntSet as IntSet
+import qualified Data.Set as Set
 import Data.Ord (Down(..))
-import Data.Bits ((.&.))
+import Data.Bits ((.&.), (.|.), shiftL, shiftR)
 import Data.Word (Word8)
 import MSDF.Config
 import MSDF.EdgeColoring (colorEdges)
@@ -60,7 +68,7 @@ import MSDF.Geometry
   )
 import MSDF.Outline (Point(..), Edge(..), contourToEdges, edgeStartDir, edgeEndDir)
 import MSDF.TTF.Parser
-import MSDF.TTF.Variations (applyGvarToContours, componentDeltas, hvarDeltas, vvarDeltas)
+import MSDF.TTF.Variations (applyGvarToContours, componentDeltas, hvarDeltas, isDefaultLocation, vvarDeltas)
 import MSDF.Types
 import Debug.Trace (trace)
 import System.Environment (lookupEnv)
@@ -75,7 +83,7 @@ defaultMSDFConfig = MSDFConfig
   , glyphSet = GlyphSetAll
   , variations = []
   , outputFormat = BitmapMSDF
-  , parallelism = msdfDefaultParallelism
+  , parallelism = 0
   , atlas = AtlasConfig
       { packAtlas = True
       , atlasPadding = 1
@@ -89,6 +97,7 @@ defaultMSDFConfig = MSDFConfig
       , contourEpsilon = 1e-6
       , normalizeOrientation = True
       , splitIntersections = True
+      , preprocess = False
       }
   , coloring = EdgeColoringConfig
       { cornerAngleDeg = 3.0
@@ -126,18 +135,38 @@ msdfTraceEnabled = unsafePerformIO $ do
   pure enabled
 {-# NOINLINE msdfTraceEnabled #-}
 
-msdfDefaultParallelism :: Int
-msdfDefaultParallelism = unsafePerformIO $ do
+msdfRenderTimingsEnabled :: Bool
+msdfRenderTimingsEnabled = unsafePerformIO $ do
+  v <- lookupEnv "MSDF_RENDER_TIMINGS"
+  let enabled = case fmap (map toLower) v of
+        Just "1" -> True
+        Just "true" -> True
+        Just "yes" -> True
+        Just "on" -> True
+        _ -> False
+  pure enabled
+{-# NOINLINE msdfRenderTimingsEnabled #-}
+
+msdfAutoParallelism :: Int
+msdfAutoParallelism = unsafePerformIO $ do
   v <- lookupEnv "MSDF_PARALLELISM"
   let parseInt s = case reads s of
         [(n, "")] -> Just n
         _ -> Nothing
   case v >>= parseInt of
-    Just n | n >= 0 -> pure n
+    Just n | n > 0 -> pure n
     _ -> do
       procs <- getNumProcessors
-      if procs > 0 then pure procs else getNumCapabilities
-{-# NOINLINE msdfDefaultParallelism #-}
+      caps <- getNumCapabilities
+      let p = if procs > 0 then procs else 1
+      let c = max 1 caps
+      pure (max p c)
+{-# NOINLINE msdfAutoParallelism #-}
+
+effectiveParallelism :: Int -> Int
+effectiveParallelism n
+  | n > 0 = n
+  | otherwise = msdfAutoParallelism
 
 msdfSplitMaxSegs :: Int
 msdfSplitMaxSegs = unsafePerformIO $ do
@@ -150,6 +179,18 @@ msdfSplitMaxSegs = unsafePerformIO $ do
         _ -> 20000
   pure maxSegs
 {-# NOINLINE msdfSplitMaxSegs #-}
+
+msdfParallelPixelsMin :: Int
+msdfParallelPixelsMin = unsafePerformIO $ do
+  v <- lookupEnv "MSDF_PARALLEL_PIXELS_MIN"
+  let parseInt s = case reads s of
+        [(n, "")] -> Just n
+        _ -> Nothing
+      threshold = case v >>= parseInt of
+        Just n | n > 0 -> n
+        _ -> 65536
+  pure threshold
+{-# NOINLINE msdfParallelPixelsMin #-}
 
 msdfSplitGridSize :: Double
 msdfSplitGridSize = unsafePerformIO $ do
@@ -198,6 +239,18 @@ msdfSplitGridMaxIters = unsafePerformIO $ do
         _ -> 6
   pure iters
 {-# NOINLINE msdfSplitGridMaxIters #-}
+
+msdfPseudoCornerDeg :: Double
+msdfPseudoCornerDeg = unsafePerformIO $ do
+  v <- lookupEnv "MSDF_PSEUDO_CORNER_DEG"
+  let parseD s = case reads s of
+        [(n, "")] -> Just n
+        _ -> Nothing
+      deg = case v >>= parseD of
+        Just n | n >= 0 -> n
+        _ -> 3.0
+  pure deg
+{-# NOINLINE msdfPseudoCornerDeg #-}
 
 msdfOverlapMaxPairs :: Int
 msdfOverlapMaxPairs = unsafePerformIO $ do
@@ -258,6 +311,18 @@ msdfMaxBitmapPixels = unsafePerformIO $ do
     _ -> pure 0
 {-# NOINLINE msdfMaxBitmapPixels #-}
 
+msdfPreprocessEnabled :: Bool
+msdfPreprocessEnabled = unsafePerformIO $ do
+  v <- lookupEnv "MSDF_PREPROCESS"
+  let enabled = case fmap (map toLower) v of
+        Just "1" -> True
+        Just "true" -> True
+        Just "yes" -> True
+        Just "on" -> True
+        _ -> False
+  pure enabled
+{-# NOINLINE msdfPreprocessEnabled #-}
+
 data GlyphCache = GlyphCache
   { location :: Maybe VariationLocation
   , contours :: Array Int [[Point]]
@@ -272,7 +337,9 @@ variationLocation :: MSDFConfig -> TTF -> Maybe VariationLocation
 variationLocation cfg ttf =
   case ttf.variations of
     Nothing -> Nothing
-    Just vars -> Just (normalizeLocation vars.fvar vars.avar cfg.variations)
+    Just vars ->
+      let loc = normalizeLocation vars.fvar vars.avar cfg.variations
+      in if isDefaultLocation loc then Nothing else Just loc
 
 renderGlyphMSDF :: MSDFConfig -> TTF -> Int -> GlyphMSDF
 renderGlyphMSDF cfg ttf glyphIndex =
@@ -319,7 +386,7 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours phantomMaybe =
                      else edgesByContour0
                  edgesByContour2 =
                    traceStage "msdf: preprocess contours" $
-                     if cfg.outline.splitIntersections
+                     if cfg.outline.splitIntersections && (cfg.outline.preprocess || msdfPreprocessEnabled)
                      then preprocessContours cfg.outline cfg.distance.fillRule edgesByContour1
                      else edgesByContour1
                  edgesByContour = map (filterDegenerateEdges eps) edgesByContour2
@@ -329,11 +396,7 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours phantomMaybe =
                    if cfg.distance.overlapSupport
                    then
                      let overlapFlags = traceStage "msdf: compute overlaps" (computeEdgeOverlaps cfg.outline.windingFlatness cfg.outline.contourEpsilon allInfos0)
-                         overlapMap = Map.fromList
-                           [ (edgeKey info, flag)
-                           | (info, flag) <- zip allInfos0 overlapFlags
-                           ]
-                     in traceStage "msdf: apply overlap flags" (map (map (applyOverlapFlag overlapMap)) edgeInfosByContour0)
+                     in traceStage "msdf: apply overlap flags" (applyOverlapFlagsByOrder edgeInfosByContour0 overlapFlags)
                    else edgeInfosByContour0
                  coloredEdges = traceStage "msdf: edge coloring" (colorEdges cfg.coloring edgesByContour)
                  coloredInfos0 = traceStage "msdf: attach edge info" (attachEdgeInfo edgeInfosByContour coloredEdges)
@@ -341,7 +404,7 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours phantomMaybe =
                  segsAll = traceStage "msdf: flatten edges all" (flattenEdges cfg.outline.windingFlatness [ info.edge | info <- allEdges0 ])
                  segsByContour = traceStage "msdf: flatten edges by contour" (map (flattenEdges cfg.outline.windingFlatness) edgesByContour)
                  coloredInfos =
-                   if cfg.distance.overlapSupport
+                  if cfg.distance.overlapSupport
                    then
                      let filtered =
                            filterBoundaryEdges
@@ -350,25 +413,25 @@ renderGlyphMSDFWithContours loc cfg ttf glyphIndex contours phantomMaybe =
                              cfg.outline.windingFlatness
                              segsAll
                              segsByContour
-                             cfg.outline.splitIntersections
+                             False
                              coloredInfos0
                      in if null filtered then coloredInfos0 else filtered
                    else coloredInfos0
+                 segsSignFinal = segsAll
              in if null coloredInfos
                 then base
                 else
                   let padding = fromIntegral (safeRange + 1) :: Double
                       width = max 1 (ceiling ((bbox.xMax - bbox.xMin) + 2 * padding))
                       height = max 1 (ceiling ((bbox.yMax - bbox.yMin) + 2 * padding))
-                      area = width * height
                       offsetX = bbox.xMin - padding
                       offsetY = bbox.yMin - padding
                       !_ = traceStage
                         ("msdf: bitmap size " <> show width <> "x" <> show height
-                          <> " pixels=" <> show area <> " bbox=" <> show bbox)
+                          <> " pixels=" <> show (width * height) <> " bbox=" <> show bbox)
                         ()
                   in
-                    let pixels = traceStage "msdf: render bitmap" (renderBitmap cfg width height offsetX offsetY coloredInfos segsAll segsByContour)
+                    let pixels = traceStage "msdf: render bitmap" (renderBitmap cfg width height offsetX offsetY coloredInfos segsSignFinal segsByContour)
                     in GlyphMSDF
                       { index = glyphIndex
                       , codepoints = []
@@ -632,13 +695,27 @@ buildContourInfo cfg contourId edges =
           endDirs = map (normalizeVec . edgeEndDir) edges
           startNormals = map (interiorNormal orient) startDirs
           endNormals = map (interiorNormal orient) endDirs
+          pseudoCornerThreshold = max 0 (msdfPseudoCornerDeg * pi / 180)
+          angleBetween a b =
+            if nearZero a || nearZero b
+            then 0
+            else
+              let cosang = max (-1) (min 1 (dot a b))
+              in acos cosang
+          cornerAtVertex i =
+            let prevIdx = (i - 1 + n) `mod` n
+                prevDir = endDirs !! prevIdx
+                currDir = startDirs !! i
+            in angleBetween prevDir currDir > pseudoCornerThreshold
           pseudoAtVertex i =
             let prevIdx = (i - 1 + n) `mod` n
                 nPrev = endNormals !! prevIdx
                 nCurr = startNormals !! i
                 summed = vecAdd nPrev nCurr
                 pn = normalizeVec summed
-            in if nearZero pn then nCurr else pn
+            in if not (cornerAtVertex i)
+               then (0, 0)
+               else if nearZero pn then nCurr else pn
           pseudoStarts = [ pseudoAtVertex i | i <- [0 .. n - 1] ]
           pseudoEnds = [ pseudoAtVertex ((i + 1) `mod` n) | i <- [0 .. n - 1] ]
       in
@@ -698,6 +775,13 @@ normalizeOrientation cfg contours =
       segs = map (flattenEdges cfg.windingFlatness) contoursWithEdges
       segBBoxes = map bboxFromSegs segs
       intersects = contourIntersections cfg.contourEpsilon segs segBBoxes
+      contourCount = length contoursWithEdges
+      intersectsAny i =
+        or
+          [ intersects i j
+          | j <- [0 .. contourCount - 1]
+          , j /= i
+          ]
       points = zipWith (contourSamplePoint cfg.contourEpsilon) areas contoursWithEdges
       depth i =
         length
@@ -711,7 +795,11 @@ normalizeOrientation cfg contours =
       adjust i contour =
         let a = areas !! i
             s = signOf a
-        in if s == 0 || s == desiredSign i then contour else reverseContour contour
+        in if intersectsAny i
+           then contour
+           else if s == 0 || s == desiredSign i
+                then contour
+                else reverseContour contour
   in [ adjust i c | (i, c) <- zip [0..] contours ]
 
 bboxFromSegs :: [LineSeg] -> Maybe BBox
@@ -730,43 +818,88 @@ bboxOverlaps :: BBox -> BBox -> Bool
 bboxOverlaps a b =
   not (a.xMax < b.xMin || b.xMax < a.xMin || a.yMax < b.yMin || b.yMax < a.yMin)
 
+bboxIntersect :: BBox -> BBox -> Maybe BBox
+bboxIntersect a b =
+  let x0 = max a.xMin b.xMin
+      y0 = max a.yMin b.yMin
+      x1 = min a.xMax b.xMax
+      y1 = min a.yMax b.yMax
+  in if x1 < x0 || y1 < y0
+     then Nothing
+     else Just BBox { xMin = x0, yMin = y0, xMax = x1, yMax = y1 }
+
+bboxExpand :: Double -> BBox -> BBox
+bboxExpand pad bb = BBox
+  { xMin = bb.xMin - pad
+  , yMin = bb.yMin - pad
+  , xMax = bb.xMax + pad
+  , yMax = bb.yMax + pad
+  }
+
 contourIntersections
   :: Double
   -> [[LineSeg]]
   -> [Maybe BBox]
   -> Int -> Int -> Bool
-contourIntersections eps segs bbs i j =
-  let segsA = segs !! i
-      segsB = segs !! j
-  in case (bbs !! i, bbs !! j) of
-      (Just bbA, Just bbB) ->
-        if not (bboxOverlaps bbA bbB)
-        then False
-        else any (uncurry (segmentsIntersect eps)) [ (sa, sb) | sa <- segsA, sb <- segsB ]
-      _ -> False
+contourIntersections eps segs bbs =
+  let n = min (length segs) (length bbs)
+      hi = n - 1
+      segArr =
+        if n <= 0
+        then array (0, -1) []
+        else array (0, hi) (zip [0 .. hi] (take n segs))
+      bbArr =
+        if n <= 0
+        then array (0, -1) []
+        else array (0, hi) (zip [0 .. hi] (take n bbs))
+  in \i j ->
+       if i < 0 || j < 0 || i > hi || j > hi
+       then False
+       else
+         case (bbArr ! i, bbArr ! j) of
+           (Just bbA, Just bbB) ->
+             bboxOverlaps bbA bbB && segmentsIntersectAny eps (segArr ! i) (segArr ! j)
+           _ -> False
 
-segmentsIntersect :: Double -> LineSeg -> LineSeg -> Bool
-segmentsIntersect eps (p1, p2) (q1, q2) =
+segmentsIntersectCore :: Double -> LineSeg -> LineSeg -> Bool
+segmentsIntersectCore eps (p1, p2) (q1, q2) =
   let o1 = orient2D p1 p2 q1
       o2 = orient2D p1 p2 q2
       o3 = orient2D q1 q2 p1
       o4 = orient2D q1 q2 p2
       diff a b = (a > eps && b < -eps) || (a < -eps && b > eps)
   in (diff o1 o2 && diff o3 o4)
-     || (abs o1 <= eps && onSegment eps p1 p2 q1)
-     || (abs o2 <= eps && onSegment eps p1 p2 q2)
-     || (abs o3 <= eps && onSegment eps q1 q2 p1)
-     || (abs o4 <= eps && onSegment eps q1 q2 p2)
+     || (abs o1 <= eps && onSegmentBounds eps p1 p2 q1)
+     || (abs o2 <= eps && onSegmentBounds eps p1 p2 q2)
+     || (abs o3 <= eps && onSegmentBounds eps q1 q2 p1)
+     || (abs o4 <= eps && onSegmentBounds eps q1 q2 p2)
+{-# INLINE segmentsIntersectCore #-}
 
 orient2D :: Vec2 -> Vec2 -> Vec2 -> Double
 orient2D (x1, y1) (x2, y2) (x3, y3) =
   (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
+{-# INLINE orient2D #-}
 
-onSegment :: Double -> Vec2 -> Vec2 -> Vec2 -> Bool
-onSegment eps (x1, y1) (x2, y2) (x, y) =
+onSegmentBounds :: Double -> Vec2 -> Vec2 -> Vec2 -> Bool
+onSegmentBounds eps (x1, y1) (x2, y2) (x, y) =
   x >= min x1 x2 - eps && x <= max x1 x2 + eps &&
-  y >= min y1 y2 - eps && y <= max y1 y2 + eps &&
-  abs (orient2D (x1, y1) (x2, y2) (x, y)) <= eps
+  y >= min y1 y2 - eps && y <= max y1 y2 + eps
+{-# INLINE onSegmentBounds #-}
+
+segmentBounds :: LineSeg -> (Double, Double, Double, Double)
+segmentBounds ((x1, y1), (x2, y2)) = (min x1 x2, max x1 x2, min y1 y2, max y1 y2)
+{-# INLINE segmentBounds #-}
+
+bboxOverlapsEps
+  :: Double
+  -> Double -> Double -> Double -> Double
+  -> Double -> Double -> Double -> Double
+  -> Bool
+bboxOverlapsEps eps minAx maxAx minAy maxAy minBx maxBx minBy maxBy =
+  not
+    (maxAx < minBx - eps || maxBx < minAx - eps
+      || maxAy < minBy - eps || maxBy < minAy - eps)
+{-# INLINE bboxOverlapsEps #-}
 
 contourArea :: Double -> [Edge] -> Double
 contourArea flatness edges =
@@ -842,13 +975,22 @@ lastPoint :: Point -> [Point] -> Point
 lastPoint prev [] = prev
 lastPoint _ (x:xs) = lastPoint x xs
 
-edgeKey :: EdgeInfo -> (Int, Int)
-edgeKey info = (info.edgeRef.contourId, info.edgeRef.edgeId)
+applyOverlapFlagsByOrder :: [[EdgeInfo]] -> [Bool] -> [[EdgeInfo]]
+applyOverlapFlagsByOrder infosByContour flags =
+  snd (mapAccumL applyContour flags infosByContour)
+  where
+    applyContour fs infos =
+      let (infos', fs') = applyInfos fs infos
+      in (fs', infos')
 
-applyOverlapFlag :: Map.Map (Int, Int) Bool -> EdgeInfo -> EdgeInfo
-applyOverlapFlag overlapMap info =
-  let key = edgeKey info
-  in info { overlaps = Map.findWithDefault False key overlapMap }
+    applyInfos fs [] = ([], fs)
+    applyInfos [] (info:infos) =
+      let (rest, fs') = applyInfos [] infos
+      in (info : rest, fs')
+    applyInfos (f:fs) (info:infos) =
+      let info' = info { overlaps = f }
+          (rest, fs') = applyInfos fs infos
+      in (info' : rest, fs')
 
 filterDegenerateEdges :: Double -> [Edge] -> [Edge]
 filterDegenerateEdges eps = filter (\e -> edgeLength e > eps)
@@ -912,8 +1054,50 @@ preprocessContours cfg rule contours =
       mergeEps = max eps (flatness * 0.5)
       loops = faceWalkLoops mergeEps edgesAll
       segsAll = flattenEdges flatness edgesAll
-      loops' = mapMaybe (classifyLoop rule eps segsAll) loops
-  in if null loops' then contours else loops'
+      loops0 = mapMaybe (classifyLoop rule eps segsAll) loops
+      loops' = dedupeLoops mergeEps loops0
+      areaAbs es = abs (contourArea flatness es)
+      origArea = sum (map areaAbs contours)
+      newArea = sum (map areaAbs loops')
+      areaOk =
+        if origArea <= 1e-9
+        then True
+        else
+          let ratio = newArea / origArea
+          in ratio >= 0.85 && ratio <= 1.15
+      fallback = null loops' || not areaOk
+      fallbackMsg =
+        "msdf: preprocess fallback"
+          <> " origArea=" <> show origArea
+          <> " newArea=" <> show newArea
+          <> " loopsIn=" <> show (length contours)
+          <> " loopsClassified=" <> show (length loops0)
+          <> " loopsOut=" <> show (length loops')
+  in if fallback
+     then if msdfTraceEnabled then trace fallbackMsg contours else contours
+     else loops'
+
+dedupeLoops :: Double -> [[Edge]] -> [[Edge]]
+dedupeLoops eps loops =
+  let scale = 1 / max 1e-9 eps
+      quant (x, y) = (round (x * scale) :: Int, round (y * scale) :: Int)
+      orderPair a b = if a <= b then (a, b) else (b, a)
+      edgeKey e =
+        case e of
+          EdgeLine p0 p1 ->
+            let (a, b) = orderPair (quant p0) (quant p1)
+            in (0 :: Int, a, b, (0, 0))
+          EdgeQuad p0 p1 p2 ->
+            let (a, b) = orderPair (quant p0) (quant p2)
+            in (1 :: Int, a, b, quant p1)
+      loopKey es = sort (map edgeKey es)
+      step (!seen, acc) es =
+        let k = loopKey es
+        in if Set.member k seen
+           then (seen, acc)
+           else (Set.insert k seen, es : acc)
+      (_, keptRev) = foldl' step (Set.empty, []) loops
+  in reverse keptRev
 
 data HalfEdge = HalfEdge Edge Int Int Vec2 Vec2
 
@@ -1039,27 +1223,42 @@ segsBounds (FlatSeg _ _ _ _ (x0, y0) (x1, y1):rest) =
         in go (mnx', mxx', mny', mxy') xs
   in go (minx, maxx, miny, maxy) rest
 
+type CellBuckets = IntMap.IntMap (IntMap.IntMap [Int])
+
+insertBucketMember :: Int -> Int -> Int -> CellBuckets -> CellBuckets
+insertBucketMember cx cy idx =
+  IntMap.alter updateRow cx
+  where
+    updateRow Nothing = Just (IntMap.singleton cy [idx])
+    updateRow (Just row) = Just (IntMap.insertWith (++) cy [idx] row)
+
+bucketGroups :: CellBuckets -> [[Int]]
+bucketGroups buckets = concatMap IntMap.elems (IntMap.elems buckets)
+
+bucketCellCount :: CellBuckets -> Int
+bucketCellCount buckets = sum (map IntMap.size (IntMap.elems buckets))
+
 collectIntersectionsGrid :: [[Edge]] -> Double -> Double -> [FlatSeg] -> Map.Map (Int, Int) [Double]
 collectIntersectionsGrid contours eps cellSize segs
   | null segs = Map.empty
   | otherwise =
       let n = length segs
           segArr = array (0, n - 1) (zip [0..] segs)
-          minCell = max (eps * 4) 1e-3
           keyBase = n + 1
+          minCell = max (eps * 4) 1e-3
           build size =
-            let buckets = foldl' (insertSegBuckets eps size) Map.empty (zip [0..] segs)
-                sizes = map length (Map.elems buckets)
-                maxBucket = if null sizes then 0 else maximum sizes
-                totalPairs = sum [ s * (s - 1) `div` 2 | s <- sizes ]
-            in (buckets, maxBucket, totalPairs)
+            let cellBuckets = foldl' (insertSegBuckets eps size) IntMap.empty (zip [0..] segs)
+                bucketSizes = map length (bucketGroups cellBuckets)
+                maxBucketSize = if null bucketSizes then 0 else maximum bucketSizes
+                pairCount = sum [ s * (s - 1) `div` 2 | s <- bucketSizes ]
+            in (cellBuckets, maxBucketSize, pairCount)
           refine size iter =
-            let (buckets, maxBucket, totalPairs) = build size
-                tooMany = (msdfSplitMaxPairs > 0 && totalPairs > msdfSplitMaxPairs)
-                       || (msdfSplitMaxBucket > 0 && maxBucket > msdfSplitMaxBucket)
-            in if tooMany && iter < msdfSplitGridMaxIters && size > minCell
+            let (cellBuckets, maxBucketSize, pairCount) = build size
+                overLimit = (msdfSplitMaxPairs > 0 && pairCount > msdfSplitMaxPairs)
+                         || (msdfSplitMaxBucket > 0 && maxBucketSize > msdfSplitMaxBucket)
+            in if overLimit && iter < msdfSplitGridMaxIters && size > minCell
                then refine (max minCell (size * 0.5)) (iter + 1)
-               else (size, buckets, maxBucket, totalPairs, tooMany)
+               else (size, cellBuckets, maxBucketSize, pairCount, overLimit)
           (size', buckets, maxBucket, totalPairs, tooMany) = refine cellSize 0
           step (acc, seen) idxs =
             let (acc', seen') = foldPairs keyBase acc seen idxs segArr
@@ -1067,10 +1266,10 @@ collectIntersectionsGrid contours eps cellSize segs
           tMap =
             if tooMany
             then Map.empty
-            else fst (foldl' step (Map.empty, IntSet.empty) (Map.elems buckets))
+            else fst (foldl' step (Map.empty, IntSet.empty) (bucketGroups buckets))
           traceMsg =
             "msdf: split grid cell=" <> show size'
-              <> " buckets=" <> show (Map.size buckets)
+              <> " buckets=" <> show (bucketCellCount buckets)
               <> " maxBucket=" <> show maxBucket
               <> " pairs=" <> show totalPairs
               <> if tooMany then " (skip split)" else ""
@@ -1084,10 +1283,8 @@ collectIntersectionsGrid contours eps cellSize segs
           maxCx = cellCoord size (maxx + pad)
           minCy = cellCoord size (miny - pad)
           maxCy = cellCoord size (maxy + pad)
-          addCell m c = Map.insertWith (++) c [idx] m
-      in foldl' addCell acc [ (cx, cy) | cx <- [minCx .. maxCx], cy <- [minCy .. maxCy] ]
-
-    cellCoord size v = floor (v / size) :: Int
+          addCell m cx cy = insertBucketMember cx cy idx m
+      in foldGridCells minCx maxCx minCy maxCy acc addCell
 
     segBBox (FlatSeg _ _ _ _ (x0, y0) (x1, y1)) =
       let mnx = min x0 x1
@@ -1351,7 +1548,7 @@ computeEdgeOverlaps flatness eps infos =
         then array (0, -1) []
         else array (0, n - 1)
           [ (i, edgeBBox info.edge) | (i, info) <- zip [0..] infos ]
-      (buckets, traceMsg, tooMany) = overlapGridStats bboxArr eps
+      (_, traceMsg, tooMany) = overlapGridStats bboxArr eps
       skip = tooMany || (msdfOverlapMaxEdges > 0 && n > msdfOverlapMaxEdges)
   in if n == 0
      then []
@@ -1385,7 +1582,24 @@ sameVec eps (x0, y0) (x1, y1) = abs (x0 - x1) <= eps && abs (y0 - y1) <= eps
 
 segmentsIntersectAny :: Double -> [LineSeg] -> [LineSeg] -> Bool
 segmentsIntersectAny eps segsA segsB =
-  any (\sa -> any (segmentsIntersect eps sa) segsB) segsA
+  goA segsA
+  where
+    segsB' =
+      [ (segB, minBx, maxBx, minBy, maxBy)
+      | segB <- segsB
+      , let (minBx, maxBx, minBy, maxBy) = segmentBounds segB
+      ]
+    goA [] = False
+    goA (sa:restA)
+      | goB sa (segmentBounds sa) segsB' = True
+      | otherwise = goA restA
+    goB _ _ [] = False
+    goB sa (minAx, maxAx, minAy, maxAy) ((sb, minBx, maxBx, minBy, maxBy):restB) =
+      if not (bboxOverlapsEps eps minAx maxAx minAy maxAy minBx maxBx minBy maxBy)
+      then goB sa (minAx, maxAx, minAy, maxAy) restB
+      else if segmentsIntersectCore eps sa sb
+           then True
+           else goB sa (minAx, maxAx, minAy, maxAy) restB
 
 overlapPairsGrid
   :: Double
@@ -1397,17 +1611,17 @@ overlapPairsGrid eps infoArr bboxArr segsArr =
   let (buckets, traceMsg, tooMany) = overlapGridStats bboxArr eps
       (lo, hi) = bounds infoArr
       n = if lo > hi then 0 else hi - lo + 1
+      keyBase = n + 1
   in if tooMany || n <= 1
      then ([], traceMsg)
      else
-       let keyBase = n + 1
-           step (pairs, seen) idxs =
-             let (pairs', seen') = foldOverlapPairs keyBase eps infoArr bboxArr segsArr pairs seen idxs
+       let step (accPairs, seen) idxs =
+             let (pairs', seen') = foldOverlapPairs keyBase eps infoArr bboxArr segsArr accPairs seen idxs
              in (pairs', seen')
-           (pairs, _) = foldl' step ([], IntSet.empty) (Map.elems buckets)
-       in (pairs, traceMsg)
+           (pairsOut, _) = foldl' step ([], IntSet.empty) (bucketGroups buckets)
+       in (pairsOut, traceMsg)
 
-overlapGridStats :: Array Int BBox -> Double -> (Map.Map (Int, Int) [Int], String, Bool)
+overlapGridStats :: Array Int BBox -> Double -> (CellBuckets, String, Bool)
 overlapGridStats bboxArr eps =
   let (lo, hi) = bounds bboxArr
       n = if lo > hi then 0 else hi - lo + 1
@@ -1415,14 +1629,14 @@ overlapGridStats bboxArr eps =
       cellSize = if msdfOverlapGridSize > 0 then msdfOverlapGridSize else chooseOverlapCell bboxArr
       size = max minCell cellSize
       buckets = buildOverlapBuckets bboxArr size
-      sizes = map length (Map.elems buckets)
+      sizes = map length (bucketGroups buckets)
       maxBucket = if null sizes then 0 else maximum sizes
       totalPairs = sum [ s * (s - 1) `div` 2 | s <- sizes ]
       tooMany = (msdfOverlapMaxPairs > 0 && totalPairs > msdfOverlapMaxPairs)
              || (msdfOverlapMaxBucket > 0 && maxBucket > msdfOverlapMaxBucket)
       traceMsg =
         "msdf: overlap grid cell=" <> show size
-          <> " buckets=" <> show (Map.size buckets)
+          <> " buckets=" <> show (bucketCellCount buckets)
           <> " maxBucket=" <> show maxBucket
           <> " pairs=" <> show totalPairs
           <> if tooMany || n <= 1 then " (skip overlap)" else ""
@@ -1446,7 +1660,7 @@ chooseOverlapCell bboxArr =
       let b = bboxArr ! i
       in (min mnx b.xMin, max mxx b.xMax, min mny b.yMin, max mxy b.yMax)
 
-buildOverlapBuckets :: Array Int BBox -> Double -> Map.Map (Int, Int) [Int]
+buildOverlapBuckets :: Array Int BBox -> Double -> CellBuckets
 buildOverlapBuckets bboxArr size =
   let (lo, hi) = bounds bboxArr
       addBucket m idx =
@@ -1459,12 +1673,22 @@ buildOverlapBuckets bboxArr size =
             maxCx = cellCoord size maxx
             minCy = cellCoord size miny
             maxCy = cellCoord size maxy
-            addCell acc c = Map.insertWith (++) c [idx] acc
-        in foldl' addCell m [ (cx, cy) | cx <- [minCx .. maxCx], cy <- [minCy .. maxCy] ]
-  in if lo > hi then Map.empty else foldl' addBucket Map.empty [lo .. hi]
+            addCell acc cx cy = insertBucketMember cx cy idx acc
+        in foldGridCells minCx maxCx minCy maxCy m addCell
+  in if lo > hi then IntMap.empty else foldl' addBucket IntMap.empty [lo .. hi]
 
 cellCoord :: Double -> Double -> Int
 cellCoord size v = floor (v / size) :: Int
+
+foldGridCells :: Int -> Int -> Int -> Int -> a -> (a -> Int -> Int -> a) -> a
+foldGridCells minCx maxCx minCy maxCy acc0 step = goX minCx acc0
+  where
+    goX !cx !acc
+      | cx > maxCx = acc
+      | otherwise = goX (cx + 1) (goY cx minCy acc)
+    goY !cx !cy !acc
+      | cy > maxCy = acc
+      | otherwise = goY cx (cy + 1) (step acc cx cy)
 
 foldOverlapPairs
   :: Int
@@ -1502,325 +1726,465 @@ foldOverlapPairs keyBase eps infoArr bboxArr segsArr pairs0 seen0 idxs =
 
 renderBitmap :: MSDFConfig -> Int -> Int -> Double -> Double -> [(EdgeColor, EdgeInfo)] -> [LineSeg] -> [[LineSeg]] -> UArray Int Word8
 renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
-  let fmt = cfg.outputFormat
-      n = width * height
-      channels = bitmapChannels fmt
-  in runST (do
-       dRArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
-       dGArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
-       dBArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
-       dAllArr <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
-       insideArr <- case cfg.distance.signMode of
-         SignScanline -> buildScanlineInside cfg.distance.fillRule width height offsetX offsetY segs
-         SignWinding -> pure Nothing
-       let coloredInfosFiltered = coloredInfos
-           (edgesR, edgesG, edgesB) = splitColoredEdges coloredInfosFiltered
-           allEdges = edgesR ++ edgesG ++ edgesB
-           bbFallback = BBox offsetX offsetY (offsetX + fromIntegral width) (offsetY + fromIntegral height)
-           bb = case bboxFromEdgeInfos allEdges of
-             Just b -> b
-             Nothing -> bbFallback
-           cellSz =
-             let base = if cfg.distance.gridCellSize > 0
-                        then cfg.distance.gridCellSize
-                        else fromIntegral (max 2 cfg.range)
-             in max 1 base
-           flatness = cfg.outline.windingFlatness
-           idxR = buildEdgeIndexInfo flatness cellSz bb edgesR
-           idxG = buildEdgeIndexInfo flatness cellSz bb edgesG
-           idxB = buildEdgeIndexInfo flatness cellSz bb edgesB
-           idxAllInfo = buildEdgeIndexInfo flatness cellSz bb allEdges
-           insideAtIdx ix iy =
-             case insideArr of
-               Nothing -> pure False
-               Just arr ->
-                 if ix < 0 || ix >= width || iy < 0 || iy >= height
-                 then pure False
-                 else readArray arr (iy * width + ix)
-           insideAtPos (px, py) =
-             let ix = floor (px - offsetX)
-                 iy = floor (py - offsetY)
-             in insideAtIdx ix iy
-           boundaryOk info t edgeSegs =
-             case insideArr of
-               Nothing -> pure True
-               Just _ ->
-                 if not cfg.distance.overlapSupport
-                 then pure True
-                 else if cfg.outline.splitIntersections
-                   then pure True
-                 else
-                   let normal = edgeUnitNormalAt info t
-                       q = edgePointAt info.edge t
-                       base = max 0.5 cfg.distance.overlapEpsilon
-                       steps = [base, base * 2]
-                       applyRule = applyFillRule cfg.distance.fillRule
-                       check step = do
-                         let q1 = vecAdd q (vecScale step normal)
-                             q2 = vecSub q (vecScale step normal)
-                         i1 <- insideAtPos q1
-                         i2 <- insideAtPos q2
-                         if i1 == i2
-                           then pure False
-                           else if not info.overlaps
-                             then pure True
-                             else do
-                               let contourSegs = edgeSegs
-                                   w1 = windingNumber segs q1 - windingNumber contourSegs q1
-                                   w2 = windingNumber segs q2 - windingNumber contourSegs q2
-                               pure (applyRule w1 /= applyRule w2)
-                   in if nearZero normal
-                      then pure True
-                      else
-                        foldM
-                          (\acc step -> if acc then pure True else check step)
-                          False
-                          steps
-           minDistanceInfoM usePseudo idx p =
-             let (elo, ehi) = bounds idx.edges
-             in if elo > ehi
-                then pure 1e9
-                else
-                  let (cx, cy) = pointCell idx p
-                      maxR = max idx.gridW idx.gridH
-                      scanCellM idx' p' usePseudo' best (x, y) =
-                        let cellIdx = cellIndex idx'.gridW x y
-                            edgeIdxs = idx'.cells ! cellIdx
-                            bestSq0 = best * best
-                            go acc _ [] = pure acc
-                            go acc accSq (i:is) =
-                              let bb = idx'.edgeBBoxes ! i
-                                  dSqBB = bboxDistanceSq bb p'
-                              in if dSqBB >= accSq
-                                 then go acc accSq is
-                                 else do
-                                   let info = idx'.edges ! i
-                                       edgeSegs = idx'.edgeSegs ! i
-                                       (dist, t) = edgeDistanceWithParam usePseudo' p' info
-                                   if dist >= acc
-                                     then go acc accSq is
-                                     else do
-                                       ok <- boundaryOk info t edgeSegs
-                                       let acc' = if ok then dist else acc
-                                           accSq' = if ok then dist * dist else accSq
-                                       go acc' accSq' is
-                        in go best bestSq0 edgeIdxs
-                      scanRing minX maxX minY maxY r best0 = do
-                        let goY y bestY
-                              | y > maxY = pure bestY
-                              | otherwise = do
-                                  let goX x bestX
-                                        | x > maxX = pure bestX
-                                        | r == 0 || x == minX || x == maxX || y == minY || y == maxY = do
-                                            bestX' <- scanCellM idx p usePseudo bestX (x, y)
-                                            goX (x + 1) bestX'
-                                        | otherwise = goX (x + 1) bestX
-                                  bestY' <- goX minX bestY
-                                  goY (y + 1) bestY'
-                        goY minY best0
-                      go r best =
-                        let minX = max 0 (cx - r)
-                            maxX = min (idx.gridW - 1) (cx + r)
-                            minY = max 0 (cy - r)
-                            maxY = min (idx.gridH - 1) (cy + r)
-                        in do
-                          best' <- scanRing minX maxX minY maxY r best
-                          let minBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) p
-                              fullGrid = minX == 0 && maxX == idx.gridW - 1 && minY == 0 && maxY == idx.gridH - 1
-                          if best' <= minBoundary
-                            then pure best'
-                            else if fullGrid || r >= maxR
-                                 then pure best'
-                                 else go (r + 1) best'
-                  in do
-                    best <- go 0 1e18
-                    if best > 9e17
-                      then pure (minDistanceInfo usePseudo idx p)
-                      else pure best
-           useOverlap =
-             cfg.distance.overlapSupport
-             && not cfg.outline.splitIntersections
-             && case insideArr of
-                  Just _ -> True
-                  Nothing -> False
-           distanceFor usePseudo idx p =
-             if useOverlap
-             then minDistanceInfoM usePseudo idx p
-             else pure (minDistanceInfo usePseudo idx p)
-       forM_ [0 .. height - 1] $ \y -> do
-         forM_ [0 .. width - 1] $ \x -> do
-           let i = y * width + x
-               px' = offsetX + fromIntegral x + 0.5
-               py' = offsetY + fromIntegral y + 0.5 + cfg.distance.signEpsilon
-               p = (px', py')
-           inside <- case insideArr of
-              Just arr -> readArray arr i
-              Nothing -> pure (windingNumber segs p /= 0)
-           let sign = if inside then 1.0 else -1.0
-           dR0 <- (* sign) <$> distanceFor cfg.distance.pseudoDistance idxR p
-           dG0 <- (* sign) <$> distanceFor cfg.distance.pseudoDistance idxG p
-           dB0 <- (* sign) <$> distanceFor cfg.distance.pseudoDistance idxB p
-           dAll0 <- (* sign) <$> distanceFor False idxAllInfo p
-           writeArray dRArr i dR0
-           writeArray dGArr i dG0
-           writeArray dBArr i dB0
-           writeArray dAllArr i dAll0
-       dAllArrCorr <- if cfg.correction.enableCorrection
-         then do
-           let edgeThresh = cfg.correction.edgeThreshold
-               neighbors8 =
-                 [ (-1, -1), (0, -1), (1, -1)
-                 , (-1,  0),          (1,  0)
-                 , (-1,  1), (0,  1), (1,  1)
-                 ]
-           dst <- newArray (0, n - 1) 0.0 :: ST s (STUArray s Int Double)
-           forM_ [0 .. height - 1] $ \y -> do
-             forM_ [0 .. width - 1] $ \x -> do
-               let i = y * width + x
-               d <- readArray dAllArr i
-               let signD :: Int
-                   signD = if d >= 0 then 1 else -1
-               if abs d < edgeThresh
-                 then do
-                   (negCount, posCount, total) <-
-                     foldM
-                       (\(nC, pC, tC) (dx, dy) ->
-                         let nx = x + dx
-                             ny = y + dy
-                         in if nx < 0 || nx >= width || ny < 0 || ny >= height
-                            then pure (nC, pC, tC)
-                            else do
-                              let ni = ny * width + nx
-                              nd <- readArray dAllArr ni
-                              let s :: Int
-                                  s = if nd >= 0 then 1 else -1
-                              pure (if s < 0 then (nC + 1, pC, tC + 1) else (nC, pC + 1, tC + 1))
-                       ) (0 :: Int, 0 :: Int, 0 :: Int) neighbors8
-                   let majoritySign
-                         | negCount >= 5 = -1
-                         | posCount >= 5 = 1
-                         | otherwise = signD
-                       d' = if total >= 5 && majoritySign /= signD
-                            then fromIntegral majoritySign * abs d
-                            else d
-                   writeArray dst i d'
-                 else writeArray dst i d
-           pure dst
-         else pure dAllArr
-       badArr <- if cfg.correction.enableCorrection && width > 1 && height > 1
-         then do
-           bad <- newArray (0, n - 1) False :: ST s (STUArray s Int Bool)
-           let edgeThresh = cfg.correction.edgeThreshold
-               chanThresh = cfg.correction.channelThreshold
-               hardThresh = cfg.correction.hardThreshold
-           forM_ [0 .. height - 2] $ \y -> do
-             forM_ [0 .. width - 2] $ \x -> do
-               let i00 = y * width + x
-                   i10 = i00 + 1
-                   i01 = i00 + width
-                   i11 = i01 + 1
-               dR00 <- readArray dRArr i00
-               dR10 <- readArray dRArr i10
-               dR01 <- readArray dRArr i01
-               dR11 <- readArray dRArr i11
-               dG00 <- readArray dGArr i00
-               dG10 <- readArray dGArr i10
-               dG01 <- readArray dGArr i01
-               dG11 <- readArray dGArr i11
-               dB00 <- readArray dBArr i00
-               dB10 <- readArray dBArr i10
-               dB01 <- readArray dBArr i01
-               dB11 <- readArray dBArr i11
-               dAll00 <- readArray dAllArrCorr i00
-               dAll10 <- readArray dAllArrCorr i10
-               dAll01 <- readArray dAllArrCorr i01
-               dAll11 <- readArray dAllArrCorr i11
-               let dR = 0.25 * (dR00 + dR10 + dR01 + dR11)
-                   dG = 0.25 * (dG00 + dG10 + dG01 + dG11)
-                   dB = 0.25 * (dB00 + dB10 + dB01 + dB11)
-                   dAll = 0.25 * (dAll00 + dAll10 + dAll01 + dAll11)
-                   sd = median3 dR dG dB
-                   mismatch = sd * dAll < 0 || abs (sd - dAll) > chanThresh
-                   hard = abs (dR - dAll) > hardThresh || abs (dG - dAll) > hardThresh || abs (dB - dAll) > hardThresh
-               if abs dAll < edgeThresh && (mismatch || hard)
-                 then do
-                   writeArray bad i00 True
-                   writeArray bad i10 True
-                   writeArray bad i01 True
-                   writeArray bad i11 True
-                 else pure ()
-           pure (Just bad)
-         else pure Nothing
-       out <- newArray (0, n * channels - 1) 0 :: ST s (STUArray s Int Word8)
-       forM_ [0 .. height - 1] $ \y -> do
-         forM_ [0 .. width - 1] $ \x -> do
-           let i = y * width + x
-               base = i * channels
-           dR0 <- readArray dRArr i
-           dG0 <- readArray dGArr i
-           dB0 <- readArray dBArr i
-           dAllCorr <- readArray dAllArrCorr i
-           dAllRaw <- readArray dAllArr i
-           let edgeThresh = cfg.correction.edgeThreshold
-               chanThresh = cfg.correction.channelThreshold
-               hardThresh = cfg.correction.hardThreshold
-               nearEdge = abs dAllCorr < edgeThresh
-               (dR1, dG1, dB1) =
-                 if cfg.correction.enableCorrection && nearEdge
-                 then ( clampChannel dR0 dAllCorr chanThresh
-                      , clampChannel dG0 dAllCorr chanThresh
-                      , clampChannel dB0 dAllCorr chanThresh
-                      )
-                 else (dR0, dG0, dB0)
-               sd = median3 dR1 dG1 dB1
-               mismatch = sd * dAllCorr < 0 || abs (sd - dAllCorr) > chanThresh
-               hard = abs (dR1 - dAllCorr) > hardThresh || abs (dG1 - dAllCorr) > hardThresh || abs (dB1 - dAllCorr) > hardThresh
-           clash <- if cfg.correction.enableCorrection && nearEdge
-             then do
-               let center = (dR0, dG0, dB0)
-                   threshold = hardThresh
-                   neighbors =
-                     [ (-1, 0), (1, 0), (0, -1), (0, 1)
-                     , (-1, -1), (1, -1), (-1, 1), (1, 1)
-                     ]
-               foldM
-                 (\acc (dx, dy) ->
-                   if acc
+  unsafePerformIO $ do
+    let fmt = cfg.outputFormat
+        n = width * height
+        channels = bitmapChannels fmt
+        range = cfg.range
+        edgeThreshF = realToFrac cfg.correction.edgeThreshold :: Float
+        chanThreshF = realToFrac cfg.correction.channelThreshold :: Float
+        hardThreshF = realToFrac cfg.correction.hardThreshold :: Float
+        neighbors8 =
+          [ (-1, -1), (0, -1), (1, -1)
+          , (-1,  0),          (1,  0)
+          , (-1,  1), (0,  1), (1,  1)
+          ]
+        baseWorkers = max 1 (min height (effectiveParallelism cfg.parallelism))
+        pixelCount = max 0 (width * height)
+        workers = if pixelCount < msdfParallelPixelsMin then 1 else baseWorkers
+        chunk = max 1 ((height + workers - 1) `div` workers)
+        parallelForRows action =
+          if workers <= 1
+          then action 0 (height - 1)
+          else do
+            mvars <- forM [0 .. workers - 1] $ \w -> do
+              let y0 = w * chunk
+                  y1 = min (height - 1) ((w + 1) * chunk - 1)
+              mv <- newEmptyMVar
+              if y0 > y1
+                then putMVar mv ()
+                else do
+                  _ <- forkIO (action y0 y1 >> putMVar mv ())
+                  pure ()
+              pure mv
+            mapM_ takeMVar mvars
+        loopY y0 yMax f =
+          let go y
+                | y > yMax = pure ()
+                | otherwise = f y >> go (y + 1)
+          in go y0
+        loopX x0 xMax f =
+          let go x
+                | x > xMax = pure ()
+                | otherwise = f x >> go (x + 1)
+          in go x0
+        timingEnabled = msdfRenderTimingsEnabled
+        timeMs = (/ 1.0e6) . fromIntegral
+        timeIO :: IO a -> IO (a, Double)
+        timeIO action =
+          if not timingEnabled
+          then do
+            r <- action
+            pure (r, 0 :: Double)
+          else do
+            t0 <- getMonotonicTimeNSec
+            r <- action
+            t1 <- getMonotonicTimeNSec
+            pure (r, timeMs (t1 - t0))
+        timePure :: a -> IO (a, Double)
+        timePure val =
+          if not timingEnabled
+          then pure (val, 0 :: Double)
+          else do
+            t0 <- getMonotonicTimeNSec
+            val `seq` pure ()
+            t1 <- getMonotonicTimeNSec
+            pure (val, timeMs (t1 - t0))
+    dRArr <- newArray (0, n - 1) 0.0 :: IO (IOUArray Int Float)
+    dGArr <- newArray (0, n - 1) 0.0 :: IO (IOUArray Int Float)
+    dBArr <- newArray (0, n - 1) 0.0 :: IO (IOUArray Int Float)
+    dAllArr <- newArray (0, n - 1) 0.0 :: IO (IOUArray Int Float)
+    (insideArr, tInside) <- timeIO $
+      case cfg.distance.signMode of
+        SignScanline -> Just <$> buildScanlineInside cfg.distance.fillRule width height offsetX offsetY segs
+        SignWinding -> pure Nothing
+    let coloredInfosFiltered = coloredInfos
+        bbFallback = BBox offsetX offsetY (offsetX + fromIntegral width) (offsetY + fromIntegral height)
+        bb = case bboxFromEdgeInfos (map snd coloredInfosFiltered) of
+          Just b -> b
+          Nothing -> bbFallback
+        cellSz =
+          let base = if cfg.distance.gridCellSize > 0
+                     then cfg.distance.gridCellSize
+                     else fromIntegral (max 2 cfg.range)
+              edgeCount = length coloredInfosFiltered
+              areaPix = fromIntegral (max 1 (width * height)) :: Double
+              targetEdges = 8.0 :: Double
+              heuristic =
+                if edgeCount <= 0
+                then base
+                else sqrt (areaPix * targetEdges / fromIntegral edgeCount)
+              maxCell = fromIntegral (max width height)
+              chosen = max base (min maxCell heuristic)
+          in max 1 chosen
+        flatness = cfg.outline.windingFlatness
+        pixelBB = BBox offsetX offsetY (offsetX + fromIntegral width) (offsetY + fromIntegral height)
+        clipBB = bboxExpand (fromIntegral (max 1 cfg.range)) pixelBB
+        useOverlap =
+          cfg.distance.overlapSupport
+          && case insideArr of
+               Just _ -> True
+               Nothing -> False
+        edgesCount = length coloredInfosFiltered
+        coarseFactor = 4 :: Double
+        coarseCellSz = cellSz * coarseFactor
+        coarseThresholdPixels = 128 * 128
+        coarseEdgeThreshold = 200
+        useCoarse =
+          coarseFactor > 1
+          && width * height >= coarseThresholdPixels
+          && edgesCount >= coarseEdgeThreshold
+          && (fromIntegral (max width height) > coarseCellSz * 2)
+    (idxAllInfo, tIndex) <- timePure (buildEdgeIndexInfo flatness cellSz bb clipBB useOverlap coloredInfosFiltered)
+    (idxCoarse, tCoarse) <- timePure $
+      if useCoarse
+      then Just (buildEdgeIndexInfo flatness coarseCellSz bb clipBB useOverlap coloredInfosFiltered)
+      else Nothing
+    let insideAtIdx ix iy =
+          case insideArr of
+            Nothing -> pure False
+            Just arr ->
+              if ix < 0 || ix >= width || iy < 0 || iy >= height
+              then pure False
+              else do
+                insideMaskAt arr (iy * width + ix)
+        insideAtPos (px, py) =
+          let ix = floor (px - offsetX)
+              iy = floor (py - offsetY)
+          in insideAtIdx ix iy
+        boundaryOk idx' i t =
+          case insideArr of
+            Nothing -> pure True
+            Just _ ->
+              if not cfg.distance.overlapSupport
+              then pure True
+              else
+                let normal = edgeUnitNormalAtIdx idx' i t
+                    q = edgePointAtIdx idx' i t
+                    base = max 0.5 cfg.distance.overlapEpsilon
+                    step1 = base
+                    step2 = base * 2
+                    applyRule = applyFillRule cfg.distance.fillRule
+                    off = idx'.segOffsets ! i
+                    cnt = idx'.segCounts ! i
+                    check step = do
+                      let q1 = vecAdd q (vecScale step normal)
+                          q2 = vecSub q (vecScale step normal)
+                      i1 <- insideAtPos q1
+                      i2 <- insideAtPos q2
+                      if i1 == i2
+                        then pure False
+                        else if idx'.edgeOverlaps ! i == 0
+                          then pure True
+                          else do
+                            let w1 = windingNumber segs q1 - windingNumberSlice idx' off cnt q1
+                                w2 = windingNumber segs q2 - windingNumberSlice idx' off cnt q2
+                            pure (applyRule w1 /= applyRule w2)
+                in if nearZero normal
                    then pure True
                    else do
-                     let nx = x + dx
-                         ny = y + dy
-                     if nx < 0 || nx >= width || ny < 0 || ny >= height
-                       then pure False
+                     ok1 <- check step1
+                     if ok1 then pure True else check step2
+        minDistancesM usePseudo idx p =
+          let edgeCount = idx.edgeCount
+              max4 a b c d = max a (max b (max c d))
+          in if edgeCount <= 0
+             then pure (1e9, 1e9, 1e9, 1e9)
+             else do
+               let (cx, cy) = pointCell idx p
+                   maxR = max idx.gridW idx.gridH
+                   scanCellM idx' p' usePseudo' (!bestR, !bestG, !bestB, !bestAll) (x, y) =
+                     let cellIdx = cellIndex idx'.gridW x y
+                         start = idx'.cellStarts ! cellIdx
+                         count = idx'.cellCounts ! cellIdx
+                         !bestMax = max4 bestR bestG bestB bestAll
+                         !bestMaxSq = bestMax * bestMax
+                         cellMinSq = cellDistanceSq idx' p' (x, y)
+                         scanCellEdges !curR !curG !curB !curA !j
+                           | j >= count = pure (curR, curG, curB, curA)
+                           | otherwise =
+                               let i = idx'.cellEdges ! (start + j)
+                               in do
+                                 let !bestMax' = max4 curR curG curB curA
+                                     !bestMaxSq' = bestMax' * bestMax'
+                                     dSqBB = bboxDistanceSqIdx idx' i p'
+                                 if dSqBB >= bestMaxSq'
+                                   then scanCellEdges curR curG curB curA (j + 1)
+                                   else do
+                                     let mask = idx'.edgeMasks ! i
+                                         (dSq, t) = edgeDistanceSqWithParamFastIdx idx' i p'
+                                         dTrue = sqrt dSq
+                                         dPseudo = if usePseudo' then edgeDistancePseudoFromIdx idx' i p' dTrue t else dTrue
+                                         wants =
+                                           (mask .&. 1 /= 0 && dPseudo < curR)
+                                           || (mask .&. 2 /= 0 && dPseudo < curG)
+                                           || (mask .&. 4 /= 0 && dPseudo < curB)
+                                           || dTrue < curA
+                                     if not wants
+                                       then scanCellEdges curR curG curB curA (j + 1)
+                                       else do
+                                         ok <- if useOverlap
+                                           then boundaryOk idx' i t
+                                           else pure True
+                                         if not ok
+                                           then scanCellEdges curR curG curB curA (j + 1)
+                                           else do
+                                             let !nextR = if mask .&. 1 /= 0 && dPseudo < curR then dPseudo else curR
+                                                 !nextG = if mask .&. 2 /= 0 && dPseudo < curG then dPseudo else curG
+                                                 !nextB = if mask .&. 4 /= 0 && dPseudo < curB then dPseudo else curB
+                                                 !nextA = if dTrue < curA then dTrue else curA
+                                             scanCellEdges nextR nextG nextB nextA (j + 1)
+                     in if cellMinSq >= bestMaxSq
+                        then pure (bestR, bestG, bestB, bestAll)
+                        else scanCellEdges bestR bestG bestB bestAll 0
+                   scanRing minX maxX minY maxY r best0 = do
+                     let ringBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) p
+                         (r0, g0, b0, a0) = best0
+                         bestMax0 = max4 r0 g0 b0 a0
+                     if bestMax0 <= ringBoundary
+                       then pure best0
                        else do
-                         let ni = ny * width + nx
-                         nr <- readArray dRArr ni
-                         ng <- readArray dGArr ni
-                         nb <- readArray dBArr ni
-                         pure (detectClash center (nr, ng, nb) threshold)
-                 ) False neighbors
-             else pure False
-           bad <- case badArr of
-             Just arr -> readArray arr i
-             Nothing -> pure False
-           let (dR, dG, dB) =
-                 if cfg.correction.enableCorrection && nearEdge && (mismatch || hard || clash || bad)
-                 then (dAllCorr, dAllCorr, dAllCorr)
-                 else (dR1, dG1, dB1)
-               r = distanceToByte cfg.range dR
-               g = distanceToByte cfg.range dG
-               b = distanceToByte cfg.range dB
-           case fmt of
-             BitmapMSDF -> do
-               writeArray out base r
-               writeArray out (base + 1) g
-               writeArray out (base + 2) b
-             BitmapMTSDF -> do
-               writeArray out base r
-               writeArray out (base + 1) g
-               writeArray out (base + 2) b
-               writeArray out (base + 3) (distanceToByte cfg.range dAllRaw)
-       freeze out)
+                         let goY y bestY
+                               | y > maxY = pure bestY
+                               | otherwise = do
+                                   let goX x bestX
+                                         | x > maxX = pure bestX
+                                         | r == 0 || x == minX || x == maxX || y == minY || y == maxY = do
+                                             bestX' <- scanCellM idx p usePseudo bestX (x, y)
+                                             goX (x + 1) bestX'
+                                         | otherwise = goX (x + 1) bestX
+                                   bestY' <- goX minX bestY
+                                   goY (y + 1) bestY'
+                         goY minY best0
+                   expandRings r best =
+                     let minX = max 0 (cx - r)
+                         maxX = min (idx.gridW - 1) (cx + r)
+                         minY = max 0 (cy - r)
+                         maxY = min (idx.gridH - 1) (cy + r)
+                     in do
+                       best' <- scanRing minX maxX minY maxY r best
+                       let (rBest, gBest, bBest, aBest) = best'
+                           bestMax = max4 rBest gBest bBest aBest
+                           minBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) p
+                           fullGrid = minX == 0 && maxX == idx.gridW - 1 && minY == 0 && maxY == idx.gridH - 1
+                       if bestMax <= minBoundary
+                         then pure best'
+                         else if fullGrid || r >= maxR
+                              then pure best'
+                              else expandRings (r + 1) best'
+               bestInit <-
+                 case idxCoarse of
+                   Nothing -> pure (1e18, 1e18, 1e18, 1e18)
+                   Just idxC -> do
+                     let (ccx, ccy) = pointCell idxC p
+                     scanCellM idxC p usePseudo (1e18, 1e18, 1e18, 1e18) (ccx, ccy)
+               expandRings 0 bestInit
+        computeDistances y0 y1 = do
+          loopY y0 y1 $ \y -> do
+            let !py' = offsetY + fromIntegral y + 0.5 + cfg.distance.signEpsilon
+                !px0 = offsetX + 0.5
+                !base = y * width
+                go !x !px
+                  | x >= width = pure ()
+                  | otherwise = do
+                      let i = base + x
+                          p = (px, py')
+                      inside <- case insideArr of
+                         Just arr -> do
+                           insideMaskAt arr i
+                         Nothing -> pure (windingNumber segs p /= 0)
+                      let sign = if inside then 1.0 else -1.0
+                      (dR, dG, dB, dAll) <-
+                        minDistancesM cfg.distance.pseudoDistance idxAllInfo p
+                      let dR0 = dR * sign
+                          dG0 = dG * sign
+                          dB0 = dB * sign
+                          dAll0 = dAll * sign
+                      writeArray dRArr i (realToFrac dR0)
+                      writeArray dGArr i (realToFrac dG0)
+                      writeArray dBArr i (realToFrac dB0)
+                      writeArray dAllArr i (realToFrac dAll0)
+                      go (x + 1) (px + 1)
+            go 0 px0
+    (_, tDistances) <- timeIO $
+      parallelForRows computeDistances
+    (dAllArrCorr, tCorr) <-
+      if cfg.correction.enableCorrection
+      then timeIO $ do
+        dst <- newArray (0, n - 1) 0.0 :: IO (IOUArray Int Float)
+        let computeCorr y0 y1 = do
+              loopY y0 y1 $ \y -> do
+                loopX 0 (width - 1) $ \x -> do
+                  let i = y * width + x
+                  d <- readArray dAllArr i
+                  let signD :: Int
+                      signD = if d >= 0 then 1 else -1
+                  if abs d < edgeThreshF
+                    then do
+                      (negCount, posCount, total) <-
+                        foldM
+                          (\(nC, pC, tC) (dx, dy) ->
+                            let nx = x + dx
+                                ny = y + dy
+                            in if nx < 0 || nx >= width || ny < 0 || ny >= height
+                               then pure (nC, pC, tC)
+                               else do
+                                 let ni = ny * width + nx
+                                 nd <- readArray dAllArr ni
+                                 let s :: Int
+                                     s = if nd >= 0 then 1 else -1
+                                 pure (if s < 0 then (nC + 1, pC, tC + 1) else (nC, pC + 1, tC + 1))
+                          ) (0 :: Int, 0 :: Int, 0 :: Int) neighbors8
+                      let majoritySign
+                            | negCount >= 5 = -1
+                            | posCount >= 5 = 1
+                            | otherwise = signD
+                          d' = if total >= 5 && majoritySign /= signD
+                               then fromIntegral majoritySign * abs d
+                               else d
+                      writeArray dst i d'
+                    else writeArray dst i d
+        parallelForRows computeCorr
+        pure dst
+      else pure (dAllArr, 0)
+    (badArr, tBad) <-
+      if cfg.correction.enableCorrection && width > 1 && height > 1
+      then timeIO $ do
+        bad <- newArray (0, n - 1) False :: IO (IOUArray Int Bool)
+        let computeBad y0 y1 = do
+              let yMax = min (height - 2) y1
+              loopY y0 yMax $ \y -> do
+                loopX 0 (width - 2) $ \x -> do
+                  let i00 = y * width + x
+                      i10 = i00 + 1
+                      i01 = i00 + width
+                      i11 = i01 + 1
+                  dR00 <- readArray dRArr i00
+                  dR10 <- readArray dRArr i10
+                  dR01 <- readArray dRArr i01
+                  dR11 <- readArray dRArr i11
+                  dG00 <- readArray dGArr i00
+                  dG10 <- readArray dGArr i10
+                  dG01 <- readArray dGArr i01
+                  dG11 <- readArray dGArr i11
+                  dB00 <- readArray dBArr i00
+                  dB10 <- readArray dBArr i10
+                  dB01 <- readArray dBArr i01
+                  dB11 <- readArray dBArr i11
+                  dAll00 <- readArray dAllArrCorr i00
+                  dAll10 <- readArray dAllArrCorr i10
+                  dAll01 <- readArray dAllArrCorr i01
+                  dAll11 <- readArray dAllArrCorr i11
+                  let dR = 0.25 * (dR00 + dR10 + dR01 + dR11)
+                      dG = 0.25 * (dG00 + dG10 + dG01 + dG11)
+                      dB = 0.25 * (dB00 + dB10 + dB01 + dB11)
+                      dAll = 0.25 * (dAll00 + dAll10 + dAll01 + dAll11)
+                      sd = median3F dR dG dB
+                      mismatch = sd * dAll < 0 || abs (sd - dAll) > chanThreshF
+                      hard = abs (dR - dAll) > hardThreshF || abs (dG - dAll) > hardThreshF || abs (dB - dAll) > hardThreshF
+                  if abs dAll < edgeThreshF && (mismatch || hard)
+                    then do
+                      writeArray bad i00 True
+                      writeArray bad i10 True
+                      writeArray bad i01 True
+                      writeArray bad i11 True
+                    else pure ()
+        parallelForRows computeBad
+        pure (Just bad)
+      else pure (Nothing, 0)
+    out <- newArray (0, n * channels - 1) 0 :: IO (IOUArray Int Word8)
+    let computeOutNoCorrection y0 y1 = do
+          loopY y0 y1 $ \y -> do
+            loopX 0 (width - 1) $ \x -> do
+              let i = y * width + x
+                  base = i * channels
+              dR0 <- readArray dRArr i
+              dG0 <- readArray dGArr i
+              dB0 <- readArray dBArr i
+              let r = distanceToByteF range dR0
+                  g = distanceToByteF range dG0
+                  b = distanceToByteF range dB0
+              case fmt of
+                BitmapMSDF -> do
+                  writeArray out base r
+                  writeArray out (base + 1) g
+                  writeArray out (base + 2) b
+                BitmapMTSDF -> do
+                  dAllRaw <- readArray dAllArr i
+                  writeArray out base r
+                  writeArray out (base + 1) g
+                  writeArray out (base + 2) b
+                  writeArray out (base + 3) (distanceToByteF range dAllRaw)
+        computeOutCorrection y0 y1 = do
+          loopY y0 y1 $ \y -> do
+            loopX 0 (width - 1) $ \x -> do
+              let i = y * width + x
+                  base = i * channels
+              dR0 <- readArray dRArr i
+              dG0 <- readArray dGArr i
+              dB0 <- readArray dBArr i
+              dAllCorr <- readArray dAllArrCorr i
+              dAllRaw <- readArray dAllArr i
+              let nearEdge = abs dAllCorr < edgeThreshF
+                  (dR1, dG1, dB1) =
+                    if nearEdge
+                    then ( clampChannelF dR0 dAllCorr chanThreshF
+                         , clampChannelF dG0 dAllCorr chanThreshF
+                         , clampChannelF dB0 dAllCorr chanThreshF
+                         )
+                    else (dR0, dG0, dB0)
+                  sd = median3F dR1 dG1 dB1
+                  mismatch = sd * dAllCorr < 0 || abs (sd - dAllCorr) > chanThreshF
+                  hard = abs (dR1 - dAllCorr) > hardThreshF || abs (dG1 - dAllCorr) > hardThreshF || abs (dB1 - dAllCorr) > hardThreshF
+              clash <- if nearEdge
+                then do
+                  let center = (dR0, dG0, dB0)
+                      threshold = hardThreshF
+                  foldM
+                    (\acc (dx, dy) ->
+                      if acc
+                      then pure True
+                      else do
+                        let nx = x + dx
+                            ny = y + dy
+                        if nx < 0 || nx >= width || ny < 0 || ny >= height
+                          then pure False
+                          else do
+                            let ni = ny * width + nx
+                            nr <- readArray dRArr ni
+                            ng <- readArray dGArr ni
+                            nb <- readArray dBArr ni
+                            pure (detectClashF center (nr, ng, nb) threshold)
+                    ) False neighbors8
+                else pure False
+              bad <- case badArr of
+                Just arr -> readArray arr i
+                Nothing -> pure False
+              let (dR, dG, dB) =
+                    if nearEdge && (mismatch || hard || clash || bad)
+                    then (dAllCorr, dAllCorr, dAllCorr)
+                    else (dR1, dG1, dB1)
+                  r = distanceToByteF range dR
+                  g = distanceToByteF range dG
+                  b = distanceToByteF range dB
+              case fmt of
+                BitmapMSDF -> do
+                  writeArray out base r
+                  writeArray out (base + 1) g
+                  writeArray out (base + 2) b
+                BitmapMTSDF -> do
+                  writeArray out base r
+                  writeArray out (base + 1) g
+                  writeArray out (base + 2) b
+                  writeArray out (base + 3) (distanceToByteF range dAllRaw)
+    (_, tOut) <- timeIO $
+      parallelForRows (if cfg.correction.enableCorrection then computeOutCorrection else computeOutNoCorrection)
+    when timingEnabled $
+      printf "msdf: renderBitmap %dx%d edges=%d inside=%.2f idx=%.2f coarse=%.2f dist=%.2f corr=%.2f bad=%.2f out=%.2f\n"
+        width height edgesCount tInside tIndex tCoarse tDistances tCorr tBad tOut
+    freeze out
+
+{-# NOINLINE renderBitmap #-}
 
 bboxFromEdgeInfos :: [EdgeInfo] -> Maybe BBox
 bboxFromEdgeInfos [] = Nothing
@@ -1838,169 +2202,523 @@ bboxUnionSimple a b = BBox
   , yMax = max a.yMax b.yMax
   }
 
-bboxDistanceSq :: BBox -> Vec2 -> Double
-bboxDistanceSq bb (px, py) =
-  let dx
-        | px < bb.xMin = bb.xMin - px
-        | px > bb.xMax = px - bb.xMax
+bboxDistanceSqIdx :: EdgeIndexInfo -> Int -> Vec2 -> Double
+bboxDistanceSqIdx idx i (px, py) =
+  let minX = idx.edgeBBoxMinX ! i
+      maxX = idx.edgeBBoxMaxX ! i
+      minY = idx.edgeBBoxMinY ! i
+      maxY = idx.edgeBBoxMaxY ! i
+      dx
+        | px < minX = minX - px
+        | px > maxX = px - maxX
         | otherwise = 0
       dy
-        | py < bb.yMin = bb.yMin - py
-        | py > bb.yMax = py - bb.yMax
+        | py < minY = minY - py
+        | py > maxY = py - maxY
         | otherwise = 0
   in dx * dx + dy * dy
 
 data EdgeIndexInfo = EdgeIndexInfo
-  { cellSize :: Double
-  , originX :: Double
-  , originY :: Double
-  , gridW :: Int
-  , gridH :: Int
-  , cells :: Array Int [Int]
-  , edges :: Array Int EdgeInfo
-  , edgeBBoxes :: Array Int BBox
-  , edgeSegs :: Array Int [LineSeg]
+  { cellSize :: !Double
+  , originX :: !Double
+  , originY :: !Double
+  , gridW :: !Int
+  , gridH :: !Int
+  , edgeCount :: !Int
+  , cellStarts :: !(UA.UArray Int Int)
+  , cellCounts :: !(UA.UArray Int Int)
+  , cellEdges :: !(UA.UArray Int Int)
+  , edgeBBoxMinX :: !(UA.UArray Int Double)
+  , edgeBBoxMinY :: !(UA.UArray Int Double)
+  , edgeBBoxMaxX :: !(UA.UArray Int Double)
+  , edgeBBoxMaxY :: !(UA.UArray Int Double)
+  , segOffsets :: !(UA.UArray Int Int)
+  , segCounts :: !(UA.UArray Int Int)
+  , segX0 :: !(UA.UArray Int Double)
+  , segY0 :: !(UA.UArray Int Double)
+  , segX1 :: !(UA.UArray Int Double)
+  , segY1 :: !(UA.UArray Int Double)
+  , edgeOverlaps :: !(UA.UArray Int Word8)
+  , edgeMasks :: !(UA.UArray Int Int)
+  , edgeKind :: !(UA.UArray Int Int)
+  , edgeStartX :: !(UA.UArray Int Double)
+  , edgeStartY :: !(UA.UArray Int Double)
+  , edgeEndX :: !(UA.UArray Int Double)
+  , edgeEndY :: !(UA.UArray Int Double)
+  , edgePseudoStartX :: !(UA.UArray Int Double)
+  , edgePseudoStartY :: !(UA.UArray Int Double)
+  , edgePseudoEndX :: !(UA.UArray Int Double)
+  , edgePseudoEndY :: !(UA.UArray Int Double)
+  , lineDx :: !(UA.UArray Int Double)
+  , lineDy :: !(UA.UArray Int Double)
+  , lineInvLen2 :: !(UA.UArray Int Double)
+  , quadAx :: !(UA.UArray Int Double)
+  , quadAy :: !(UA.UArray Int Double)
+  , quadBx :: !(UA.UArray Int Double)
+  , quadBy :: !(UA.UArray Int Double)
+  , quadC3 :: !(UA.UArray Int Double)
+  , quadC2 :: !(UA.UArray Int Double)
+  , quadC1base :: !(UA.UArray Int Double)
   }
 
 
-buildEdgeIndexInfo :: Double -> Double -> BBox -> [EdgeInfo] -> EdgeIndexInfo
-buildEdgeIndexInfo flatness cellSize' bb edgesList =
+buildEdgeIndexInfo :: Double -> Double -> BBox -> BBox -> Bool -> [(EdgeColor, EdgeInfo)] -> EdgeIndexInfo
+buildEdgeIndexInfo flatness cellSize' bb clipBB0 buildSegs coloredEdges =
   let cellSize'' = max 1 cellSize'
-      width = (max 1 (ceiling (bb.xMax - bb.xMin) + 1) :: Int)
-      height = (max 1 (ceiling (bb.yMax - bb.yMin) + 1) :: Int)
+      clipBB = bboxExpand 0 clipBB0
+      gridBB = case bboxIntersect bb clipBB of
+        Just b -> b
+        Nothing -> bb
+      width = (max 1 (ceiling (gridBB.xMax - gridBB.xMin) + 1) :: Int)
+      height = (max 1 (ceiling (gridBB.yMax - gridBB.yMin) + 1) :: Int)
+      filteredEdges =
+        [ (c, e)
+        | (c, e) <- coloredEdges
+        , bboxOverlaps (edgeBBox e.edge) clipBB
+        ]
+      edgesList = map snd filteredEdges
       gridW' = max 1 (ceiling (fromIntegral width / cellSize''))
       gridH' = max 1 (ceiling (fromIntegral height / cellSize''))
-      edgesArr =
-        if null edgesList
-        then array (0, -1) []
-        else array (0, length edgesList - 1) (zip [0..] edgesList)
-      edgeSegsArr =
-        if null edgesList
-        then array (0, -1) []
-        else array (0, length edgesList - 1)
-          [ (i, flattenEdges flatness [info.edge]) | (i, info) <- zip [0..] edgesList ]
+      edgeCount = length edgesList
       edgeBBoxArr =
         if null edgesList
         then array (0, -1) []
-        else array (0, length edgesList - 1)
-          [ (i, edgeBBox info.edge) | (i, info) <- zip [0..] edgesList ]
-      pairs = concat
-        [ [ (cellIndex gridW' x y, i) | x <- [x0 .. x1], y <- [y0 .. y1] ]
-        | (i, e) <- zip [0..] edgesList
-        , let bbE = edgeBBox e.edge
-              x0 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMin)
-              x1 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMax)
-              y0 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMin)
-              y1 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMax)
-        ]
-      cellsArr = accumArray (flip (:)) [] (0, gridW' * gridH' - 1) pairs
+        else array (0, edgeCount - 1)
+          [ (i, edgeBBox info.edge) | (i, info) <- zip [0 ..] edgesList ]
+      edgeBBoxMinXArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1)
+          [ (edgeBBoxArr ! i).xMin | i <- [0 .. edgeCount - 1] ]
+      edgeBBoxMinYArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1)
+          [ (edgeBBoxArr ! i).yMin | i <- [0 .. edgeCount - 1] ]
+      edgeBBoxMaxXArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1)
+          [ (edgeBBoxArr ! i).xMax | i <- [0 .. edgeCount - 1] ]
+      edgeBBoxMaxYArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1)
+          [ (edgeBBoxArr ! i).yMax | i <- [0 .. edgeCount - 1] ]
+      edgeClipArr =
+        if null edgesList
+        then array (0, -1) []
+        else array (0, edgeCount - 1)
+          [ (i, bboxIntersect (edgeBBoxArr ! i) clipBB) | i <- [0 .. edgeCount - 1] ]
+      maskArr =
+        if null filteredEdges
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, length filteredEdges - 1)
+          [ colorMask c | (c, _) <- filteredEdges ]
+      segsPerEdge =
+        if not buildSegs
+        then replicate edgeCount []
+        else [ if info.overlaps then flattenEdges flatness [info.edge] else []
+             | info <- edgesList
+             ]
+      segCountsList =
+        if null edgesList
+        then []
+        else map length segsPerEdge
+      segOffsetsList =
+        if null edgesList
+        then []
+        else scanl (+) 0 segCountsList
+      totalSegs =
+        if null segOffsetsList
+        then 0
+        else last segOffsetsList
+      segOffsetsArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1) (take edgeCount segOffsetsList)
+      segCountsArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1) segCountsList
+      (segX0Arr, segY0Arr, segX1Arr, segY1Arr) =
+        if totalSegs <= 0
+        then (UA.listArray (0, -1) [], UA.listArray (0, -1) [], UA.listArray (0, -1) [], UA.listArray (0, -1) [])
+        else runST $ do
+          x0Arr <- (newArray (0, totalSegs - 1) 0.0 :: ST s (STUArray s Int Double))
+          y0Arr <- (newArray (0, totalSegs - 1) 0.0 :: ST s (STUArray s Int Double))
+          x1Arr <- (newArray (0, totalSegs - 1) 0.0 :: ST s (STUArray s Int Double))
+          y1Arr <- (newArray (0, totalSegs - 1) 0.0 :: ST s (STUArray s Int Double))
+          forM_ (zip [0 ..] segsPerEdge) $ \(i, segs) -> do
+            let off = segOffsetsArr ! i
+            forM_ (zip [0 ..] segs) $ \(j, ((sx, sy), (ex, ey))) -> do
+              let k = off + j
+              writeArray x0Arr k sx
+              writeArray y0Arr k sy
+              writeArray x1Arr k ex
+              writeArray y1Arr k ey
+          x0' <- freeze x0Arr
+          y0' <- freeze y0Arr
+          x1' <- freeze x1Arr
+          y1' <- freeze y1Arr
+          pure (x0', y0', x1', y1')
+      edgeOverlapsArr =
+        if null edgesList
+        then UA.listArray (0, -1) []
+        else UA.listArray (0, edgeCount - 1)
+          [ if info.overlaps then 1 else 0 | info <- edgesList ]
+      (edgeKindArr, edgeStartXArr, edgeStartYArr, edgeEndXArr, edgeEndYArr
+        , edgePseudoStartXArr, edgePseudoStartYArr, edgePseudoEndXArr, edgePseudoEndYArr
+        , lineDxArr, lineDyArr, lineInvLen2Arr
+        , quadAxArr, quadAyArr, quadBxArr, quadByArr, quadC3Arr, quadC2Arr, quadC1baseArr) =
+          buildEdgeParamArrays edgesList
+      cellCountArr =
+        let cellCount = gridW' * gridH'
+        in runSTUArray $ do
+             arr <- (newArray (0, cellCount - 1) 0 :: ST s (STUArray s Int Int))
+             forM_ [0 .. edgeCount - 1] $ \i -> do
+               case edgeClipArr ! i of
+                 Nothing -> pure ()
+                 Just bbE -> do
+                   let x0 = clamp 0 (gridW' - 1) (toCell gridBB.xMin cellSize'' bbE.xMin)
+                       x1 = clamp 0 (gridW' - 1) (toCell gridBB.xMin cellSize'' bbE.xMax)
+                       y0 = clamp 0 (gridH' - 1) (toCell gridBB.yMin cellSize'' bbE.yMin)
+                       y1 = clamp 0 (gridH' - 1) (toCell gridBB.yMin cellSize'' bbE.yMax)
+                   forM_ [y0 .. y1] $ \y -> do
+                     forM_ [x0 .. x1] $ \x -> do
+                       let idx = cellIndex gridW' x y
+                       cur <- readArray arr idx
+                       writeArray arr idx (cur + 1)
+             pure arr
+      (cellStartsArr, totalEdges) = buildCellStarts cellCountArr
+      cellEdgesArr =
+        if totalEdges <= 0
+        then UA.listArray (0, -1) []
+        else runSTUArray $ do
+          arr <- (newArray (0, totalEdges - 1) 0 :: ST s (STUArray s Int Int))
+          posArr <- (thaw cellStartsArr :: ST s (STUArray s Int Int))
+          forM_ [0 .. edgeCount - 1] $ \i -> do
+            case edgeClipArr ! i of
+              Nothing -> pure ()
+              Just bbE -> do
+                let x0 = clamp 0 (gridW' - 1) (toCell gridBB.xMin cellSize'' bbE.xMin)
+                    x1 = clamp 0 (gridW' - 1) (toCell gridBB.xMin cellSize'' bbE.xMax)
+                    y0 = clamp 0 (gridH' - 1) (toCell gridBB.yMin cellSize'' bbE.yMin)
+                    y1 = clamp 0 (gridH' - 1) (toCell gridBB.yMin cellSize'' bbE.yMax)
+                forM_ [y0 .. y1] $ \y -> do
+                  forM_ [x0 .. x1] $ \x -> do
+                    let idx = cellIndex gridW' x y
+                    pos <- readArray posArr idx
+                    writeArray arr pos i
+                    writeArray posArr idx (pos + 1)
+          pure arr
   in EdgeIndexInfo
        { cellSize = cellSize''
-       , originX = bb.xMin
-       , originY = bb.yMin
+       , originX = gridBB.xMin
+       , originY = gridBB.yMin
        , gridW = gridW'
        , gridH = gridH'
-       , cells = cellsArr
-       , edges = edgesArr
-       , edgeBBoxes = edgeBBoxArr
-       , edgeSegs = edgeSegsArr
+       , edgeCount = edgeCount
+       , cellStarts = cellStartsArr
+       , cellCounts = cellCountArr
+       , cellEdges = cellEdgesArr
+       , edgeBBoxMinX = edgeBBoxMinXArr
+       , edgeBBoxMinY = edgeBBoxMinYArr
+       , edgeBBoxMaxX = edgeBBoxMaxXArr
+       , edgeBBoxMaxY = edgeBBoxMaxYArr
+       , segOffsets = segOffsetsArr
+       , segCounts = segCountsArr
+       , segX0 = segX0Arr
+       , segY0 = segY0Arr
+       , segX1 = segX1Arr
+       , segY1 = segY1Arr
+       , edgeOverlaps = edgeOverlapsArr
+       , edgeMasks = maskArr
+       , edgeKind = edgeKindArr
+       , edgeStartX = edgeStartXArr
+       , edgeStartY = edgeStartYArr
+       , edgeEndX = edgeEndXArr
+       , edgeEndY = edgeEndYArr
+       , edgePseudoStartX = edgePseudoStartXArr
+       , edgePseudoStartY = edgePseudoStartYArr
+       , edgePseudoEndX = edgePseudoEndXArr
+       , edgePseudoEndY = edgePseudoEndYArr
+       , lineDx = lineDxArr
+       , lineDy = lineDyArr
+       , lineInvLen2 = lineInvLen2Arr
+       , quadAx = quadAxArr
+       , quadAy = quadAyArr
+       , quadBx = quadBxArr
+       , quadBy = quadByArr
+       , quadC3 = quadC3Arr
+       , quadC2 = quadC2Arr
+       , quadC1base = quadC1baseArr
        }
 
-minDistanceInfo :: Bool -> EdgeIndexInfo -> Vec2 -> Double
-minDistanceInfo usePseudo idx p =
-  let (elo, ehi) = bounds idx.edges
-  in if elo > ehi
-     then 1e9
-     else
-       let (cx, cy) = pointCell idx p
-           maxR = max idx.gridW idx.gridH
-           scanRing minX maxX minY maxY r best0 =
-             let goY y bestY
-                   | y > maxY = bestY
-                   | otherwise =
-                       let goX x bestX
-                             | x > maxX = bestX
-                             | r == 0 || x == minX || x == maxX || y == minY || y == maxY =
-                                 goX (x + 1) (scanCell idx p usePseudo bestX (x, y))
-                             | otherwise = goX (x + 1) bestX
-                           bestY' = goX minX bestY
-                       in goY (y + 1) bestY'
-             in goY minY best0
-           go r best =
-             let minX = max 0 (cx - r)
-                 maxX = min (idx.gridW - 1) (cx + r)
-                 minY = max 0 (cy - r)
-                 maxY = min (idx.gridH - 1) (cy + r)
-                 best' = scanRing minX maxX minY maxY r best
-                 minBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) p
-                 fullGrid = minX == 0 && maxX == idx.gridW - 1 && minY == 0 && maxY == idx.gridH - 1
-             in if best' <= minBoundary
-                then best'
-                else if fullGrid || r >= maxR
-                     then best'
-                     else go (r + 1) best'
-       in go 0 1e18
+buildEdgeParamArrays
+  :: [EdgeInfo]
+  -> ( UA.UArray Int Int
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     , UA.UArray Int Double
+     )
+buildEdgeParamArrays edgesList =
+  if null edgesList
+  then
+    ( UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    , UA.listArray (0, -1) []
+    )
+  else
+    let n = length edgesList
+        bounds' = (0, n - 1)
+    in runST $ do
+      kindArr <- newArray bounds' 0 :: ST s (STUArray s Int Int)
+      sxArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      syArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      exArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      eyArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      psxArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      psyArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      pexArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      peyArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      ldxArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      ldyArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      linvArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qaxArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qayArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qbxArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qbyArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qc3Arr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qc2Arr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      qc1Arr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
+      forM_ (zip [0 ..] edgesList) $ \(i, e) -> do
+        let (sx, sy) = e.start
+            (ex, ey) = e.end
+            (psx, psy) = e.pseudoStart
+            (pex, pey) = e.pseudoEnd
+        writeArray kindArr i $
+          case e.edgeData of
+            EdgeLineData {} -> 0
+            EdgeQuadData {} -> 1
+        writeArray sxArr i sx
+        writeArray syArr i sy
+        writeArray exArr i ex
+        writeArray eyArr i ey
+        writeArray psxArr i psx
+        writeArray psyArr i psy
+        writeArray pexArr i pex
+        writeArray peyArr i pey
+        case e.edgeData of
+          EdgeLineData dx dy invLen2 -> do
+            writeArray ldxArr i dx
+            writeArray ldyArr i dy
+            writeArray linvArr i invLen2
+          _ -> pure ()
+        case e.edgeData of
+          EdgeQuadData ax ay bx by c3 c2 c1base -> do
+            writeArray qaxArr i ax
+            writeArray qayArr i ay
+            writeArray qbxArr i bx
+            writeArray qbyArr i by
+            writeArray qc3Arr i c3
+            writeArray qc2Arr i c2
+            writeArray qc1Arr i c1base
+          _ -> pure ()
+      kind <- freeze kindArr
+      sx <- freeze sxArr
+      sy <- freeze syArr
+      ex <- freeze exArr
+      ey <- freeze eyArr
+      psx <- freeze psxArr
+      psy <- freeze psyArr
+      pex <- freeze pexArr
+      pey <- freeze peyArr
+      ldx <- freeze ldxArr
+      ldy <- freeze ldyArr
+      linv <- freeze linvArr
+      qax <- freeze qaxArr
+      qay <- freeze qayArr
+      qbx <- freeze qbxArr
+      qby <- freeze qbyArr
+      qc3 <- freeze qc3Arr
+      qc2 <- freeze qc2Arr
+      qc1 <- freeze qc1Arr
+      pure
+        ( kind
+        , sx
+        , sy
+        , ex
+        , ey
+        , psx
+        , psy
+        , pex
+        , pey
+        , ldx
+        , ldy
+        , linv
+        , qax
+        , qay
+        , qbx
+        , qby
+        , qc3
+        , qc2
+        , qc1
+        )
 
-scanCell :: EdgeIndexInfo -> Vec2 -> Bool -> Double -> (Int, Int) -> Double
-scanCell idx p usePseudo best (x, y) =
-  let cellIdx = cellIndex idx.gridW x y
-      edgeIdxs = idx.cells ! cellIdx
-      bestSq0 = best * best
-      go acc _ [] = acc
-      go acc accSq (i:is) =
-        let bb = idx.edgeBBoxes ! i
-            dSqBB = bboxDistanceSq bb p
-        in if dSqBB >= accSq
-           then go acc accSq is
-           else
-             let (dist, _) = edgeDistanceWithParam usePseudo p (idx.edges ! i)
-                 acc' = if dist < acc then dist else acc
-                 accSq' = if dist < acc then dist * dist else accSq
-             in go acc' accSq' is
-  in go best bestSq0 edgeIdxs
+buildCellStarts :: UA.UArray Int Int -> (UA.UArray Int Int, Int)
+buildCellStarts counts =
+  runST $ do
+    let (lo, hi) = bounds counts
+    starts <- (newArray (lo, hi) 0 :: ST s (STUArray s Int Int))
+    let go i acc
+          | i > hi = pure acc
+          | otherwise = do
+              let c = counts ! i
+              writeArray starts i acc
+              go (i + 1) (acc + c)
+    total <- go lo 0
+    starts' <- freeze starts
+    pure (starts', total)
 
-edgeDistanceWithParam :: Bool -> Vec2 -> EdgeInfo -> (Double, Double)
-edgeDistanceWithParam usePseudo p info =
-  let (dSq, t) = edgeDistanceSqWithParamFast p info
-      d = if usePseudo then edgeDistancePseudoFrom p info dSq t else sqrt dSq
-  in (d, t)
+edgeDistanceSqLineIdx :: EdgeIndexInfo -> Int -> Vec2 -> (Double, Double)
+edgeDistanceSqLineIdx idx i (px, py) =
+  let x0 = idx.edgeStartX ! i
+      y0 = idx.edgeStartY ! i
+      dx = idx.lineDx ! i
+      dy = idx.lineDy ! i
+      invLen2 = idx.lineInvLen2 ! i
+      t = if invLen2 == 0
+          then 0
+          else ((px - x0) * dx + (py - y0) * dy) * invLen2
+      t' = max 0 (min 1 t)
+      cx = x0 + t' * dx
+      cy = y0 + t' * dy
+      ex = px - cx
+      ey = py - cy
+  in (ex * ex + ey * ey, t')
 
-edgeDistanceSqWithParamFast :: Vec2 -> EdgeInfo -> (Double, Double)
-edgeDistanceSqWithParamFast p info =
-  case info.edgeData of
-    EdgeLineData dx dy invLen2 ->
-      let (x0, y0) = info.start
-          (px, py) = p
-          t = if invLen2 == 0
-              then 0
-              else ((px - x0) * dx + (py - y0) * dy) * invLen2
-          t' = max 0 (min 1 t)
-          cx = x0 + t' * dx
-          cy = y0 + t' * dy
-          ex = px - cx
-          ey = py - cy
-      in (ex * ex + ey * ey, t')
-    EdgeQuadData ax ay bx by c3 c2 c1base ->
-      case info.edge of
-        EdgeQuad p0 p1 p2 ->
-          let (x0, y0) = p0
-              (px, py) = p
-              cx = x0 - px
-              cy = y0 - py
-              c1 = c1base + 2 * (ax * cx + ay * cy)
-              c0 = bx * cx + by * cy
-              d0 = distanceSq2 x0 y0 px py
-              (x2, y2) = p2
-              d1 = distanceSq2 x2 y2 px py
-              start = if d0 < d1 then (d0, 0) else (d1, 1)
-              pick t (bestD, bestT) =
-                if t >= 0 && t <= 1
-                then
-                  let d = distanceSqBezier2 p0 p1 p2 p t
-                  in if d < bestD then (d, t) else (bestD, bestT)
-                else (bestD, bestT)
-          in foldCubicRoots c3 c2 c1 c0 start pick
-        EdgeLine _ _ -> (1e18, 0)
+edgeDistanceSqQuadIdx :: EdgeIndexInfo -> Int -> Vec2 -> (Double, Double)
+edgeDistanceSqQuadIdx idx i (px, py) =
+  let x0 = idx.edgeStartX ! i
+      y0 = idx.edgeStartY ! i
+      ax = idx.quadAx ! i
+      ay = idx.quadAy ! i
+      bx = idx.quadBx ! i
+      by = idx.quadBy ! i
+      c3 = idx.quadC3 ! i
+      c2 = idx.quadC2 ! i
+      c1base = idx.quadC1base ! i
+      cx = x0 - px
+      cy = y0 - py
+      c1 = c1base + 2 * (ax * cx + ay * cy)
+      c0 = bx * cx + by * cy
+      d0 = distanceSq2 x0 y0 px py
+      p1x = x0 + bx * 0.5
+      p1y = y0 + by * 0.5
+      x2 = x0 + bx + ax
+      y2 = y0 + by + ay
+      d1 = distanceSq2 x2 y2 px py
+      start = if d0 < d1 then (d0, 0) else (d1, 1)
+      pick t (bestD, bestT) =
+        if t >= 0 && t <= 1
+        then
+          let d = distanceSqBezier2 (x0, y0) (p1x, p1y) (x2, y2) (px, py) t
+          in if d < bestD then (d, t) else (bestD, bestT)
+        else (bestD, bestT)
+  in foldCubicRoots c3 c2 c1 c0 start pick
+
+edgeDistanceSqWithParamFastIdx :: EdgeIndexInfo -> Int -> Vec2 -> (Double, Double)
+edgeDistanceSqWithParamFastIdx idx i p =
+  if idx.edgeKind ! i == 0
+  then edgeDistanceSqLineIdx idx i p
+  else edgeDistanceSqQuadIdx idx i p
+
+edgeDistancePseudoFromIdx :: EdgeIndexInfo -> Int -> Vec2 -> Double -> Double -> Double
+edgeDistancePseudoFromIdx idx i p d t =
+  let eps = 1e-6
+  in if t <= 0 + eps
+     then pseudoAt (idx.edgeStartX ! i, idx.edgeStartY ! i)
+                   (idx.edgePseudoStartX ! i, idx.edgePseudoStartY ! i)
+                   p d
+     else if t >= 1 - eps
+          then pseudoAt (idx.edgeEndX ! i, idx.edgeEndY ! i)
+                        (idx.edgePseudoEndX ! i, idx.edgePseudoEndY ! i)
+                        p d
+          else d
+
+edgePointAtIdx :: EdgeIndexInfo -> Int -> Double -> Vec2
+edgePointAtIdx idx i t =
+  if idx.edgeKind ! i == 0
+  then
+    let x0 = idx.edgeStartX ! i
+        y0 = idx.edgeStartY ! i
+        dx = idx.lineDx ! i
+        dy = idx.lineDy ! i
+    in (x0 + t * dx, y0 + t * dy)
+  else
+    let x0 = idx.edgeStartX ! i
+        y0 = idx.edgeStartY ! i
+        ax = idx.quadAx ! i
+        ay = idx.quadAy ! i
+        bx = idx.quadBx ! i
+        by = idx.quadBy ! i
+        tt = t * t
+    in (x0 + bx * t + ax * tt, y0 + by * t + ay * tt)
+
+edgeTangentAtIdx :: EdgeIndexInfo -> Int -> Double -> Vec2
+edgeTangentAtIdx idx i t =
+  if idx.edgeKind ! i == 0
+  then (idx.lineDx ! i, idx.lineDy ! i)
+  else
+    let ax = idx.quadAx ! i
+        ay = idx.quadAy ! i
+        bx = idx.quadBx ! i
+        by = idx.quadBy ! i
+    in (bx + 2 * ax * t, by + 2 * ay * t)
+
+edgeUnitNormalAtIdx :: EdgeIndexInfo -> Int -> Double -> Vec2
+edgeUnitNormalAtIdx idx i t =
+  let (dx, dy) = edgeTangentAtIdx idx i t
+      n = normalizeVec (-dy, dx)
+  in if nearZero n
+     then
+       let ps = (idx.edgePseudoStartX ! i, idx.edgePseudoStartY ! i)
+           pe = (idx.edgePseudoEndX ! i, idx.edgePseudoEndY ! i)
+           blend = vecAdd (vecScale (1 - t) ps) (vecScale t pe)
+       in normalizeVec blend
+     else n
 
 distanceSqBezier2 :: Vec2 -> Vec2 -> Vec2 -> Vec2 -> Double -> Double
 distanceSqBezier2 (x0, y0) (x1, y1) (x2, y2) (px, py) t =
@@ -2072,16 +2790,6 @@ foldLinearRoots a b z f
 cbrt :: Double -> Double
 cbrt x = if x < 0 then -((abs x) ** (1 / 3)) else x ** (1 / 3)
 
-edgeDistancePseudoFrom :: Vec2 -> EdgeInfo -> Double -> Double -> Double
-edgeDistancePseudoFrom p info dSq t =
-  let d = sqrt dSq
-      eps = 1e-6
-  in if t <= 0 + eps
-     then pseudoAt info.start info.pseudoStart p d
-     else if t >= 1 - eps
-          then pseudoAt info.end info.pseudoEnd p d
-          else d
-
 pseudoAt :: Vec2 -> Vec2 -> Vec2 -> Double -> Double
 pseudoAt origin n p fallback =
   if nearZero n
@@ -2100,6 +2808,22 @@ distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py') =
       dx = min (px' - x0) (x1 - px')
       dy = min (py' - y0) (y1 - py')
   in max 0 (min dx dy)
+
+cellDistanceSq :: EdgeIndexInfo -> Vec2 -> (Int, Int) -> Double
+cellDistanceSq idx (px', py') (cx, cy) =
+  let x0 = idx.originX + fromIntegral cx * idx.cellSize
+      x1 = x0 + idx.cellSize
+      y0 = idx.originY + fromIntegral cy * idx.cellSize
+      y1 = y0 + idx.cellSize
+      dx
+        | px' < x0 = x0 - px'
+        | px' > x1 = px' - x1
+        | otherwise = 0
+      dy
+        | py' < y0 = y0 - py'
+        | py' > y1 = py' - y1
+        | otherwise = 0
+  in dx * dx + dy * dy
 
 pointCell :: EdgeIndexInfo -> Vec2 -> (Int, Int)
 pointCell idx (px', py') =
@@ -2124,10 +2848,14 @@ buildScanlineInside
   -> Double
   -> Double
   -> [LineSeg]
-  -> ST s (Maybe (STUArray s Int Bool))
+  -> IO (IOUArray Int Word8)
 buildScanlineInside rule width height offsetX offsetY segs = do
   let n = width * height
-  arr <- newArray (0, n - 1) False :: ST s (STUArray s Int Bool)
+      bytes = insideMaskBytes n
+  arr <-
+    if bytes <= 0
+    then newArray (0, -1) 0
+    else newArray (0, bytes - 1) 0 :: IO (IOUArray Int Word8)
   let halfOpen y0 y1 py = (y0 <= py && y1 > py) || (y1 <= py && y0 > py)
       rowInside py =
         let hits =
@@ -2154,10 +2882,61 @@ buildScanlineInside rule width height offsetX offsetY segs = do
                   (passed, remaining) = span (\(xHit, _) -> xHit <= px) rest
                   w' = w + sum (map snd passed)
                   inside = applyRule w'
-              writeArray arr (y * width + xIdx) inside
+              when inside $
+                setInsideBit arr (y * width + xIdx)
               go (xIdx + 1) remaining w'
     go 0 hits 0
-  pure (Just arr)
+  pure arr
+
+{-# INLINE insideMaskBytes #-}
+insideMaskBytes :: Int -> Int
+insideMaskBytes n =
+  if n <= 0 then 0 else (n + 7) `div` 8
+
+{-# INLINE insideMaskAt #-}
+insideMaskAt :: IOUArray Int Word8 -> Int -> IO Bool
+insideMaskAt arr idx = do
+  let byte = idx `shiftR` 3
+      bit = idx .&. 7
+      mask = (1 `shiftL` bit) :: Int
+  v <- readArray arr byte
+  pure ((v .&. fromIntegral mask) /= 0)
+
+{-# INLINE setInsideBit #-}
+setInsideBit :: IOUArray Int Word8 -> Int -> IO ()
+setInsideBit arr idx = do
+  let byte = idx `shiftR` 3
+      bit = idx .&. 7
+      mask = (1 `shiftL` bit) :: Int
+  cur <- readArray arr byte
+  writeArray arr byte (cur .|. fromIntegral mask)
+
+{-# INLINE windingNumberSlice #-}
+windingNumberSlice :: EdgeIndexInfo -> Int -> Int -> Vec2 -> Int
+windingNumberSlice idx off count (px', py') =
+  let end = off + count
+      go i wn
+        | i >= end = wn
+        | otherwise =
+            let x0 = idx.segX0 ! i
+                y0 = idx.segY0 ! i
+                x1 = idx.segX1 ! i
+                y1 = idx.segY1 ! i
+                wn' =
+                  if y0 <= py'
+                  then if y1 > py' && isLeft (x0, y0) (x1, y1) (px', py') > 0
+                       then wn + 1
+                       else wn
+                  else if y1 <= py' && isLeft (x0, y0) (x1, y1) (px', py') < 0
+                       then wn - 1
+                       else wn
+            in go (i + 1) wn'
+  in go off 0
+
+{-# INLINE isLeft #-}
+isLeft :: Vec2 -> Vec2 -> Vec2 -> Double
+isLeft (x0, y0) (x1, y1) (px', py') =
+  (x1 - x0) * (py' - y0) - (px' - x0) * (y1 - y0)
 
 applyFillRule :: FillRule -> Int -> Bool
 applyFillRule rule w =
@@ -2171,7 +2950,8 @@ edgeIsBoundary :: FillRule -> Double -> Double -> [LineSeg] -> [[LineSeg]] -> Bo
 edgeIsBoundary rule eps _flatness segsAll _segsByContour useContour info =
   let edge = info.edge
       len = edgeLengthApprox edge
-      base = max eps (len * 1e-3)
+      -- Use a minimum pixel step so tiny contours (dots) don't get filtered out.
+      base = max eps (max 0.5 (len * 1e-2))
       steps = [base, base * 2]
       samples = case edge of
         EdgeLine _ _ -> [0.5]
@@ -2223,14 +3003,10 @@ edgeUnitNormalAt info t =
        in normalizeVec blend
      else n
 
-clampChannel :: Double -> Double -> Double -> Double
-clampChannel d dAll threshold =
+{-# INLINE clampChannelF #-}
+clampChannelF :: Float -> Float -> Float -> Float
+clampChannelF d dAll threshold =
   if abs (d - dAll) > threshold then dAll else d
-
-splitColoredEdges :: [(EdgeColor, EdgeInfo)] -> ([EdgeInfo], [EdgeInfo], [EdgeInfo])
-splitColoredEdges colored =
-  let edgesByMask mask = [ info | (col, info) <- colored, colorMask col .&. mask /= 0 ]
-  in (edgesByMask 1, edgesByMask 2, edgesByMask 4)
 
 colorMask :: EdgeColor -> Int
 colorMask c =
@@ -2243,20 +3019,21 @@ colorMask c =
     ColorCyan -> 6
     ColorWhite -> 7
 
-median3 :: Double -> Double -> Double -> Double
-median3 a b c = max (min a b) (min (max a b) c)
+{-# INLINE median3F #-}
+median3F :: Float -> Float -> Float -> Float
+median3F a b c = max (min a b) (min (max a b) c)
 
-detectClash :: (Double, Double, Double) -> (Double, Double, Double) -> Double -> Bool
-detectClash (ar, ag, ab) (br, bg, bb) threshold =
-  let am = median3 ar ag ab
-      bm = median3 br bg bb
-      devsA :: [(Int, Double)]
+detectClashF :: (Float, Float, Float) -> (Float, Float, Float) -> Float -> Bool
+detectClashF (ar, ag, ab) (br, bg, bb) threshold =
+  let am = median3F ar ag ab
+      bm = median3F br bg bb
+      devsA :: [(Int, Float)]
       devsA = sortOn (Down . snd)
         [ (0, abs (ar - am))
         , (1, abs (ag - am))
         , (2, abs (ab - am))
         ]
-      devsB :: [(Int, Double)]
+      devsB :: [(Int, Float)]
       devsB = sortOn (Down . snd)
         [ (0, abs (br - bm))
         , (1, abs (bg - bm))
@@ -2270,9 +3047,10 @@ detectClash (ar, ag, ab) (br, bg, bb) threshold =
      && abs ((aDist0 - aDist1) - (bDist0 - bDist1)) >= threshold
      && abs am >= abs bm
 
-distanceToByte :: Int -> Double -> Word8
-distanceToByte range dist =
-  let r = fromIntegral (max 1 range) :: Double
+{-# INLINE distanceToByteF #-}
+distanceToByteF :: Int -> Float -> Word8
+distanceToByteF range dist =
+  let r = fromIntegral (max 1 range) :: Float
       v = 0.5 + dist / (2 * r)
       v' = max 0 (min 1 v)
   in fromIntegral (round (v' * 255) :: Int)
