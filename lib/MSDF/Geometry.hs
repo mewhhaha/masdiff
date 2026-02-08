@@ -25,9 +25,9 @@ import MSDF.Outline (Point(..), Edge(..), Vec2)
 import MSDF.Types (BBox(..), bboxUnion)
 
 data EdgeRef = EdgeRef
-  { contourId :: Int
-  , edgeId :: Int
-  , edge :: Edge
+  { contourId :: !Int
+  , edgeId :: !Int
+  , edge :: !Edge
   } deriving (Eq, Show)
 
 data EdgeColor
@@ -41,8 +41,8 @@ data EdgeColor
   deriving (Eq, Show)
 
 data ColoredEdge = ColoredEdge
-  { color :: EdgeColor
-  , edgeRef :: EdgeRef
+  { color :: !EdgeColor
+  , edgeRef :: !EdgeRef
   } deriving (Eq, Show)
 
 edgePointAt :: Edge -> Double -> Vec2
@@ -286,15 +286,19 @@ distanceSq (x0, y0) (x1, y1) =
 
 dot :: Vec2 -> Vec2 -> Double
 dot (x0, y0) (x1, y1) = x0 * x1 + y0 * y1
+{-# INLINE dot #-}
 
 vecAdd :: Vec2 -> Vec2 -> Vec2
 vecAdd (x0, y0) (x1, y1) = (x0 + x1, y0 + y1)
+{-# INLINE vecAdd #-}
 
 vecSub :: Vec2 -> Vec2 -> Vec2
 vecSub (x0, y0) (x1, y1) = (x0 - x1, y0 - y1)
+{-# INLINE vecSub #-}
 
 vecScale :: Double -> Vec2 -> Vec2
 vecScale s (x, y) = (s * x, s * y)
+{-# INLINE vecScale #-}
 
 cbrt :: Double -> Double
 cbrt x = if x < 0 then -((abs x) ** (1 / 3)) else x ** (1 / 3)

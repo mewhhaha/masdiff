@@ -11,9 +11,9 @@ module MSDF.Outline
 
 -- | A point from the glyph outline.
 data Point = Point
-  { x :: Double
-  , y :: Double
-  , on :: Bool
+  { x :: !Double
+  , y :: !Double
+  , on :: !Bool
   } deriving (Eq, Show)
 
 type Vec2 = (Double, Double)

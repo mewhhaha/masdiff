@@ -40,113 +40,113 @@ bitmapChannels BitmapMTSDF = 4
 type GlyphIndex = Int
 
 data MSDFAtlas = MSDFAtlas
-  { fontName :: String
-  , unitsPerEm :: Int
-  , ascent :: Int
-  , descent :: Int
-  , lineGap :: Int
-  , vAscent :: Maybe Int
-  , vDescent :: Maybe Int
-  , vLineGap :: Maybe Int
-  , pixelSize :: Int
-  , range :: Int
-  , scale :: Double
-  , atlasPadding :: Int
-  , atlas :: Maybe AtlasImage
-  , glyphs :: Array GlyphIndex GlyphMSDF
-  , codepointIndex :: Array Int CodepointMapEntry
-  , kerning :: Array Int KerningPair
-  , markToBase :: [MarkToBase]
-  , markToMark :: [MarkToMark]
+  { fontName :: !String
+  , unitsPerEm :: !Int
+  , ascent :: !Int
+  , descent :: !Int
+  , lineGap :: !Int
+  , vAscent :: !(Maybe Int)
+  , vDescent :: !(Maybe Int)
+  , vLineGap :: !(Maybe Int)
+  , pixelSize :: !Int
+  , range :: !Int
+  , scale :: !Double
+  , atlasPadding :: !Int
+  , atlas :: !(Maybe AtlasImage)
+  , glyphs :: !(Array GlyphIndex GlyphMSDF)
+  , codepointIndex :: !(Array Int CodepointMapEntry)
+  , kerning :: !(Array Int KerningPair)
+  , markToBase :: ![MarkToBase]
+  , markToMark :: ![MarkToMark]
   }
 
 -- | Map from Unicode codepoint to glyph index.
 data CodepointMapEntry = CodepointMapEntry
-  { codepoint :: Int
-  , glyphIndex :: Int
+  { codepoint :: !Int
+  , glyphIndex :: !Int
   } deriving (Eq, Show)
 
 -- | Kerning pair adjustment in pixels.
 data KerningPair = KerningPair
-  { left :: Int
-  , right :: Int
-  , xAdvance :: Double
+  { left :: !Int
+  , right :: !Int
+  , xAdvance :: !Double
   } deriving (Eq, Show)
 
 -- | Anchor position in pixels.
 data Anchor = Anchor
-  { x :: Double
-  , y :: Double
+  { x :: !Double
+  , y :: !Double
   } deriving (Eq, Show)
 
 -- | Mark glyph anchor and class.
 data MarkGlyph = MarkGlyph
-  { markClass :: Int
-  , anchor :: Anchor
+  { markClass :: !Int
+  , anchor :: !Anchor
   } deriving (Eq, Show)
 
 -- | Base glyph anchors per mark class.
 data BaseGlyph = BaseGlyph
-  { anchors :: Array Int (Maybe Anchor)
+  { anchors :: !(Array Int (Maybe Anchor))
   } deriving (Eq, Show)
 
 data MarkToBase = MarkToBase
-  { classCount :: Int
-  , marks :: Array Int (Maybe MarkGlyph)
-  , bases :: Array Int (Maybe BaseGlyph)
+  { classCount :: !Int
+  , marks :: !(Array Int (Maybe MarkGlyph))
+  , bases :: !(Array Int (Maybe BaseGlyph))
   } deriving (Eq, Show)
 
 data MarkToMark = MarkToMark
-  { classCount :: Int
-  , marks1 :: Array Int (Maybe MarkGlyph)
-  , marks2 :: Array Int (Maybe BaseGlyph)
+  { classCount :: !Int
+  , marks1 :: !(Array Int (Maybe MarkGlyph))
+  , marks2 :: !(Array Int (Maybe BaseGlyph))
   } deriving (Eq, Show)
 
 -- | Per-glyph MSDF data.
 data GlyphMSDF = GlyphMSDF
-  { index :: GlyphIndex
-  , codepoints :: [Int]
-  , advance :: Double
-  , bearingX :: Double
-  , bearingY :: Double
-  , bbox :: BBox
-  , bitmap :: MSDFBitmap
-  , vertical :: Maybe VerticalMetrics
-  , placement :: Maybe GlyphPlacement
+  { index :: !GlyphIndex
+  , codepoints :: ![Int]
+  , advance :: !Double
+  , bearingX :: !Double
+  , bearingY :: !Double
+  , bbox :: !BBox
+  , bitmap :: !MSDFBitmap
+  , vertical :: !(Maybe VerticalMetrics)
+  , placement :: !(Maybe GlyphPlacement)
   } deriving (Eq, Show)
 
 -- | Optional vertical metrics for vertical writing.
 data VerticalMetrics = VerticalMetrics
-  { advance :: Double
-  , topSideBearing :: Double
+  { advance :: !Double
+  , topSideBearing :: !Double
   } deriving (Eq, Show)
 
 -- | Glyph placement inside an atlas (pixel and UV space).
 data GlyphPlacement = GlyphPlacement
-  { x :: Int
-  , y :: Int
-  , width :: Int
-  , height :: Int
-  , u0 :: Double
-  , v0 :: Double
-  , u1 :: Double
-  , v1 :: Double
+  { x :: !Int
+  , y :: !Int
+  , width :: !Int
+  , height :: !Int
+  , u0 :: !Double
+  , v0 :: !Double
+  , u1 :: !Double
+  , v1 :: !Double
   } deriving (Eq, Show)
 
 -- | Packed atlas image (RGB for MSDF, RGBA for MTSDF).
 data AtlasImage = AtlasImage
-  { width :: Int
-  , height :: Int
-  , format :: BitmapFormat
-  , pixels :: UArray Int Word8
+  { width :: !Int
+  , height :: !Int
+  , format :: !BitmapFormat
+  , pixels :: !(UArray Int Word8)
   } deriving (Eq, Show)
 
 -- | Glyph bounding box in pixels.
 data BBox = BBox
-  { xMin :: Double
-  , yMin :: Double
-  , xMax :: Double
-  , yMax :: Double
+  { xMin :: !Double
+  , yMin :: !Double
+  , xMax :: !Double
+  , yMax :: !Double
   } deriving (Eq, Show)
 
 newtype BBoxUnion = BBoxUnion { getBBoxUnion :: Maybe BBox }
@@ -176,12 +176,12 @@ instance Monoid BBoxUnion where
 
 -- | Packed bitmap data (RGB for MSDF, RGBA for MTSDF).
 data MSDFBitmap = MSDFBitmap
-  { width :: Int
-  , height :: Int
-  , offsetX :: Double
-  , offsetY :: Double
-  , format :: BitmapFormat
-  , pixels :: UArray Int Word8
+  { width :: !Int
+  , height :: !Int
+  , offsetX :: !Double
+  , offsetY :: !Double
+  , format :: !BitmapFormat
+  , pixels :: !(UArray Int Word8)
   } deriving (Eq, Show)
 
 instance NFData BBox where

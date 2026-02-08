@@ -324,13 +324,13 @@ msdfPreprocessEnabled = unsafePerformIO $ do
 {-# NOINLINE msdfPreprocessEnabled #-}
 
 data GlyphCache = GlyphCache
-  { location :: Maybe VariationLocation
-  , contours :: Array Int [[Point]]
+  { location :: !(Maybe VariationLocation)
+  , contours :: !(Array Int [[Point]])
   } deriving (Eq, Show)
 
 data GlyphCacheLazy = GlyphCacheLazy
-  { location :: Maybe VariationLocation
-  , contoursRef :: IORef (IntMap.IntMap [[Point]])
+  { location :: !(Maybe VariationLocation)
+  , contoursRef :: !(IORef (IntMap.IntMap [[Point]]))
   }
 
 variationLocation :: MSDFConfig -> TTF -> Maybe VariationLocation
@@ -659,14 +659,14 @@ normalizeContour cfg pts =
          in xs' ++ [first]
 
 data EdgeInfo = EdgeInfo
-  { edgeRef :: EdgeRef
-  , edge :: Edge
-  , start :: Vec2
-  , end :: Vec2
-  , pseudoStart :: Vec2
-  , pseudoEnd :: Vec2
-  , overlaps :: Bool
-  , edgeData :: EdgeDistanceData
+  { edgeRef :: !EdgeRef
+  , edge :: !Edge
+  , start :: !Vec2
+  , end :: !Vec2
+  , pseudoStart :: !Vec2
+  , pseudoEnd :: !Vec2
+  , overlaps :: !Bool
+  , edgeData :: !EdgeDistanceData
   }
 
 data EdgeDistanceData
@@ -844,10 +844,11 @@ contourIntersections
 contourIntersections eps segs bbs =
   let n = min (length segs) (length bbs)
       hi = n - 1
-      segArr =
+      segsN = take n segs
+      segBoundArr =
         if n <= 0
         then array (0, -1) []
-        else array (0, hi) (zip [0 .. hi] (take n segs))
+        else array (0, hi) [ (k, toBoundedSegs s) | (k, s) <- zip [0 .. hi] segsN ]
       bbArr =
         if n <= 0
         then array (0, -1) []
@@ -858,37 +859,57 @@ contourIntersections eps segs bbs =
        else
          case (bbArr ! i, bbArr ! j) of
            (Just bbA, Just bbB) ->
-             bboxOverlaps bbA bbB && segmentsIntersectAny eps (segArr ! i) (segArr ! j)
+             bboxOverlaps bbA bbB && segmentsIntersectAnyBounded eps (segBoundArr ! i) (segBoundArr ! j)
            _ -> False
 
-segmentsIntersectCore :: Double -> LineSeg -> LineSeg -> Bool
-segmentsIntersectCore eps (p1, p2) (q1, q2) =
-  let o1 = orient2D p1 p2 q1
-      o2 = orient2D p1 p2 q2
-      o3 = orient2D q1 q2 p1
-      o4 = orient2D q1 q2 p2
+segmentsIntersectCoreXY :: Double -> Double -> Double -> Double -> Double -> Double -> Double -> Double -> Double -> Bool
+segmentsIntersectCoreXY eps p1x p1y p2x p2y q1x q1y q2x q2y =
+  let o1 = orient2Dxy p1x p1y p2x p2y q1x q1y
+      o2 = orient2Dxy p1x p1y p2x p2y q2x q2y
+      o3 = orient2Dxy q1x q1y q2x q2y p1x p1y
+      o4 = orient2Dxy q1x q1y q2x q2y p2x p2y
       diff a b = (a > eps && b < -eps) || (a < -eps && b > eps)
   in (diff o1 o2 && diff o3 o4)
-     || (abs o1 <= eps && onSegmentBounds eps p1 p2 q1)
-     || (abs o2 <= eps && onSegmentBounds eps p1 p2 q2)
-     || (abs o3 <= eps && onSegmentBounds eps q1 q2 p1)
-     || (abs o4 <= eps && onSegmentBounds eps q1 q2 p2)
-{-# INLINE segmentsIntersectCore #-}
+     || (abs o1 <= eps && onSegmentBoundsXY eps p1x p1y p2x p2y q1x q1y)
+     || (abs o2 <= eps && onSegmentBoundsXY eps p1x p1y p2x p2y q2x q2y)
+     || (abs o3 <= eps && onSegmentBoundsXY eps q1x q1y q2x q2y p1x p1y)
+     || (abs o4 <= eps && onSegmentBoundsXY eps q1x q1y q2x q2y p2x p2y)
+{-# INLINE segmentsIntersectCoreXY #-}
 
-orient2D :: Vec2 -> Vec2 -> Vec2 -> Double
-orient2D (x1, y1) (x2, y2) (x3, y3) =
+orient2Dxy :: Double -> Double -> Double -> Double -> Double -> Double -> Double
+orient2Dxy x1 y1 x2 y2 x3 y3 =
   (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
-{-# INLINE orient2D #-}
+{-# INLINE orient2Dxy #-}
 
-onSegmentBounds :: Double -> Vec2 -> Vec2 -> Vec2 -> Bool
-onSegmentBounds eps (x1, y1) (x2, y2) (x, y) =
+onSegmentBoundsXY :: Double -> Double -> Double -> Double -> Double -> Double -> Double -> Bool
+onSegmentBoundsXY eps x1 y1 x2 y2 x y =
   x >= min x1 x2 - eps && x <= max x1 x2 + eps &&
   y >= min y1 y2 - eps && y <= max y1 y2 + eps
-{-# INLINE onSegmentBounds #-}
+{-# INLINE onSegmentBoundsXY #-}
 
 segmentBounds :: LineSeg -> (Double, Double, Double, Double)
 segmentBounds ((x1, y1), (x2, y2)) = (min x1 x2, max x1 x2, min y1 y2, max y1 y2)
 {-# INLINE segmentBounds #-}
+
+data BoundedSeg = BoundedSeg
+  { bsX1 :: {-# UNPACK #-} !Double
+  , bsY1 :: {-# UNPACK #-} !Double
+  , bsX2 :: {-# UNPACK #-} !Double
+  , bsY2 :: {-# UNPACK #-} !Double
+  , bsMinX :: {-# UNPACK #-} !Double
+  , bsMaxX :: {-# UNPACK #-} !Double
+  , bsMinY :: {-# UNPACK #-} !Double
+  , bsMaxY :: {-# UNPACK #-} !Double
+  }
+
+toBoundedSegs :: [LineSeg] -> [BoundedSeg]
+toBoundedSegs =
+  map (\((x1, y1), (x2, y2)) ->
+    let mnx = min x1 x2
+        mxx = max x1 x2
+        mny = min y1 y2
+        mxy = max y1 y2
+    in BoundedSeg x1 y1 x2 y2 mnx mxx mny mxy)
 
 bboxOverlapsEps
   :: Double
@@ -1006,7 +1027,7 @@ filterDegenerateEdges eps = filter (\e -> edgeLength e > eps)
 scalePoint :: Double -> Point -> Point
 scalePoint s p = Point (p.x * s) (p.y * s) p.on
 
-data FlatSeg = FlatSeg Int Int Double Double Vec2 Vec2
+data FlatSeg = FlatSeg !Int !Int !Double !Double !Vec2 !Vec2
 
 splitContoursIntersections :: OutlineConfig -> [[Edge]] -> [[Edge]]
 splitContoursIntersections cfg contours
@@ -1099,7 +1120,7 @@ dedupeLoops eps loops =
       (_, keptRev) = foldl' step (Set.empty, []) loops
   in reverse keptRev
 
-data HalfEdge = HalfEdge Edge Int Int Vec2 Vec2
+data HalfEdge = HalfEdge !Edge !Int !Int !Vec2 !Vec2
 
 faceWalkLoops :: Double -> [Edge] -> [[Edge]]
 faceWalkLoops eps edges =
@@ -1580,26 +1601,20 @@ edgesShareEndpoint eps infoA infoB =
 sameVec :: Double -> Vec2 -> Vec2 -> Bool
 sameVec eps (x0, y0) (x1, y1) = abs (x0 - x1) <= eps && abs (y0 - y1) <= eps
 
-segmentsIntersectAny :: Double -> [LineSeg] -> [LineSeg] -> Bool
-segmentsIntersectAny eps segsA segsB =
-  goA segsA
+segmentsIntersectAnyBounded :: Double -> [BoundedSeg] -> [BoundedSeg] -> Bool
+segmentsIntersectAnyBounded eps segsA segsB = goA segsA
   where
-    segsB' =
-      [ (segB, minBx, maxBx, minBy, maxBy)
-      | segB <- segsB
-      , let (minBx, maxBx, minBy, maxBy) = segmentBounds segB
-      ]
     goA [] = False
-    goA (sa:restA)
-      | goB sa (segmentBounds sa) segsB' = True
+    goA (BoundedSeg ax1 ay1 ax2 ay2 minAx maxAx minAy maxAy : restA)
+      | goB ax1 ay1 ax2 ay2 minAx maxAx minAy maxAy segsB = True
       | otherwise = goA restA
-    goB _ _ [] = False
-    goB sa (minAx, maxAx, minAy, maxAy) ((sb, minBx, maxBx, minBy, maxBy):restB) =
+    goB _ _ _ _ _ _ _ _ [] = False
+    goB ax1 ay1 ax2 ay2 minAx maxAx minAy maxAy (BoundedSeg bx1 by1 bx2 by2 minBx maxBx minBy maxBy : restB) =
       if not (bboxOverlapsEps eps minAx maxAx minAy maxAy minBx maxBx minBy maxBy)
-      then goB sa (minAx, maxAx, minAy, maxAy) restB
-      else if segmentsIntersectCore eps sa sb
+      then goB ax1 ay1 ax2 ay2 minAx maxAx minAy maxAy restB
+      else if segmentsIntersectCoreXY eps ax1 ay1 ax2 ay2 bx1 by1 bx2 by2
            then True
-           else goB sa (minAx, maxAx, minAy, maxAy) restB
+           else goB ax1 ay1 ax2 ay2 minAx maxAx minAy maxAy restB
 
 overlapPairsGrid
   :: Double
@@ -1612,11 +1627,18 @@ overlapPairsGrid eps infoArr bboxArr segsArr =
       (lo, hi) = bounds infoArr
       n = if lo > hi then 0 else hi - lo + 1
       keyBase = n + 1
+      segsBoundArr =
+        if n <= 0
+        then array (0, -1) []
+        else array (0, n - 1)
+          [ (i, toBoundedSegs (segsArr ! i))
+          | i <- [0 .. n - 1]
+          ]
   in if tooMany || n <= 1
      then ([], traceMsg)
      else
        let step (accPairs, seen) idxs =
-             let (pairs', seen') = foldOverlapPairs keyBase eps infoArr bboxArr segsArr accPairs seen idxs
+             let (pairs', seen') = foldOverlapPairs keyBase eps infoArr bboxArr segsBoundArr accPairs seen idxs
              in (pairs', seen')
            (pairsOut, _) = foldl' step ([], IntSet.empty) (bucketGroups buckets)
        in (pairsOut, traceMsg)
@@ -1695,12 +1717,12 @@ foldOverlapPairs
   -> Double
   -> Array Int EdgeInfo
   -> Array Int BBox
-  -> Array Int [LineSeg]
+  -> Array Int [BoundedSeg]
   -> [(Int, Bool)]
   -> IntSet.IntSet
   -> [Int]
   -> ([(Int, Bool)], IntSet.IntSet)
-foldOverlapPairs keyBase eps infoArr bboxArr segsArr pairs0 seen0 idxs =
+foldOverlapPairs keyBase eps infoArr bboxArr segsBoundArr pairs0 seen0 idxs =
   let go [] pairs seen = (pairs, seen)
       go (i:is) pairs seen =
         let (pairs', seen') = foldl' (handlePair i) (pairs, seen) is
@@ -1716,7 +1738,7 @@ foldOverlapPairs keyBase eps infoArr bboxArr segsArr pairs0 seen0 idxs =
                  overlaps =
                    not (edgesShareEndpoint eps infoA infoB)
                    && bboxOverlaps (bboxArr ! a) (bboxArr ! b)
-                   && segmentsIntersectAny eps (segsArr ! a) (segsArr ! b)
+                   && segmentsIntersectAnyBounded eps (segsBoundArr ! a) (segsBoundArr ! b)
                  pairs' =
                    if overlaps
                    then (a, True) : (b, True) : pairs
@@ -1848,7 +1870,7 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
               then pure False
               else do
                 insideMaskAt arr (iy * width + ix)
-        insideAtPos (px, py) =
+        insideAtPosXY px py =
           let ix = floor (px - offsetX)
               iy = floor (py - offsetY)
           in insideAtIdx ix iy
@@ -1859,8 +1881,8 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
               if not cfg.distance.overlapSupport
               then pure True
               else
-                let normal = edgeUnitNormalAtIdx idx' i t
-                    q = edgePointAtIdx idx' i t
+                let (nx, ny) = edgeUnitNormalAtIdx idx' i t
+                    (qx, qy) = edgePointAtIdx idx' i t
                     base = max 0.5 cfg.distance.overlapEpsilon
                     step1 = base
                     step2 = base * 2
@@ -1868,19 +1890,25 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
                     off = idx'.segOffsets ! i
                     cnt = idx'.segCounts ! i
                     check step = do
-                      let q1 = vecAdd q (vecScale step normal)
-                          q2 = vecSub q (vecScale step normal)
-                      i1 <- insideAtPos q1
-                      i2 <- insideAtPos q2
+                      let !dx = step * nx
+                          !dy = step * ny
+                          !q1x = qx + dx
+                          !q1y = qy + dy
+                          !q2x = qx - dx
+                          !q2y = qy - dy
+                      i1 <- insideAtPosXY q1x q1y
+                      i2 <- insideAtPosXY q2x q2y
                       if i1 == i2
                         then pure False
                         else if idx'.edgeOverlaps ! i == 0
                           then pure True
                           else do
-                            let w1 = windingNumber segs q1 - windingNumberSlice idx' off cnt q1
+                            let q1 = (q1x, q1y)
+                                q2 = (q2x, q2y)
+                                w1 = windingNumber segs q1 - windingNumberSlice idx' off cnt q1
                                 w2 = windingNumber segs q2 - windingNumberSlice idx' off cnt q2
                             pure (applyRule w1 /= applyRule w2)
-                in if nearZero normal
+                in if nearZero (nx, ny)
                    then pure True
                    else do
                      ok1 <- check step1
@@ -1900,43 +1928,44 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
                          !bestMax = max4 bestR bestG bestB bestAll
                          !bestMaxSq = bestMax * bestMax
                          cellMinSq = cellDistanceSq idx' p' (x, y)
-                         scanCellEdges !curR !curG !curB !curA !j
+                         scanCellEdges !curR !curG !curB !curA !curMax !curMaxSq !j
                            | j >= count = pure (curR, curG, curB, curA)
                            | otherwise =
                                let i = idx'.cellEdges ! (start + j)
-                               in do
-                                 let !bestMax' = max4 curR curG curB curA
-                                     !bestMaxSq' = bestMax' * bestMax'
-                                     dSqBB = bboxDistanceSqIdx idx' i p'
-                                 if dSqBB >= bestMaxSq'
-                                   then scanCellEdges curR curG curB curA (j + 1)
+                                   dSqBB = bboxDistanceSqIdx idx' i p'
+                               in
+                               if dSqBB >= curMaxSq
+                               then scanCellEdges curR curG curB curA curMax curMaxSq (j + 1)
+                               else do
+                                 let mask = idx'.edgeMasks ! i
+                                     (dSq, t) = edgeDistanceSqWithParamFastIdx idx' i p'
+                                     dTrue = sqrt dSq
+                                     dPseudo = if usePseudo' then edgeDistancePseudoFromIdx idx' i p' dTrue t else dTrue
+                                     wants =
+                                       (mask .&. 1 /= 0 && dPseudo < curR)
+                                       || (mask .&. 2 /= 0 && dPseudo < curG)
+                                       || (mask .&. 4 /= 0 && dPseudo < curB)
+                                       || dTrue < curA
+                                 if not wants
+                                   then scanCellEdges curR curG curB curA curMax curMaxSq (j + 1)
                                    else do
-                                     let mask = idx'.edgeMasks ! i
-                                         (dSq, t) = edgeDistanceSqWithParamFastIdx idx' i p'
-                                         dTrue = sqrt dSq
-                                         dPseudo = if usePseudo' then edgeDistancePseudoFromIdx idx' i p' dTrue t else dTrue
-                                         wants =
-                                           (mask .&. 1 /= 0 && dPseudo < curR)
-                                           || (mask .&. 2 /= 0 && dPseudo < curG)
-                                           || (mask .&. 4 /= 0 && dPseudo < curB)
-                                           || dTrue < curA
-                                     if not wants
-                                       then scanCellEdges curR curG curB curA (j + 1)
+                                     ok <- if useOverlap
+                                       then boundaryOk idx' i t
+                                       else pure True
+                                     if not ok
+                                       then scanCellEdges curR curG curB curA curMax curMaxSq (j + 1)
                                        else do
-                                         ok <- if useOverlap
-                                           then boundaryOk idx' i t
-                                           else pure True
-                                         if not ok
-                                           then scanCellEdges curR curG curB curA (j + 1)
-                                           else do
-                                             let !nextR = if mask .&. 1 /= 0 && dPseudo < curR then dPseudo else curR
-                                                 !nextG = if mask .&. 2 /= 0 && dPseudo < curG then dPseudo else curG
-                                                 !nextB = if mask .&. 4 /= 0 && dPseudo < curB then dPseudo else curB
-                                                 !nextA = if dTrue < curA then dTrue else curA
-                                             scanCellEdges nextR nextG nextB nextA (j + 1)
-                     in if cellMinSq >= bestMaxSq
-                        then pure (bestR, bestG, bestB, bestAll)
-                        else scanCellEdges bestR bestG bestB bestAll 0
+                                         let !nextR = if mask .&. 1 /= 0 && dPseudo < curR then dPseudo else curR
+                                             !nextG = if mask .&. 2 /= 0 && dPseudo < curG then dPseudo else curG
+                                             !nextB = if mask .&. 4 /= 0 && dPseudo < curB then dPseudo else curB
+                                             !nextA = if dTrue < curA then dTrue else curA
+                                             !nextMax = max4 nextR nextG nextB nextA
+                                             !nextMaxSq = nextMax * nextMax
+                                         scanCellEdges nextR nextG nextB nextA nextMax nextMaxSq (j + 1)
+                     in
+                     if cellMinSq >= bestMaxSq
+                     then pure (bestR, bestG, bestB, bestAll)
+                     else scanCellEdges bestR bestG bestB bestAll bestMax bestMaxSq 0
                    scanRing minX maxX minY maxY r best0 = do
                      let ringBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) p
                          (r0, g0, b0, a0) = best0
@@ -2217,6 +2246,7 @@ bboxDistanceSqIdx idx i (px, py) =
         | py > maxY = py - maxY
         | otherwise = 0
   in dx * dx + dy * dy
+{-# INLINE bboxDistanceSqIdx #-}
 
 data EdgeIndexInfo = EdgeIndexInfo
   { cellSize :: !Double
@@ -2239,8 +2269,8 @@ data EdgeIndexInfo = EdgeIndexInfo
   , segX1 :: !(UA.UArray Int Double)
   , segY1 :: !(UA.UArray Int Double)
   , edgeOverlaps :: !(UA.UArray Int Word8)
-  , edgeMasks :: !(UA.UArray Int Int)
-  , edgeKind :: !(UA.UArray Int Int)
+  , edgeMasks :: !(UA.UArray Int Word8)
+  , edgeKind :: !(UA.UArray Int Word8)
   , edgeStartX :: !(UA.UArray Int Double)
   , edgeStartY :: !(UA.UArray Int Double)
   , edgeEndX :: !(UA.UArray Int Double)
@@ -2457,7 +2487,7 @@ buildEdgeIndexInfo flatness cellSize' bb clipBB0 buildSegs coloredEdges =
 
 buildEdgeParamArrays
   :: [EdgeInfo]
-  -> ( UA.UArray Int Int
+  -> ( UA.UArray Int Word8
      , UA.UArray Int Double
      , UA.UArray Int Double
      , UA.UArray Int Double
@@ -2504,7 +2534,7 @@ buildEdgeParamArrays edgesList =
     let n = length edgesList
         bounds' = (0, n - 1)
     in runST $ do
-      kindArr <- newArray bounds' 0 :: ST s (STUArray s Int Int)
+      kindArr <- newArray bounds' 0 :: ST s (STUArray s Int Word8)
       sxArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
       syArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
       exArr <- newArray bounds' 0 :: ST s (STUArray s Int Double)
@@ -2628,6 +2658,7 @@ edgeDistanceSqLineIdx idx i (px, py) =
       ex = px - cx
       ey = py - cy
   in (ex * ex + ey * ey, t')
+{-# INLINE edgeDistanceSqLineIdx #-}
 
 edgeDistanceSqQuadIdx :: EdgeIndexInfo -> Int -> Vec2 -> (Double, Double)
 edgeDistanceSqQuadIdx idx i (px, py) =
@@ -2644,12 +2675,16 @@ edgeDistanceSqQuadIdx idx i (px, py) =
       cy = y0 - py
       c1 = c1base + 2 * (ax * cx + ay * cy)
       c0 = bx * cx + by * cy
-      d0 = distanceSq2 x0 y0 px py
-      p1x = x0 + bx * 0.5
-      p1y = y0 + by * 0.5
+      d0 = cx * cx + cy * cy
+      bx2 = bx * 0.5
+      by2 = by * 0.5
+      p1x = x0 + bx2
+      p1y = y0 + by2
       x2 = x0 + bx + ax
       y2 = y0 + by + ay
-      d1 = distanceSq2 x2 y2 px py
+      dx2 = x2 - px
+      dy2 = y2 - py
+      d1 = dx2 * dx2 + dy2 * dy2
       start = if d0 < d1 then (d0, 0) else (d1, 1)
       pick t (bestD, bestT) =
         if t >= 0 && t <= 1
@@ -2658,12 +2693,14 @@ edgeDistanceSqQuadIdx idx i (px, py) =
           in if d < bestD then (d, t) else (bestD, bestT)
         else (bestD, bestT)
   in foldCubicRoots c3 c2 c1 c0 start pick
+{-# INLINE edgeDistanceSqQuadIdx #-}
 
 edgeDistanceSqWithParamFastIdx :: EdgeIndexInfo -> Int -> Vec2 -> (Double, Double)
 edgeDistanceSqWithParamFastIdx idx i p =
   if idx.edgeKind ! i == 0
   then edgeDistanceSqLineIdx idx i p
   else edgeDistanceSqQuadIdx idx i p
+{-# INLINE edgeDistanceSqWithParamFastIdx #-}
 
 edgeDistancePseudoFromIdx :: EdgeIndexInfo -> Int -> Vec2 -> Double -> Double -> Double
 edgeDistancePseudoFromIdx idx i p d t =
@@ -2677,6 +2714,7 @@ edgeDistancePseudoFromIdx idx i p d t =
                         (idx.edgePseudoEndX ! i, idx.edgePseudoEndY ! i)
                         p d
           else d
+{-# INLINE edgeDistancePseudoFromIdx #-}
 
 edgePointAtIdx :: EdgeIndexInfo -> Int -> Double -> Vec2
 edgePointAtIdx idx i t =
@@ -2696,6 +2734,7 @@ edgePointAtIdx idx i t =
         by = idx.quadBy ! i
         tt = t * t
     in (x0 + bx * t + ax * tt, y0 + by * t + ay * tt)
+{-# INLINE edgePointAtIdx #-}
 
 edgeTangentAtIdx :: EdgeIndexInfo -> Int -> Double -> Vec2
 edgeTangentAtIdx idx i t =
@@ -2707,6 +2746,7 @@ edgeTangentAtIdx idx i t =
         bx = idx.quadBx ! i
         by = idx.quadBy ! i
     in (bx + 2 * ax * t, by + 2 * ay * t)
+{-# INLINE edgeTangentAtIdx #-}
 
 edgeUnitNormalAtIdx :: EdgeIndexInfo -> Int -> Double -> Vec2
 edgeUnitNormalAtIdx idx i t =
@@ -2719,6 +2759,7 @@ edgeUnitNormalAtIdx idx i t =
            blend = vecAdd (vecScale (1 - t) ps) (vecScale t pe)
        in normalizeVec blend
      else n
+{-# INLINE edgeUnitNormalAtIdx #-}
 
 distanceSqBezier2 :: Vec2 -> Vec2 -> Vec2 -> Vec2 -> Double -> Double
 distanceSqBezier2 (x0, y0) (x1, y1) (x2, y2) (px, py) t =
@@ -2729,12 +2770,6 @@ distanceSqBezier2 (x0, y0) (x1, y1) (x2, y2) (px, py) t =
       y = uu * y0 + 2 * u * t * y1 + tt * y2
       dx = x - px
       dy = y - py
-  in dx * dx + dy * dy
-
-distanceSq2 :: Double -> Double -> Double -> Double -> Double
-distanceSq2 x0 y0 x1 y1 =
-  let dx = x0 - x1
-      dy = y0 - y1
   in dx * dx + dy * dy
 
 foldCubicRoots :: Double -> Double -> Double -> Double -> r -> (Double -> r -> r) -> r
@@ -2808,6 +2843,7 @@ distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py') =
       dx = min (px' - x0) (x1 - px')
       dy = min (py' - y0) (y1 - py')
   in max 0 (min dx dy)
+{-# INLINE distanceToBoundary #-}
 
 cellDistanceSq :: EdgeIndexInfo -> Vec2 -> (Int, Int) -> Double
 cellDistanceSq idx (px', py') (cx, cy) =
@@ -2824,6 +2860,7 @@ cellDistanceSq idx (px', py') (cx, cy) =
         | py' > y1 = py' - y1
         | otherwise = 0
   in dx * dx + dy * dy
+{-# INLINE cellDistanceSq #-}
 
 pointCell :: EdgeIndexInfo -> Vec2 -> (Int, Int)
 pointCell idx (px', py') =
@@ -3008,7 +3045,7 @@ clampChannelF :: Float -> Float -> Float -> Float
 clampChannelF d dAll threshold =
   if abs (d - dAll) > threshold then dAll else d
 
-colorMask :: EdgeColor -> Int
+colorMask :: EdgeColor -> Word8
 colorMask c =
   case c of
     ColorRed -> 1

@@ -17,6 +17,28 @@ It is the single source of truth for scope, sequencing, and exit criteria.
 - Do not set `CABAL_DIR` or `CABAL_LOGDIR` (including one-off command prefixes).
 - If Cabal execution needs any local-dir/logdir override or sandbox escape, stop and hand off to the user with the exact command to run manually.
 
+## Pause Handoff (2026-02-08)
+
+What the agent needs to proceed after pause:
+
+1) Priority target for optimization:
+   - choose one: `no-pack`, `pack`, or `balanced` (both).
+2) Performance target for this machine:
+   - provide desired `msdf-bench --glyphs 1024` wall-time target(s).
+3) Tradeoff policy:
+   - confirm whether small render/output drift is allowed for speed (`strict parity` vs `perf-first within tolerance`).
+
+Current checkpoint (for comparison on resume):
+
+- `cabal run msdf-bench -- --glyphs 512 +RTS -s`
+  - no-pack: ~`7.4-7.5s`
+  - pack: ~`7.0-7.1s`
+- `cabal run msdf-bench -- --glyphs 1024 +RTS -s`
+  - no-pack: ~`13.1s` (last known; refresh needed)
+  - pack: ~`13.1s` (last known; refresh needed)
+
+No extra manual setup is required to continue; the repo is ready for the next optimization pass.
+
 ## Research anchors (source of truth)
 
 - **msdfgen README**: modes (`sdf`, `psdf`, `msdf`, `mtsdf`) and that **MTSDF stores true SDF in alpha**.

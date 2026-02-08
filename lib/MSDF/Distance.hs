@@ -10,7 +10,14 @@ module MSDF.Distance
   , windingNumber
   ) where
 
-import Data.Array (Array, accumArray, array, bounds, (!))
+import Control.Monad (forM_)
+import Data.Array (Array, array)
+import qualified Data.Array as A
+import Data.Array.MArray (newArray, readArray, writeArray)
+import Data.Array.ST (STUArray, runSTUArray, thaw)
+import Data.Array.Unboxed (UArray)
+import qualified Data.Array.Unboxed as UA
+import Control.Monad.ST (ST)
 import MSDF.Geometry (EdgeRef(..), Edge(..), Vec2, edgeBBox, edgeDistanceSq)
 import MSDF.Outline (flattenEdge)
 import MSDF.Types (BBox(..))
@@ -18,13 +25,15 @@ import MSDF.Types (BBox(..))
 type LineSeg = (Vec2, Vec2)
 
 data EdgeIndex = EdgeIndex
-  { cellSize :: Double
-  , originX :: Double
-  , originY :: Double
-  , gridW :: Int
-  , gridH :: Int
-  , cells :: Array Int [Int]
-  , edges :: Array Int EdgeRef
+  { cellSize :: !Double
+  , originX :: !Double
+  , originY :: !Double
+  , gridW :: !Int
+  , gridH :: !Int
+  , cellStarts :: !(UArray Int Int)
+  , cellCounts :: !(UArray Int Int)
+  , cellEdges :: !(UArray Int Int)
+  , edges :: !(Array Int Edge)
   }
 
 buildEdgeIndex :: Double -> BBox -> [EdgeRef] -> EdgeIndex
@@ -34,77 +43,184 @@ buildEdgeIndex cellSize' bb edgesList =
       height = (max 1 (ceiling (bb.yMax - bb.yMin) + 1) :: Int)
       gridW' = max 1 (ceiling (fromIntegral width / cellSize''))
       gridH' = max 1 (ceiling (fromIntegral height / cellSize''))
+      edgeList = [ e.edge | e <- edgesList ]
       edgesArr =
-        if null edgesList
+        if null edgeList
         then array (0, -1) []
-        else array (0, length edgesList - 1) (zip [0..] edgesList)
-      pairs = concat
-        [ [ (cellIndex gridW' x y, i) | x <- [x0 .. x1], y <- [y0 .. y1] ]
-        | (i, e) <- zip [0..] edgesList
-        , let bbE = edgeBBox e.edge
-              x0 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMin)
-              x1 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMax)
-              y0 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMin)
-              y1 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMax)
-        ]
-      cellsArr = accumArray (flip (:)) [] (0, gridW' * gridH' - 1) pairs
+        else array (0, length edgeList - 1) (zip [0..] edgeList)
+      cellCount = gridW' * gridH'
+      countsArr =
+        if cellCount <= 0
+        then UA.listArray (0, -1) []
+        else runSTUArray $ do
+          arr <- (newArray (0, cellCount - 1) 0 :: ST s (STUArray s Int Int))
+          forM_ edgesList $ \e -> do
+            let bbE = edgeBBox e.edge
+                x0 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMin)
+                x1 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMax)
+                y0 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMin)
+                y1 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMax)
+            forM_ [y0 .. y1] $ \y ->
+              forM_ [x0 .. x1] $ \x -> do
+                let idx = cellIndex gridW' x y
+                cur <- readArray arr idx
+                writeArray arr idx (cur + 1)
+          pure arr
+      (startsArr, totalEdges) = buildCellStarts countsArr
+      edgeIdxArr =
+        if totalEdges <= 0
+        then UA.listArray (0, -1) []
+        else runSTUArray $ do
+          arr <- (newArray (0, totalEdges - 1) 0 :: ST s (STUArray s Int Int))
+          posArr <- (thaw startsArr :: ST s (STUArray s Int Int))
+          forM_ (zip [0..] edgesList) $ \(i, e) -> do
+            let bbE = edgeBBox e.edge
+                x0 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMin)
+                x1 = clamp 0 (gridW' - 1) (toCell bb.xMin cellSize'' bbE.xMax)
+                y0 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMin)
+                y1 = clamp 0 (gridH' - 1) (toCell bb.yMin cellSize'' bbE.yMax)
+            forM_ [y0 .. y1] $ \y ->
+              forM_ [x0 .. x1] $ \x -> do
+                let idx = cellIndex gridW' x y
+                pos <- readArray posArr idx
+                writeArray arr pos i
+                writeArray posArr idx (pos + 1)
+          pure arr
   in EdgeIndex
        { cellSize = cellSize''
        , originX = bb.xMin
        , originY = bb.yMin
        , gridW = gridW'
        , gridH = gridH'
-       , cells = cellsArr
+       , cellStarts = startsArr
+       , cellCounts = countsArr
+       , cellEdges = edgeIdxArr
        , edges = edgesArr
        }
+
+buildCellStarts :: UArray Int Int -> (UArray Int Int, Int)
+buildCellStarts counts =
+  let (lo, hi) = UA.bounds counts
+  in if lo > hi
+     then (UA.listArray (0, -1) [], 0)
+     else
+       let starts = runSTUArray $ do
+             arr <- (newArray (lo, hi) 0 :: ST s (STUArray s Int Int))
+             let go i acc
+                   | i > hi = pure ()
+                   | otherwise = do
+                       writeArray arr i acc
+                       go (i + 1) (acc + counts UA.! i)
+             go lo 0
+             pure arr
+           total = starts UA.! hi + counts UA.! hi
+       in (starts, total)
 
 minDistance :: EdgeIndex -> Vec2 -> Double
 minDistance idx p = sqrt (minDistanceSq idx p)
 
 minDistanceSq :: EdgeIndex -> Vec2 -> Double
 minDistanceSq idx p@(px', py') =
-  let (elo, ehi) = bounds idx.edges
+  let (elo, ehi) = A.bounds idx.edges
   in if elo > ehi
      then 1e18
      else
        let (cx, cy) = pointCell idx p
-           maxR = max idx.gridW idx.gridH
+           gridW' = idx.gridW
+           gridH' = idx.gridH
+           maxR = max gridW' gridH'
+           cellSize' = idx.cellSize
+           pxCell = (px' - idx.originX) / cellSize'
+           pyCell = (py' - idx.originY) / cellSize'
+           invCellSizeSq = 1 / (cellSize' * cellSize')
            go !r !bestSq =
              let minX = max 0 (cx - r)
-                 maxX = min (idx.gridW - 1) (cx + r)
+                 maxX = min (gridW' - 1) (cx + r)
                  minY = max 0 (cy - r)
-                 maxY = min (idx.gridH - 1) (cy + r)
+                 maxY = min (gridH' - 1) (cy + r)
                  bestSq' = scanRing r minX maxX minY maxY bestSq
                  minBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py')
-                 fullGrid = minX == 0 && maxX == idx.gridW - 1 && minY == 0 && maxY == idx.gridH - 1
+                 fullGrid = minX == 0 && maxX == gridW' - 1 && minY == 0 && maxY == gridH' - 1
              in if bestSq' < 1e18 && bestSq' <= minBoundary * minBoundary
                 then bestSq'
                 else if fullGrid || r >= maxR
                      then bestSq'
                      else go (r + 1) bestSq'
-           scanRing !r !minX !maxX !minY !maxY !best0 = goY minY best0
+           scanRing !r !minX !maxX !minY !maxY !best0 =
+             let ringBoundary = distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py')
+                 bestSq0 = best0
+             in if bestSq0 <= ringBoundary * ringBoundary
+                then best0
+                else
+                  if r == 0
+                  then scanRow minY best0
+                  else
+                    let best1 = scanRow minY best0
+                        best2 = if maxY /= minY then scanRow maxY best1 else best1
+                        best3 = scanCol minX (minY + 1) (maxY - 1) best2
+                        best4 = if maxX /= minX then scanCol maxX (minY + 1) (maxY - 1) best3 else best3
+                    in best4
              where
-               goY !y !best
-                 | y > maxY = best
-                 | otherwise = goY (y + 1) (goX y minX best)
-               goX !y !x !best
-                 | x > maxX = best
-                 | r /= 0 && x /= minX && x /= maxX && y /= minY && y /= maxY = goX y (x + 1) best
-                 | otherwise =
-                     let !best' = scanCell idx p best (x, y)
-                     in goX y (x + 1) best'
+               scanRow !y !best =
+                 let fy = fromIntegral y
+                     fy1 = fy + 1
+                     dy
+                       | pyCell < fy = fy - pyCell
+                       | pyCell > fy1 = pyCell - fy1
+                       | otherwise = 0
+                     dy2 = dy * dy
+                     goX !x !fx !bestAcc
+                       | x > maxX = bestAcc
+                       | otherwise =
+                           let fx1 = fx + 1
+                               dx
+                                 | pxCell < fx = fx - pxCell
+                                 | pxCell > fx1 = pxCell - fx1
+                                 | otherwise = 0
+                               !bestNorm = bestAcc * invCellSizeSq
+                               cellSqNorm = dx * dx + dy2
+                               !best' = if cellSqNorm >= bestNorm then bestAcc else scanCell idx p bestAcc x y
+                           in goX (x + 1) fx1 best'
+                 in goX minX (fromIntegral minX) best
+               scanCol !x !y0 !y1 !best =
+                 if y0 > y1
+                 then best
+                 else
+                   let fx = fromIntegral x
+                       fx1 = fx + 1
+                       dx
+                         | pxCell < fx = fx - pxCell
+                         | pxCell > fx1 = pxCell - fx1
+                         | otherwise = 0
+                       dx2 = dx * dx
+                       goY !y !fy !bestAcc
+                         | y > y1 = bestAcc
+                         | otherwise =
+                             let fy1 = fy + 1
+                                 dy
+                                   | pyCell < fy = fy - pyCell
+                                   | pyCell > fy1 = pyCell - fy1
+                                   | otherwise = 0
+                                 !bestNorm = bestAcc * invCellSizeSq
+                                 cellSqNorm = dx2 + dy * dy
+                                 !best' = if cellSqNorm >= bestNorm then bestAcc else scanCell idx p bestAcc x y
+                             in goY (y + 1) fy1 best'
+                   in goY y0 (fromIntegral y0) best
        in go 0 1e18
 
-scanCell :: EdgeIndex -> Vec2 -> Double -> (Int, Int) -> Double
-scanCell idx p bestSq (x, y) =
+scanCell :: EdgeIndex -> Vec2 -> Double -> Int -> Int -> Double
+scanCell idx p bestSq x y =
   let cellIdx = cellIndex idx.gridW x y
-      edgeIdxs = idx.cells ! cellIdx
-      go !acc [] = acc
-      go !acc (i:is) =
-        let !d = edgeDistanceSq p (idx.edges ! i).edge
-            !acc' = if d < acc then d else acc
-        in go acc' is
-  in go bestSq edgeIdxs
+      start = idx.cellStarts UA.! cellIdx
+      count = idx.cellCounts UA.! cellIdx
+      go !acc !j
+        | j >= count = acc
+        | otherwise =
+            let i = idx.cellEdges UA.! (start + j)
+                !d = edgeDistanceSq p (idx.edges A.! i)
+                !acc' = if d < acc then d else acc
+            in go acc' (j + 1)
+  in go bestSq 0
 
 distanceToBoundary :: EdgeIndex -> (Int, Int) -> (Int, Int) -> Vec2 -> Double
 distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py') =
@@ -115,6 +231,7 @@ distanceToBoundary idx (minX, minY) (maxX, maxY) (px', py') =
       dx = min (px' - x0) (x1 - px')
       dy = min (py' - y0) (y1 - py')
   in max 0 (min dx dy)
+{-# INLINE distanceToBoundary #-}
 
 pointCell :: EdgeIndex -> Vec2 -> (Int, Int)
 pointCell idx (px', py') =
