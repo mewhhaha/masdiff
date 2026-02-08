@@ -887,20 +887,12 @@ onSegmentBoundsXY eps x1 y1 x2 y2 x y =
   y >= min y1 y2 - eps && y <= max y1 y2 + eps
 {-# INLINE onSegmentBoundsXY #-}
 
-segmentBounds :: LineSeg -> (Double, Double, Double, Double)
-segmentBounds ((x1, y1), (x2, y2)) = (min x1 x2, max x1 x2, min y1 y2, max y1 y2)
-{-# INLINE segmentBounds #-}
-
-data BoundedSeg = BoundedSeg
-  { bsX1 :: {-# UNPACK #-} !Double
-  , bsY1 :: {-# UNPACK #-} !Double
-  , bsX2 :: {-# UNPACK #-} !Double
-  , bsY2 :: {-# UNPACK #-} !Double
-  , bsMinX :: {-# UNPACK #-} !Double
-  , bsMaxX :: {-# UNPACK #-} !Double
-  , bsMinY :: {-# UNPACK #-} !Double
-  , bsMaxY :: {-# UNPACK #-} !Double
-  }
+data BoundedSeg
+  = BoundedSeg
+      {-# UNPACK #-} !Double {-# UNPACK #-} !Double
+      {-# UNPACK #-} !Double {-# UNPACK #-} !Double
+      {-# UNPACK #-} !Double {-# UNPACK #-} !Double
+      {-# UNPACK #-} !Double {-# UNPACK #-} !Double
 
 toBoundedSegs :: [LineSeg] -> [BoundedSeg]
 toBoundedSegs =
