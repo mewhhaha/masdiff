@@ -84,6 +84,7 @@ fn fs_main(input: FSIn) -> @location(0) vec4<f32> {
     sd = sample.a - 0.5;
   }
   let spr = screenPxRange(uFrag.params.x, input.uv);
-  let alpha = clamp(sd * spr + 0.5, 0.0, 1.0);
+  let screenPxDistance = sd * spr;
+  let alpha = clamp(screenPxDistance + 0.5, 0.0, 1.0);
   return vec4<f32>(uFrag.textColor.rgb, uFrag.textColor.a * alpha);
 }

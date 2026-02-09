@@ -37,15 +37,17 @@ for ((i=0; i<text_len; i++)); do
   ch=${TEXT:$i:1}
   code=$(printf "%04X" "'${ch}'")
   out_file="$OUT_DIR/msdfgen/U+$code.png"
-  "$MSDFGEN_BIN" mtsdf \
-    -font "$FONT_PATH" "$ch" \
+  if "$MSDFGEN_BIN" mtsdf \
+    -font "$FONT_PATH" "0x$code" \
     -o "$out_file" \
     -pxrange "$PX_RANGE" \
     -autoframe \
-    -size "$PX_SIZE" "$PX_SIZE" >/dev/null 2>&1 || {
-      echo "msdfgen failed for '$ch' (U+$code)" >&2
-    }
-  echo "msdfgen wrote $out_file"
+    -size "$PX_SIZE" "$PX_SIZE"; then
+    echo "msdfgen wrote $out_file"
+  else
+    echo "msdfgen failed for '$ch' (U+$code)" >&2
+    rm -f "$out_file"
+  fi
 done
 
 printf "\nOutput:\n  masdiff: %s\n  msdfgen: %s\n" "$OUT_DIR/masdiff" "$OUT_DIR/msdfgen"

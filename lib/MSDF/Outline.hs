@@ -63,10 +63,21 @@ insertImpliedPoints pts =
 contourToEdges :: [Point] -> [Edge]
 contourToEdges [] = []
 contourToEdges pts0 =
-  let pts = insertImpliedPoints pts0
+  let pts = insertImpliedPoints (stripDuplicateClose pts0)
       n = length pts
   in if n < 2 then [] else buildEdges pts
   where
+    stripDuplicateClose xs =
+      case xs of
+        [] -> []
+        [_] -> xs
+        (first:_) ->
+          let
+              lastP = last xs
+          in if samePos first lastP then init xs else xs
+
+    samePos a b = a.x == b.x && a.y == b.y
+
     buildEdges pts =
       case pts of
         [] -> []

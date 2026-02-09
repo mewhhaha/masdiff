@@ -184,6 +184,26 @@ def diff_sd(sd_a: List[List[float]], sd_b: List[List[float]], range_px: int) -> 
     return (max_diff, mean_diff, mismatch)
 
 
+def write_diff_images(out_dir: str, name: str, our_img: Image.Image, ref_img: Image.Image, sd_ref: List[List[float]], sd_our: List[List[float]], scale: float) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    our_img.save(os.path.join(out_dir, name + "_our.png"))
+    ref_img.save(os.path.join(out_dir, name + "_ref.png"))
+    width, height = our_img.size
+    diff_vals: List[int] = []
+    s = max(0.0, scale)
+    for y in range(height):
+        row_ref = sd_ref[y]
+        row_our = sd_our[y]
+        for x in range(width):
+            d = abs(row_ref[x] - row_our[x]) * s
+            if d > 1.0:
+                d = 1.0
+            diff_vals.append(int(d * 255 + 0.5))
+    diff_img = Image.new("L", (width, height))
+    diff_img.putdata(diff_vals)
+    diff_img.save(os.path.join(out_dir, name + "_diff.png"))
+
+
 def run_msdfgen(cmd_template: str, msdfgen_bin: str, fmt: str, font: str, size: int, range_px: int, cp: int, out_path: str) -> None:
     cmd = cmd_template.format(
         bin=msdfgen_bin,
@@ -201,6 +221,8 @@ def run_msdfgen(cmd_template: str, msdfgen_bin: str, fmt: str, font: str, size: 
 
 
 def run_msdfgen_match(msdfgen_bin: str, fmt: str, font: str, meta: GlyphMeta, out_path: str, yflip: bool, range_override: Optional[int]) -> None:
+    if meta.width <= 0 or meta.height <= 0 or meta.channels <= 0:
+        raise ValueError(f"invalid dimensions: {meta.width}x{meta.height} ch={meta.channels}")
     range_px = range_override if range_override is not None else meta.range
     scale = meta.scale
     if scale == 0 and meta.units_per_em > 0 and meta.pixel_size > 0:
@@ -254,6 +276,8 @@ def main() -> int:
     parser.add_argument("--yflip", dest="yflip", action="store_true", help="apply -yflip to msdfgen output")
     parser.add_argument("--no-yflip", dest="yflip", action="store_false", help="disable -yflip in msdfgen output")
     parser.set_defaults(yflip=True)
+    parser.add_argument("--diff-dir", help="write per-glyph diff images into this directory")
+    parser.add_argument("--diff-scale", type=float, default=4.0, help="scale factor for diff visualization (default: 4.0)")
     parser.add_argument(
         "--cmd",
         default="{bin} {format} -font {font} {codepoint_hex} -o {out} -dimensions {size} {size} -pxrange {range} -autoframe",
@@ -261,7 +285,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    cps = parse_codepoints(args.text or "masdiff", args.codepoints)
+    text_arg = args.text
+    if text_arg is None and not args.codepoints:
+        text_arg = "masdiff"
+    cps = parse_codepoints(text_arg, args.codepoints)
     if not cps:
         print("no codepoints provided")
         return 1
@@ -279,7 +306,14 @@ def main() -> int:
                     print(f"missing masdiff meta for {name_for(cp)}")
                     return 1
                 meta = load_meta(meta_path)
-                run_msdfgen_match(args.msdfgen, args.format, args.font, meta, out_path, args.yflip, args.range)
+                if meta.width <= 0 or meta.height <= 0 or meta.channels <= 0:
+                    print(f"skip {name_for(cp)}: empty glyph dimensions ({meta.width}x{meta.height})")
+                    continue
+                try:
+                    run_msdfgen_match(args.msdfgen, args.format, args.font, meta, out_path, args.yflip, args.range)
+                except ValueError as err:
+                    print(f"skip {name_for(cp)}: {err}")
+                    continue
             else:
                 run_msdfgen(args.cmd, args.msdfgen, args.format, args.font, args.size, args.range, cp, out_path)
 
@@ -288,25 +322,34 @@ def main() -> int:
     mean_count = 0
     mismatch_sum = 0
 
+    skipped = 0
     for cp in cps:
         name = name_for(cp)
         ref_path = os.path.join(args.ref_dir, name + ".png")
         meta_path = os.path.join(args.our_dir, name + ".json")
         raw_path = os.path.join(args.our_dir, name + ".raw")
-        if not os.path.exists(ref_path):
-            print(f"missing reference: {ref_path}")
-            return 1
+
         if not os.path.exists(meta_path) or not os.path.exists(raw_path):
             print(f"missing masdiff output for {name}")
             return 1
 
         meta = load_meta(meta_path)
+        if meta.width <= 0 or meta.height <= 0 or meta.channels <= 0:
+            print(f"{name}: skip empty glyph ({meta.width}x{meta.height})")
+            skipped += 1
+            continue
+        if not os.path.exists(ref_path):
+            print(f"missing reference: {ref_path}")
+            return 1
+
         our_img = load_raw(raw_path, meta.width, meta.height, meta.channels)
         ref_img = load_ref_png(ref_path)
 
         sd_ref = decode_sd(ref_img, args.format)
         sd_our = decode_sd(our_img, args.format)
         max_diff, mean_diff, mismatch = diff_sd(sd_ref, sd_our, args.range)
+        if args.diff_dir:
+            write_diff_images(args.diff_dir, name, our_img, ref_img, sd_ref, sd_our, args.diff_scale)
 
         max_diff_all = max(max_diff_all, max_diff)
         mean_sum += mean_diff
@@ -316,7 +359,7 @@ def main() -> int:
         print(f"{name}: max {max_diff:.6f} mean {mean_diff:.6f} mismatches {mismatch}")
 
     mean_all = mean_sum / mean_count if mean_count else 0.0
-    print(f"overall: max {max_diff_all:.6f} mean {mean_all:.6f} mismatches {mismatch_sum}")
+    print(f"overall: max {max_diff_all:.6f} mean {mean_all:.6f} mismatches {mismatch_sum} skipped {skipped}")
 
     if args.fail_max is not None and max_diff_all > args.fail_max:
         return 1

@@ -216,3 +216,81 @@ Focus on layout to reduce GC churn and pointer chasing in hot paths.
 8) Docs + examples
    - Document axis selection, defaults, and limitations.
    - Add usage examples (e.g., Inter Variable at weight 400 vs 700).
+
+---
+
+# Resume Notes (2026-02-08)
+
+## Current Regression
+- SDL demo render is still noisy/jagged (e.g., “the” / “lazy dog”) even after snapshot updates.
+- `msdfgen_compare.py` shows consistent distance magnitude mismatch vs msdfgen:
+  - Mean diff ~0.09–0.11 for many glyphs at `range=16`.
+  - Alpha and median are both off by a similar amount, so issue is not just channel mixing.
+  - Best-fit scale factor varies ~1.1–1.3x depending on glyph.
+
+## Debug Outputs (Already Generated)
+- `out/debug_shots/` contains:
+  - `alpha.png`, `median.png`, `normal.png`, `split.png`, `fill.png`, `r.png`, `g.png`, `b.png`.
+  - `msdfgen_h/` diff images (`U+0068_our/ref/diff.png`).
+  - `dump_h/trace.log` (pipeline trace).
+- `out/msdfgen_compare/masdiff/` + `out/msdfgen_compare/msdfgen/` contain per-glyph dumps.
+- `out/debug_shots/normal.png` vs `out/debug_shots/normal_nobadmap.png` show bad-map correction impact.
+
+## Commands to Reproduce (Do Not Use CABAL_DIR/LOGDIR)
+- Full debug bundle:
+  - `just debug`
+- Single glyph compare (h):
+  - `cabal run msdf-dump -- --font assets/Inter/Inter-VariableFont_opsz,wght.ttf --text "h" --pixel-size 256 --range 16 --padding 16 --format mtsdf --out-dir out/msdfgen_compare/masdiff`
+  - `python tools/msdfgen_compare.py --format mtsdf --codepoints 0068 --our-dir out/msdfgen_compare/masdiff --ref-dir out/msdfgen_compare/msdfgen --generate --match-masdiff --font assets/Inter/Inter-VariableFont_opsz,wght.ttf --range 16 --diff-dir out/debug_shots/msdfgen_h`
+- SDL correction A/B (same text, same snapshot path):
+  - `SDL_MSDF_SAMPLE_TEXT="the" MSDF_CORRECTION=1 MSDF_CORRECTION_BADMAP=0 just debug-sdl-correction-on`
+  - `SDL_MSDF_SAMPLE_TEXT="the" MSDF_CORRECTION=0 MSDF_CORRECTION_BADMAP=0 just debug-sdl-correction-off`
+
+## Next Investigation Steps
+- Confirm whether seams are introduced by correction pipeline:
+  - Compare `debug-sdl-correction-on` vs `debug-sdl-correction-off` screenshots.
+  - If seams only exist with correction on, focus on `renderBitmap` correction subpasses (`computeCorr`, clash/hard fallback), not distance generation.
+- Isolate the distance magnitude mismatch:
+  - Compare a single edge’s distance field vs msdfgen along a normal sample line.
+  - Verify unit conversion flow: glyph units → scaled contours → distance in pixel units → `distanceToByteF`.
+  - Check whether flattening / edge indexing / pseudo-distance are biasing distances (not just signs).
+- Add a small “distance probe” output (per-glyph or per-edge) to log a few sample distances vs msdfgen.
+- Re-run `just debug` after any change and inspect `out/debug_shots/*diff.png`.
+
+## Latest Finding (2026-02-09)
+- Overlap filtering is currently a major source of visible sliver artifacts on problematic glyphs (`u`, `t` family).
+- A/B compare (`--no-overlap`) reduces seam/sliver artifacts without introducing sign mismatches in current compares.
+- SDL generator (`examples/sdl_gpu_wesl/Main.hs`) now defaults to overlap disabled; `--overlap` remains available for explicit opt-in/debug.
+
+## Latest Finding (2026-02-09, render path)
+- `MSDF_CORRECTION=1` vs `MSDF_CORRECTION=0` produced identical SDL snapshots for the current repro (`the`), so correction pass is not the active source of the seam.
+- A likely render-stage cause is the fragment shader AA formula:
+  - old: `alpha = smoothstep(-fwidth(dist), fwidth(dist), dist)`
+  - new: `alpha = clamp(screenPxDistance + 0.5, 0.0, 1.0)` (standard MSDF formula)
+- File changed: `examples/sdl_gpu_wesl/shaders/msdf.frag.wesl`.
+- SDL runtime default now uses MSDF median (RGB) for MTSDF text rendering:
+  - `SDL_MSDF_RENDER_ALPHA` default switched from `true` to `false` in `examples/sdl_gpu_wesl/sdl_gpu_msdf.c`.
+  - Alpha SDF rendering remains available via `SDL_MSDF_RENDER_ALPHA=1`.
+- Next verification command:
+  - `SDL_MSDF_SAMPLE_TEXT="the" just demo-live-text-shot`
+  - compare `examples/sdl_gpu_wesl/out/screenshot.png` to previous run.
+
+## Latest Finding (2026-02-09, split path)
+- Split-intersections remains a likely seam source in demo output.
+- Demo/debug defaults were switched to no-split for stability:
+  - `Justfile` default generation args now use `--no-split-intersections`.
+  - SDL generator baseline config (`examples/sdl_gpu_wesl/Main.hs`) now sets `splitIntersections = False` unless explicitly overridden by CLI.
+- Explicit split A/B remains available:
+  - `just demo-live-text-shot-split`
+  - `just demo-live-text-shot`
+- Added guard attempt in splitter:
+  - `splitEdgeAt` now receives a practical param epsilon in `splitContoursIntersections`:
+    `max contourEpsilon (windingFlatness * 0.25)`
+  - For sampled glyphs (`t,h,e,f,n`) this guard did not materially change outputs, so root split artifact cause is still unresolved.
+
+## Latest Finding (2026-02-09, SDL guardrail)
+- Added SDL seam guard script: `tools/sdl_seam_guard.py`.
+- `tools/sdl_render_snapshot.sh` now runs seam guard in both `update` and `compare` modes.
+  - Fails if suspicious tiny enclosed holes are detected in the live screenshot.
+  - Writes debug overlay to `out/snapshots/render/demo_live_text.seam.png`.
+  - Temporary bypass (debug only): `MSDF_ALLOW_SEAM=1`.

@@ -323,6 +323,30 @@ msdfPreprocessEnabled = unsafePerformIO $ do
   pure enabled
 {-# NOINLINE msdfPreprocessEnabled #-}
 
+msdfCorrectionEnabled :: Bool
+msdfCorrectionEnabled = unsafePerformIO $ do
+  v <- lookupEnv "MSDF_CORRECTION"
+  let enabled = case fmap (map toLower) v of
+        Just "0" -> False
+        Just "false" -> False
+        Just "no" -> False
+        Just "off" -> False
+        _ -> True
+  pure enabled
+{-# NOINLINE msdfCorrectionEnabled #-}
+
+msdfCorrectionBadMapEnabled :: Bool
+msdfCorrectionBadMapEnabled = unsafePerformIO $ do
+  v <- lookupEnv "MSDF_CORRECTION_BADMAP"
+  let enabled = case fmap (map toLower) v of
+        Just "0" -> False
+        Just "false" -> False
+        Just "no" -> False
+        Just "off" -> False
+        _ -> True
+  pure enabled
+{-# NOINLINE msdfCorrectionBadMapEnabled #-}
+
 data GlyphCache = GlyphCache
   { location :: !(Maybe VariationLocation)
   , contours :: !(Array Int [[Point]])
@@ -1041,9 +1065,13 @@ splitContoursIntersections cfg contours
           skipSplit = msdfSplitMaxSegs > 0 && segCount > msdfSplitMaxSegs
           cellSize = chooseSplitGridSize flatSegs eps
           tMap = collectIntersectionsGrid contours eps cellSize flatSegs
+          -- Use a practical split-parameter epsilon, not only contour epsilon.
+          -- Very small near-endpoint split params create tiny edge fragments that
+          -- show up as seam artifacts at joins in final MSDF rendering.
+          splitParamEps = max cfg.contourEpsilon (cfg.windingFlatness * 0.25)
           splitEdgeFor cid eid e =
             let ts = Map.findWithDefault [] (cid, eid) tMap
-            in splitEdgeAt cfg.contourEpsilon e ts
+            in splitEdgeAt splitParamEps e ts
           traceSkip =
             if msdfTraceEnabled && skipSplit
             then trace ("msdf: skip split intersections, flatSegs=" <> show segCount) True
@@ -1745,6 +1773,7 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
         n = width * height
         channels = bitmapChannels fmt
         range = cfg.range
+        correctionEnabled = cfg.correction.enableCorrection && msdfCorrectionEnabled
         edgeThreshF = realToFrac cfg.correction.edgeThreshold :: Float
         chanThreshF = realToFrac cfg.correction.channelThreshold :: Float
         hardThreshF = realToFrac cfg.correction.hardThreshold :: Float
@@ -2030,7 +2059,7 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
     (_, tDistances) <- timeIO $
       parallelForRows computeDistances
     (dAllArrCorr, tCorr) <-
-      if cfg.correction.enableCorrection
+      if correctionEnabled
       then timeIO $ do
         dst <- newArray (0, n - 1) 0.0 :: IO (IOUArray Int Float)
         let computeCorr y0 y1 = do
@@ -2069,7 +2098,7 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
         pure dst
       else pure (dAllArr, 0)
     (badArr, tBad) <-
-      if cfg.correction.enableCorrection && width > 1 && height > 1
+      if correctionEnabled && msdfCorrectionBadMapEnabled && width > 1 && height > 1
       then timeIO $ do
         bad <- newArray (0, n - 1) False :: IO (IOUArray Int Bool)
         let computeBad y0 y1 = do
@@ -2199,7 +2228,7 @@ renderBitmap cfg width height offsetX offsetY coloredInfos segs _segsByContour =
                   writeArray out (base + 2) b
                   writeArray out (base + 3) (distanceToByteF range dAllRaw)
     (_, tOut) <- timeIO $
-      parallelForRows (if cfg.correction.enableCorrection then computeOutCorrection else computeOutNoCorrection)
+      parallelForRows (if correctionEnabled then computeOutCorrection else computeOutNoCorrection)
     when timingEnabled $
       printf "msdf: renderBitmap %dx%d edges=%d inside=%.2f idx=%.2f coarse=%.2f dist=%.2f corr=%.2f bad=%.2f out=%.2f\n"
         width height edgesCount tInside tIndex tCoarse tDistances tCorr tBad tOut

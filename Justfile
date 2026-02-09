@@ -1,8 +1,9 @@
 set shell := ["bash", "-lc"]
 
 root := justfile_directory()
-# Quality-first default for demo/debug captures.
-default_gen_args := "--split-intersections"
+# Stability-first default for demo/debug captures.
+# Intersection splitting is still available via explicit split targets.
+default_gen_args := "--no-split-intersections"
 
 # Build MSDF atlas + SPIR-V shaders (writes to examples/sdl_gpu_wesl/out).
 demo-gen:
@@ -38,14 +39,14 @@ demo-live: demo-build
 # Run live with the final render only (no debug grid).
 demo-live-text: demo-build
     (cd "{{root}}/examples/sdl_gpu_wesl" && \
-      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 \
+      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP="${MSDF_CORRECTION_BADMAP:-0}" \
       cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
       | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin
 
 # Run text-only view, capture screenshot, then auto-exit.
 demo-live-text-shot: demo-build
     (cd "{{root}}/examples/sdl_gpu_wesl" && \
-      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 \
+      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP="${MSDF_CORRECTION_BADMAP:-0}" \
       cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
       | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_SCREENSHOT=1 SDL_MSDF_SCREENSHOT_DELAY_MS="${SDL_MSDF_SCREENSHOT_DELAY_MS:-100}" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin
     if [ -f "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga" ]; then python "{{root}}/examples/sdl_gpu_wesl/tools/tga_to_png.py" "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga"; fi
@@ -137,7 +138,7 @@ demo-headless: demo-build
 demo-shot mode: demo-build
     mkdir -p "{{root}}/out/debug_shots"
     (cd "{{root}}/examples/sdl_gpu_wesl" && \
-      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" \
+      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP="${MSDF_CORRECTION_BADMAP:-0}" \
       cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
       | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_SCREENSHOT=1 SDL_MSDF_SCREENSHOT_DELAY_MS="${SDL_MSDF_SCREENSHOT_DELAY_MS:-100}" SDL_MSDF_DEBUG_VIEW="{{mode}}" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin
     if [ -f "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga" ]; then python "{{root}}/examples/sdl_gpu_wesl/tools/tga_to_png.py" "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga"; fi
@@ -147,11 +148,21 @@ demo-shot mode: demo-build
 demo-shot-normal: demo-build
     mkdir -p "{{root}}/out/debug_shots"
     (cd "{{root}}/examples/sdl_gpu_wesl" && \
-      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" \
+      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP="${MSDF_CORRECTION_BADMAP:-0}" \
       cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
       | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_SCREENSHOT=1 SDL_MSDF_SCREENSHOT_DELAY_MS="${SDL_MSDF_SCREENSHOT_DELAY_MS:-100}" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin
     if [ -f "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga" ]; then python "{{root}}/examples/sdl_gpu_wesl/tools/tga_to_png.py" "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga"; fi
     cp "{{root}}/examples/sdl_gpu_wesl/out/screenshot.png" "{{root}}/out/debug_shots/normal.png"
+
+# Capture normal screenshot with bilinear bad-map correction disabled.
+demo-shot-normal-nobadmap: demo-build
+    mkdir -p "{{root}}/out/debug_shots"
+    (cd "{{root}}/examples/sdl_gpu_wesl" && \
+      SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP=0 \
+      cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
+      | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_SCREENSHOT=1 SDL_MSDF_SCREENSHOT_DELAY_MS="${SDL_MSDF_SCREENSHOT_DELAY_MS:-100}" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin
+    if [ -f "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga" ]; then python "{{root}}/examples/sdl_gpu_wesl/tools/tga_to_png.py" "{{root}}/examples/sdl_gpu_wesl/out/screenshot.tga"; fi
+    cp "{{root}}/examples/sdl_gpu_wesl/out/screenshot.png" "{{root}}/out/debug_shots/normal_nobadmap.png"
 
 # Capture a debug bundle: normal + alpha + median + split + fill + r + g + b.
 demo-shot-set: demo-build
@@ -160,12 +171,12 @@ demo-shot-set: demo-build
     for mode in "${modes[@]}"; do \
       if [ "$mode" = "normal" ]; then \
         (cd "{{root}}/examples/sdl_gpu_wesl" && \
-          SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" \
+          SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP="${MSDF_CORRECTION_BADMAP:-0}" \
           cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
           | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_SCREENSHOT=1 SDL_MSDF_SCREENSHOT_DELAY_MS="${SDL_MSDF_SCREENSHOT_DELAY_MS:-100}" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin; \
       else \
         (cd "{{root}}/examples/sdl_gpu_wesl" && \
-          SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" \
+          SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_IN_MEMORY=1 SDL_MSDF_EMIT_BLOB=1 SDL_MSDF_PIXEL_SIZE="${SDL_MSDF_PIXEL_SIZE:-128}" MSDF_CORRECTION="${MSDF_CORRECTION:-0}" MSDF_CORRECTION_BADMAP="${MSDF_CORRECTION_BADMAP:-0}" \
           cabal run msdf-sdl-gen -- --emit-blob ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}}) \
           | SDL_MSDF_OUT_DIR="{{root}}/examples/sdl_gpu_wesl/out" SDL_MSDF_SCREENSHOT=1 SDL_MSDF_SCREENSHOT_DELAY_MS="${SDL_MSDF_SCREENSHOT_DELAY_MS:-100}" SDL_MSDF_DEBUG_VIEW="$mode" "{{root}}/examples/sdl_gpu_wesl/sdl_gpu_msdf" --stdin; \
       fi; \
@@ -176,3 +187,75 @@ demo-shot-set: demo-build
 # Optional: generate with a specific font path.
 demo-gen-font font:
     (cd "{{root}}/examples/sdl_gpu_wesl" && cabal run msdf-sdl-gen -- --font {{font}} ${SDL_MSDF_GEN_ARGS:-{{default_gen_args}}})
+
+# Debug helpers --------------------------------------------------------------
+
+# Run all debug helpers in one go.
+debug: debug-msdfgen-h debug-msdfgen-h-diff debug-msdfgen-h-trace debug-sdl-shot-set debug-sdl-alpha debug-sdl-median
+
+# Generate masdiff msdf-dump output for a single glyph (default: 'h').
+debug-msdfgen-h:
+    cabal run msdf-dump -- \
+      --font "{{root}}/assets/Inter/Inter-VariableFont_opsz,wght.ttf" \
+      --text "h" \
+      --pixel-size 256 \
+      --range 16 \
+      --padding 16 \
+      --format mtsdf \
+      --no-overlap \
+      --out-dir "{{root}}/out/msdfgen_compare/masdiff"
+
+# Generate msdfgen reference + diff images for glyph 'h'.
+debug-msdfgen-h-diff:
+    python "{{root}}/tools/msdfgen_compare.py" \
+      --format mtsdf \
+      --codepoints 0068 \
+      --our-dir "{{root}}/out/msdfgen_compare/masdiff" \
+      --ref-dir "{{root}}/out/msdfgen_compare/msdfgen" \
+      --generate --match-masdiff \
+      --font "{{root}}/assets/Inter/Inter-VariableFont_opsz,wght.ttf" \
+      --range 16 \
+      --diff-dir "{{root}}/out/debug_shots/msdfgen_h"
+
+# Trace the msdf-dump pipeline for glyph 'h'.
+debug-msdfgen-h-trace:
+    MSDF_TRACE=1 cabal run msdf-dump -- \
+      --font "{{root}}/assets/Inter/Inter-VariableFont_opsz,wght.ttf" \
+      --text "h" \
+      --pixel-size 256 \
+      --range 16 \
+      --padding 16 \
+      --format mtsdf \
+      --no-overlap \
+      --out-dir "{{root}}/out/debug_shots/dump_h" \
+      > "{{root}}/out/debug_shots/dump_h/trace.log" 2>&1
+
+# SDL debug: write normal + alpha + median + split + fill + r/g/b to out/debug_shots.
+debug-sdl-shot-set:
+    SDL_MSDF_TEXT_DEBUG=1 SDL_MSDF_SAMPLE_TEXT="the" SDL_MSDF_PIXEL_SIZE=256 SDL_MSDF_RANGE=16 just demo-shot-set
+
+# SDL debug: capture alpha render and median render side by side.
+debug-sdl-alpha:
+    SDL_MSDF_RENDER_ALPHA=1 SDL_MSDF_SAMPLE_TEXT="the" just demo-shot-normal
+    cp "{{root}}/out/debug_shots/normal.png" "{{root}}/out/debug_shots/normal_alpha.png"
+
+debug-sdl-median:
+    SDL_MSDF_RENDER_ALPHA=0 SDL_MSDF_SAMPLE_TEXT="the" just demo-shot-normal
+    cp "{{root}}/out/debug_shots/normal.png" "{{root}}/out/debug_shots/normal_median.png"
+
+debug-sdl-nobadmap:
+    SDL_MSDF_SAMPLE_TEXT="the" MSDF_CORRECTION_BADMAP=0 just demo-shot-normal-nobadmap
+
+debug-sdl-correction-on:
+    SDL_MSDF_SAMPLE_TEXT="the" MSDF_CORRECTION=1 MSDF_CORRECTION_BADMAP=0 just demo-shot-normal
+    cp "{{root}}/out/debug_shots/normal.png" "{{root}}/out/debug_shots/normal_corr_on.png"
+
+debug-sdl-correction-off:
+    SDL_MSDF_SAMPLE_TEXT="the" MSDF_CORRECTION=0 MSDF_CORRECTION_BADMAP=0 just demo-shot-normal
+    cp "{{root}}/out/debug_shots/normal.png" "{{root}}/out/debug_shots/normal_corr_off.png"
+
+debug-sdl-alpha-vs-median:
+    SDL_MSDF_SAMPLE_TEXT="the" SDL_MSDF_RENDER_ALPHA=0 just demo-live-text-shot
+    cp "{{root}}/examples/sdl_gpu_wesl/out/screenshot.png" "{{root}}/out/debug_shots/live_default_median.png"
+    SDL_MSDF_SAMPLE_TEXT="the" SDL_MSDF_RENDER_ALPHA=1 just demo-live-text-shot
+    cp "{{root}}/examples/sdl_gpu_wesl/out/screenshot.png" "{{root}}/out/debug_shots/live_alpha_forced.png"

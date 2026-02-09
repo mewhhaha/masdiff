@@ -78,6 +78,27 @@ atlasBold <- generateMSDFWithConfig cfgBold "assets/Inter/Inter-VariableFont_ops
 cabal test msdf-tests
 ```
 
+Update MTSDF snapshots:
+
+```sh
+MSDF_UPDATE_SNAPSHOTS=1 cabal test msdf-tests
+```
+
+Or use the helper script:
+
+```sh
+tools/mtsdf_snapshots.sh update
+```
+
+Optional SDL render snapshot (headless):
+
+```sh
+tools/sdl_render_snapshot.sh compare
+```
+
+`tools/sdl_render_snapshot.sh` also runs a seam-guard check and writes
+`out/snapshots/render/demo_live_text.seam.png` for diagnostics.
+
 ## Reference comparison (msdfgen)
 
 If you have `msdfgen` installed, you can generate side‑by‑side outputs for quick visual comparison:

@@ -31,7 +31,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import qualified MSDF.MSDF as MSDF
 import MSDF.MSDF (GlyphSet(..), glyphMetricsOnlyAt)
 import MSDF.Generated (BuildTimings(..), generateMSDFFromTTF, generateMSDFFromTTFWithTimings)
-import MSDF.Render (glyphQuad, glyphUV, pixelRangeForAtlas)
+import MSDF.Render (glyphQuad, glyphUV)
 import MSDF.Binary (ByteBuffer(..), readU8)
 import MSDF.Outline (Point(..))
 import MSDF.Types (AtlasImage(..), BitmapFormat(..), GlyphMSDF(..), MSDFAtlas(..), MSDFBitmap(..), lookupCodepoint)
@@ -453,8 +453,19 @@ main = do
         , MSDF.range = rangeBase
         , MSDF.atlas = cfg0.atlas { MSDF.atlasPadding = 16, MSDF.packAtlas = True }
         , MSDF.correction = cfg0.correction { MSDF.channelThreshold = 0.1, MSDF.edgeThreshold = 1.0, MSDF.hardThreshold = 0.05 }
-        , MSDF.outline = cfg0.outline { MSDF.windingFlatness = 0.02 }
-        , MSDF.distance = cfg0.distance { MSDF.signMode = MSDF.SignScanline }
+        , MSDF.outline = cfg0.outline
+            { MSDF.windingFlatness = 0.02
+            -- Keep intersection splitting opt-in in demo defaults.
+            -- Current split path can introduce small seam artifacts on some joins.
+            , MSDF.splitIntersections = False
+            }
+        , MSDF.distance =
+            cfg0.distance
+              { MSDF.signMode = MSDF.SignScanline
+              -- Keep overlap filtering opt-in for demo generation.
+              -- Current overlap logic can introduce visible sliver artifacts.
+              , MSDF.overlapSupport = False
+              }
         , MSDF.coloring = cfg0.coloring { MSDF.conflictDistance = 1.0 }
         , MSDF.variations = variations
         , MSDF.glyphSet = GlyphSetCodepoints (map ord sampleText)
@@ -952,7 +963,7 @@ buildAtlas cfgBase renderPixelSize diskCacheDir lazyAtlas textDebug cacheEnabled
                   boundsRaw = scaleBounds renderScale (textBounds atlas renderText)
                   fitScale = fitScaleToBox wrapWidth maxHeight boundsRaw
                   bounds = scaleBounds fitScale boundsRaw
-                  pxRange = pixelRangeForAtlas atlas (fromIntegral renderPx * fitScale)
+                  pxRange = fromIntegral atlas.range
                   penStart' = snapPen (penForCenter (centerX, centerY) bounds)
                   texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
                   verts = buildTextVerticesScaled (renderScale * fitScale) atlas (screenW, screenH) penStart' texel renderText
@@ -999,7 +1010,7 @@ buildAtlasLazy renderScale renderText cfg ttf label centerX centerY maxWidth max
       wrapWidth = fromMaybe (screenW * 0.94) maxWidth
       fitScale = fitScaleToBox wrapWidth maxHeight boundsRaw
       bounds = scaleBounds fitScale boundsRaw
-      pxRange = fromIntegral cfg.range * renderScale * fitScale
+      pxRange = fromIntegral cfg.range
       penStart' = snapPen (penForCenter (centerX, centerY) bounds)
       texel = (1 / fromIntegral aw, 1 / fromIntegral ah)
       verts = buildTextVerticesLazyScaled (renderScale * fitScale) glyphsMap (screenW, screenH) penStart' texel renderText ttf cfg

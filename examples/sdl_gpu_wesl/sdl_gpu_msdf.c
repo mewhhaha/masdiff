@@ -59,6 +59,21 @@ static void make_path(char *dst, size_t cap, const char *dir, const char *file) 
   SDL_snprintf(dst, cap, "%s/%s", dir, file);
 }
 
+static bool env_true_default(const char *name, bool defaultValue) {
+  const char *v = SDL_getenv(name);
+  if (!v) return defaultValue;
+  if (v[0] == '\0') return true;
+  if (SDL_strcasecmp(v, "0") == 0 || SDL_strcasecmp(v, "false") == 0 ||
+      SDL_strcasecmp(v, "no") == 0 || SDL_strcasecmp(v, "off") == 0) {
+    return false;
+  }
+  if (SDL_strcasecmp(v, "1") == 0 || SDL_strcasecmp(v, "true") == 0 ||
+      SDL_strcasecmp(v, "yes") == 0 || SDL_strcasecmp(v, "on") == 0) {
+    return true;
+  }
+  return true;
+}
+
 static int write_tga(const char *path, int w, int h, const void *data, SDL_GPUTextureFormat fmt) {
   const Uint8 *bytes = (const Uint8 *) data;
   bool is_bgra = fmt == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM ||
@@ -448,7 +463,7 @@ int main(int argc, char **argv) {
     debugMode = 1.f;
   }
   bool forceNearest = SDL_getenv("SDL_MSDF_NEAREST") != NULL;
-  bool renderAlphaSdf = SDL_getenv("SDL_MSDF_RENDER_ALPHA") != NULL;
+  bool renderAlphaSdf = env_true_default("SDL_MSDF_RENDER_ALPHA", false);
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0) {
     die("SDL_Init");
