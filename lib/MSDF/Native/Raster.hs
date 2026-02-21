@@ -1669,8 +1669,10 @@ channelBit channel =
 
 lessSignedDist :: SignedDist -> SignedDist -> Bool
 lessSignedDist a b =
-  abs a.distance < abs b.distance
-    || (abs a.distance == abs b.distance && a.dot < b.dot)
+  let absA = abs a.distance
+      absB = abs b.distance
+   in absA < absB
+        || (absA == absB && a.dot < b.dot)
 
 selectorAddEdge :: Pt -> Edge -> Edge -> Edge -> Selector -> Selector
 selectorAddEdge point prevEdge curEdge nextEdge selector =
@@ -1685,8 +1687,8 @@ selectorAddEdge point prevEdge curEdge nextEdge selector =
       bDir = normalizeAllowZero (edgeEndTangent curEdge)
       prevDir = normalizeAllowZero (edgeEndTangent prevEdge)
       nextDir = normalizeAllowZero (edgeStartTangent nextEdge)
-      add = dotVec ap (normalizeAllowZero (addPt prevDir aDir))
-      bdd = negate (dotVec bp (normalizeAllowZero (addPt bDir nextDir)))
+      add = dotVec ap (addPt prevDir aDir)
+      bdd = negate (dotVec bp (addPt bDir nextDir))
       selectorA =
         if add > 0.0
           then
