@@ -1,0 +1,26 @@
+# Build artifacts
+/dist-newstyle/
+*.hi
+*.hie
+*.o
+*.dyn_o
+*.dyn_hi
+
+# Cabal user-local state
+/.cabal/
+/.cabal-logs/
+/cabal.project.local
+/cabal.project.local~
+
+# Tooling
+/.ghc.environment.*
+/.hie-bios
+/.haskell-language-server/
+
+# Generated outputs
+/out/
+/tmp/
+
+# Editor/system
+*~
+.DS_Store

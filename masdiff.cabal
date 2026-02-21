@@ -1,0 +1,131 @@
+cabal-version:      3.14
+name:               masdiff
+version:            0.1.0.0
+-- synopsis:
+-- description:
+license:            MIT
+license-file:       LICENSE
+author:             mewhhaha
+maintainer:         kopatheonlyone@hotmail.com
+-- copyright:
+category:           Text
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+-- extra-source-files:
+
+common warnings
+    ghc-options: -Wall
+
+common haskell-defaults
+    default-language: GHC2024
+
+library
+    import:           warnings
+    import:           haskell-defaults
+    exposed-modules:
+        Font
+        MSDF.Compare
+        MSDF.Encode
+        MSDF.Generate
+        MSDF.Manifest
+        MSDF.Native
+        MSDF.Types
+    other-modules:
+        MSDF.Generate.Native
+        MSDF.Native.Raster
+        MSDF.Native.TTF
+        MSDF.Native.Types
+    -- other-extensions:
+    build-depends:
+        base ^>=4.21.0.0,
+        binary,
+        bytestring,
+        containers,
+        directory,
+        filepath,
+        JuicyPixels,
+        process,
+        temporary,
+        text
+    hs-source-dirs:   lib
+
+executable generate-inter-mtsdf-fixtures
+    import:           warnings
+    import:           haskell-defaults
+    hs-source-dirs:   app
+    main-is:          GenerateInterFixtures.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        containers,
+        directory,
+        filepath,
+        masdiff,
+        text
+
+executable masdiff
+    import:           warnings
+    import:           haskell-defaults
+    hs-source-dirs:   app
+    main-is:          MasdiffMain.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        containers,
+        masdiff,
+        text
+
+executable masdiff-validate
+    import:           warnings
+    import:           haskell-defaults
+    hs-source-dirs:   app
+    main-is:          ValidateManifestMain.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        directory,
+        filepath,
+        masdiff,
+        text
+
+executable masdiff-parity
+    import:           warnings
+    import:           haskell-defaults
+    hs-source-dirs:   app
+    main-is:          ParityMain.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        containers,
+        directory,
+        masdiff,
+        text
+
+benchmark masdiff-bench
+    import:           warnings
+    import:           haskell-defaults
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   bench
+    main-is:          Main.hs
+    ghc-options:      -threaded -rtsopts
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        masdiff,
+        time
+
+test-suite masdiff-test
+    import:           warnings
+    import:           haskell-defaults
+    -- other-modules:
+    -- other-extensions:
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        bytestring,
+        containers,
+        directory,
+        masdiff,
+        QuickCheck,
+        text

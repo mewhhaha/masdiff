@@ -1,0 +1,115 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NoFieldSelectors #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+
+module Main (main) where
+
+import Control.Exception (evaluate)
+import qualified Data.ByteString as BS
+import Data.Char (ord)
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import MSDF.Compare (DiffStats (..), diffRGBA8)
+import MSDF.Generate (defaultRuntimeCfg, generateGlyphIO)
+import MSDF.Types
+  ( FontSrc (..),
+    GenCfg (..),
+    GenOut (..),
+    GlyphCode,
+    ImgRGBA8 (..),
+    Mode (..),
+    mkDim,
+    mkGlyphCode,
+    mkImgRGBA8,
+    mkPxRange,
+  )
+import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
+
+main :: IO ()
+main = do
+  diffIters <- envInt "BENCH_DIFF_ITERS" 400
+  genIters <- envInt "BENCH_GEN_ITERS" 12
+  putStrLn ("diff iters: " <> show diffIters)
+  putStrLn ("generate iters: " <> show genIters)
+
+  let leftImg = fixedImage64x64 73 19
+  let rightImg = fixedImage64x64 31 101
+  diffMs <- timeLoop diffIters (consumeDiffStats leftImg rightImg)
+  putStrLn ("diffRGBA8 total ms: " <> show diffMs)
+  putStrLn ("diffRGBA8 avg ms: " <> show (diffMs / fromIntegral diffIters))
+
+  let cfg = benchmarkCfg
+  let font = FontFile {path = "assets/Inter/static/Inter_24pt-Regular.ttf"}
+  let glyph = benchmarkGlyphA
+  genMs <- timeLoop genIters (benchmarkGenerateGlyphIO cfg font glyph)
+  putStrLn ("generateGlyphIO total ms: " <> show genMs)
+  putStrLn ("generateGlyphIO avg ms: " <> show (genMs / fromIntegral genIters))
+
+timeLoop :: Int -> IO Int -> IO Double
+timeLoop iters action = do
+  t0 <- getPOSIXTime
+  loop iters
+  t1 <- getPOSIXTime
+  pure (realToFrac ((t1 - t0) * 1000))
+  where
+    loop n
+      | n <= 0 = pure ()
+      | otherwise = action >> loop (n - 1)
+
+fixedImage64x64 :: Int -> Int -> ImgRGBA8
+fixedImage64x64 mul add = must "fixedImage64x64" (mkImgRGBA8 64 64 payload)
+  where
+    pxCount = 64 * 64 * 4
+    payload = BS.pack [fromIntegral ((i * mul + add) `mod` 256) | i <- [0 .. pxCount - 1]]
+
+consumeDiffStats :: ImgRGBA8 -> ImgRGBA8 -> IO Int
+consumeDiffStats leftImg rightImg =
+  evaluate $
+    case diffRGBA8 leftImg rightImg of
+      Left _ -> -1
+      Right stats ->
+        let (maxR, maxG, maxB, maxA) = stats.maxCh
+         in stats.pxCount
+              + stats.chCount
+              + stats.maxAbs
+              + maxR
+              + maxG
+              + maxB
+              + maxA
+              + stats.p99Abs
+              + round (stats.meanAbs * 1000)
+              + stats.mismatch
+
+benchmarkGenerateGlyphIO :: GenCfg -> FontSrc -> GlyphCode -> IO Int
+benchmarkGenerateGlyphIO cfg src glyph = do
+  result <- generateGlyphIO defaultRuntimeCfg cfg src glyph
+  case result of
+    Left err -> error ("generateGlyphIO benchmark failed: " <> show err)
+    Right out -> evaluate (BS.length out.img.px)
+
+benchmarkCfg :: GenCfg
+benchmarkCfg =
+  GenCfg
+    { mode = Mtsdf,
+      dim = must "mkDim 64" (mkDim 64),
+      pxr = must "mkPxRange 8.0" (mkPxRange 8.0),
+      seed = 1,
+      autoframe = False
+    }
+
+benchmarkGlyphA :: GlyphCode
+benchmarkGlyphA = must "mkGlyphCode A" (mkGlyphCode (ord 'A'))
+
+envInt :: String -> Int -> IO Int
+envInt name fallback = do
+  raw <- lookupEnv name
+  pure $
+    case raw >>= readMaybe of
+      Just x | x > 0 -> x
+      _ -> fallback
+
+must :: String -> Either String a -> a
+must label result =
+  case result of
+    Right x -> x
+    Left err -> error (label <> " failed: " <> err)
