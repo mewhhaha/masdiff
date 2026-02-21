@@ -96,7 +96,8 @@ data GenCfg = GenCfg
     dim :: Dim,
     pxr :: PxRange,
     seed :: Int,
-    autoframe :: Bool
+    autoframe :: Bool,
+    ovlp :: Bool
   }
   deriving stock (Eq, Show)
 

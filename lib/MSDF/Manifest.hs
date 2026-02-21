@@ -60,7 +60,8 @@ manifestCfg meta =
       dim = meta.dim,
       pxr = meta.pxr,
       seed = meta.seed,
-      autoframe = True
+      autoframe = True,
+      ovlp = False
     }
 
 parseManifest :: String -> Either String Manifest

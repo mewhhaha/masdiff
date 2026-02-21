@@ -29,6 +29,7 @@ library
         MSDF.Generate
         MSDF.Manifest
         MSDF.Native
+        MSDF.TextRender
         MSDF.Types
     other-modules:
         MSDF.Generate.Native
@@ -97,6 +98,17 @@ executable masdiff-parity
         base ^>=4.21.0.0,
         containers,
         directory,
+        masdiff,
+        text
+
+executable masdiff-text-render
+    import:           warnings
+    import:           haskell-defaults
+    hs-source-dirs:   app
+    main-is:          TextRenderMain.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        containers,
         masdiff,
         text
 

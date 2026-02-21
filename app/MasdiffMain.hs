@@ -53,6 +53,7 @@ data ParseState = ParseState
     psPxr :: Double,
     psSeed :: Int,
     psAutoframe :: Bool,
+    psOvlp :: Bool,
     psOut :: FilePath,
     psFmt :: Maybe OutFmt,
     psPrintMetrics :: Bool
@@ -135,6 +136,8 @@ parseLoop st args =
       parseLoop st {psSeed = seed} rest
     "-autoframe" : rest ->
       parseLoop st {psAutoframe = True} rest
+    "-overlapfix" : rest ->
+      parseLoop st {psOvlp = True} rest
     "-o" : path : rest ->
       parseLoop st {psOut = path} rest
     "-format" : fmtRaw : rest -> do
@@ -144,10 +147,10 @@ parseLoop st args =
       parseLoop st {psPrintMetrics = True} rest
     flag : _
       | isUnsupported flag ->
-          Left $
-            "Unsupported option in phase-1: "
-              <> flag
-              <> ". Supported options: -font, -varfont, -dimensions, -pxrange, -seed, -autoframe, -o, -format, -printmetrics"
+            Left $
+              "Unsupported option in phase-1: "
+                <> flag
+                <> ". Supported options: -font, -varfont, -dimensions, -pxrange, -seed, -autoframe, -overlapfix, -o, -format, -printmetrics"
     raw : _ -> Left ("Unexpected positional argument: " <> raw)
 
 finalize :: ParseState -> Either String CliReq
@@ -162,7 +165,8 @@ finalize st = do
             dim = dim,
             pxr = pxr,
             seed = st.psSeed,
-            autoframe = st.psAutoframe
+            autoframe = st.psAutoframe,
+            ovlp = st.psOvlp
           }
   pure
     CliReq
@@ -183,6 +187,7 @@ defaultState =
       psPxr = 8.0,
       psSeed = 1,
       psAutoframe = False,
+      psOvlp = False,
       psOut = "output.png",
       psFmt = Nothing,
       psPrintMetrics = False
@@ -201,6 +206,7 @@ usage =
       "  -pxrange <range>",
       "  -seed <n>",
       "  -autoframe",
+      "  -overlapfix",
       "  -o <output>",
       "  -format <png|rgba>",
       "  -printmetrics"

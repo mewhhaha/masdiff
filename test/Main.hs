@@ -26,6 +26,16 @@ import MSDF.Compare (DiffStats (..), diffRGBA8, passesGate, strictGate)
 import MSDF.Encode (decodeMsdfgenRgba, encodeMsdfgenRgba)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestMeta (..), ManifestRow (..), loadManifest)
+import MSDF.TextRender
+  ( ScreenPxRange (..),
+    ShaderCfg (..),
+    addBorder,
+    hcatWithGap,
+    mkShaderCfg,
+    resampleBilinear,
+    shadeMtsdfImg,
+    solidImg
+  )
 import MSDF.Types
   ( AxisTag (..),
     AxisVal (..),
@@ -75,6 +85,7 @@ main = do
   backendParityOk <- runBackendParitySmoke
   thinItalicStrictParityOk <- runThinItalicStrictParityRegression
   compareBehaviorOk <- runCompareBehaviorChecks
+  textRenderOk <- runTextRenderChecks
   decodeChecksOk <- runDecodeChecks
   manifestChecksOk <- runManifestChecks
   let allOk =
@@ -91,6 +102,7 @@ main = do
             backendParityOk,
             thinItalicStrictParityOk,
             compareBehaviorOk,
+            textRenderOk,
             decodeChecksOk,
             manifestChecksOk
           ]
@@ -174,13 +186,14 @@ mkParityCfg = do
   dim <- mkDim 64
   pxr <- mkPxRange 8.0
   pure
-    GenCfg
-      { mode = Mtsdf,
-        dim = dim,
-        pxr = pxr,
-        seed = 1,
-        autoframe = True
-      }
+        GenCfg
+          { mode = Mtsdf,
+            dim = dim,
+            pxr = pxr,
+            seed = 1,
+            autoframe = True,
+            ovlp = False
+          }
 
 parityCases :: [(String, FontSrc, Int)]
 parityCases =
@@ -460,6 +473,305 @@ runCompareBehaviorChecks = do
           strictGateMaxChFailOk,
           strictGateP99FailOk,
           strictGateMeanFailOk
+        ]
+    )
+
+runTextRenderChecks :: IO Bool
+runTextRenderChecks = do
+  badShaderCfgOk <-
+    check
+      "mkShaderCfg rejects non-positive screenPxRange"
+      (isLeft (mkShaderCfg (FixedPxRange 0) True 0.06))
+  goodShaderCfgOk <-
+    check
+      "mkShaderCfg accepts valid fixed range"
+      (case mkShaderCfg (FixedPxRange 8) True 0.06 of Right _ -> True; Left _ -> False)
+  autoModeShaderCfgOk <-
+    check
+      "mkShaderCfg accepts auto mode"
+      (case mkShaderCfg (AutoPxRange 6) False 0.06 of Right _ -> True; Left _ -> False)
+  blackInsideOk <-
+    case mkShaderCfg (FixedPxRange 8) True 0.06 of
+      Left err ->
+        check ("shader cfg setup failed: " <> err) False
+      Right shader ->
+        case mkImgRGBA8 1 1 (BS.pack [255, 255, 255, 255]) of
+          Left err ->
+            check ("inside sample setup failed: " <> err) False
+          Right img ->
+            case shadeMtsdfImg shader img of
+              Left err ->
+                check ("inside shade failed: " <> err) False
+              Right shaded ->
+                check
+                  "shadeMtsdfImg maps inside sample to black"
+                  (BS.take 4 shaded.px == BS.pack [0, 0, 0, 255])
+  whiteOutsideOk <-
+    case mkShaderCfg (FixedPxRange 8) True 0.06 of
+      Left err ->
+        check ("shader cfg setup failed: " <> err) False
+      Right shader ->
+        case mkImgRGBA8 1 1 (BS.pack [0, 0, 0, 0]) of
+          Left err ->
+            check ("outside sample setup failed: " <> err) False
+          Right img ->
+            case shadeMtsdfImg shader img of
+              Left err ->
+                check ("outside shade failed: " <> err) False
+              Right shaded ->
+                check
+                  "shadeMtsdfImg maps outside sample to white"
+                  (BS.take 4 shaded.px == BS.pack [255, 255, 255, 255])
+  monotonicCoverageOk <-
+    case mkShaderCfg (FixedPxRange 8) True 0.06 of
+      Left err ->
+        check ("monotonic shader cfg setup failed: " <> err) False
+      Right shader ->
+        case
+          ( mkImgRGBA8 1 1 (BS.pack [120, 120, 120, 255]),
+            mkImgRGBA8 1 1 (BS.pack [136, 136, 136, 255])
+          ) of
+          (Left err, _) ->
+            check ("lower median sample setup failed: " <> err) False
+          (_, Left err) ->
+            check ("higher median sample setup failed: " <> err) False
+          (Right lowMedianImg, Right highMedianImg) ->
+            case
+              ( shadeMtsdfImg shader lowMedianImg,
+                shadeMtsdfImg shader highMedianImg
+              ) of
+              (Left err, _) ->
+                check ("low median shade failed: " <> err) False
+              (_, Left err) ->
+                check ("high median shade failed: " <> err) False
+              (Right lowShaded, Right highShaded) ->
+                case (BS.unpack lowShaded.px, BS.unpack highShaded.px) of
+                  (lowGray : _, highGray : _) ->
+                    check
+                      "higher median channel yields darker or equal grayscale"
+                      (highGray <= lowGray)
+                  _ ->
+                    check "shaded payloads were empty" False
+  acuteJoinHealOk <-
+    case mkShaderCfg (FixedPxRange 1) False 0.06 of
+      Left err ->
+        check ("acute-join shader cfg setup failed: " <> err) False
+      Right shader ->
+        case
+          ( mkImgRGBA8
+              3
+              3
+              ( BS.pack
+                  ( concat
+                      [ [214, 214, 214, 255, 214, 214, 214, 255, 178, 178, 178, 255],
+                        [214, 214, 214, 255, 26, 26, 26, 255, 178, 178, 178, 255],
+                        [214, 214, 214, 255, 214, 214, 214, 255, 178, 178, 178, 255]
+                      ]
+                  )
+              )
+          ) of
+          Left err ->
+            check ("acute-join fixture image setup failed: " <> err) False
+          Right img -> do
+            case shadeMtsdfImg (shader {ssaa = 1}) img of
+              Left err ->
+                check ("acute-join shade failed: " <> err) False
+              Right shaded ->
+                if BS.length shaded.px > 16
+                  then
+                    let centerGray = BS.index shaded.px 16
+                  in check
+                          "shadeMtsdfImg heals acute-join-like one-pixel pinhole"
+                          (centerGray < 80)
+                  else check "acute-join shaded payload was truncated" False
+  multiJoinHealOk <-
+    case mkShaderCfg (FixedPxRange 1) False 0.06 of
+      Left err ->
+        check ("join-heal shader cfg setup failed: " <> err) False
+      Right shader ->
+        let seamCoverage = [ [214, 214, 214],
+                            [214, 26, 178],
+                            [214, 214, 214]
+                          ]
+            pixelBytes = BS.pack $ concatMap (concatMap (\v -> [v, v, v, 255])) seamCoverage
+         in case mkImgRGBA8 3 3 pixelBytes of
+          Left err ->
+            check ("join-heal fixture image setup failed: " <> err) False
+          Right img -> do
+            case shadeMtsdfImg (shader {ssaa = 1}) img of
+              Left err ->
+                check ("join-heal shade failed: " <> err) False
+              Right shaded ->
+                if BS.length shaded.px > 16
+                  then
+                    let centerGray = BS.index shaded.px 16
+                     in check
+                          "shadeMtsdfImg heals a join-seam-like one-pixel artifact"
+                          (centerGray < 80)
+                  else check "join-heal shaded payload was truncated" False
+  neighborhoodSpeckHealOk <-
+    case mkShaderCfg (FixedPxRange 1) False 0.06 of
+      Left err ->
+        check ("neighborhood-heal shader cfg setup failed: " <> err) False
+      Right shader ->
+        let seamCoverage = [ [190, 190, 190],
+                            [190, 130, 190],
+                            [190, 190, 190]
+                          ]
+            pixelBytes = BS.pack $ concatMap (concatMap (\v -> [v, v, v, 255])) seamCoverage
+         in case mkImgRGBA8 3 3 pixelBytes of
+              Left err ->
+                check ("neighborhood-heal fixture image setup failed: " <> err) False
+              Right img -> do
+                case shadeMtsdfImg (shader {ssaa = 1}) img of
+                  Left err ->
+                    check ("neighborhood-heal shade failed: " <> err) False
+                  Right shaded ->
+                    if BS.length shaded.px > 16
+                      then
+                        let centerGray = BS.index shaded.px 16
+                         in check
+                              "shadeMtsdfImg heals dark-region bright bumps using neighborhood context"
+                              (centerGray < 80)
+                      else check "neighborhood-heal shaded payload was truncated" False
+  edgePreserveOk <-
+    case mkShaderCfg (FixedPxRange 1) False 0.06 of
+      Left err ->
+        check ("edge-preserve shader cfg setup failed: " <> err) False
+      Right shader ->
+        case
+          ( mkImgRGBA8
+              3
+              3
+              ( BS.pack
+                  ( concat
+                      [ [214, 214, 214, 255, 26, 26, 26, 255, 26, 26, 26, 255],
+                        [214, 214, 214, 255, 26, 26, 26, 255, 26, 26, 26, 255],
+                        [26, 26, 26, 255, 26, 26, 26, 255, 26, 26, 26, 255]
+                      ]
+                  )
+              )
+          ) of
+          Left err ->
+            check ("edge-preserve fixture image setup failed: " <> err) False
+          Right img ->
+            case shadeMtsdfImg (shader {ssaa = 1}) img of
+              Left err ->
+                check ("edge-preserve shade failed: " <> err) False
+              Right shaded ->
+                if BS.length shaded.px > 16
+                  then
+                    let centerGray = BS.index shaded.px 16
+                     in check
+                          "shadeMtsdfImg does not over-heal real edge pixels"
+                          (centerGray > 160)
+                  else check "edge-preserve shaded payload was truncated" False
+  nonHealContourOk <-
+    case mkShaderCfg (FixedPxRange 1) False 0.06 of
+      Left err ->
+        check ("non-heal shader cfg setup failed: " <> err) False
+      Right shader ->
+        let connectedDark = [ [214, 26, 214],
+                             [26, 26, 26],
+                             [214, 26, 214]
+                           ]
+            pixelBytes = BS.pack $ concatMap (concatMap (\v -> [v, v, v, 255])) connectedDark
+         in case mkImgRGBA8 3 3 pixelBytes of
+              Left err ->
+                check ("non-heal fixture image setup failed: " <> err) False
+              Right img -> do
+                case shadeMtsdfImg (shader {ssaa = 1}) img of
+                  Left err ->
+                    check ("non-heal shade failed: " <> err) False
+                  Right shaded ->
+                    if BS.length shaded.px > 16
+                      then
+                        let centerGray = BS.index shaded.px 16
+                         in check
+                              "shadeMtsdfImg does not over-heal connected dark corners"
+                              (centerGray > 140)
+                      else check "non-heal shaded payload was truncated" False
+  alphaFallbackOk <-
+    case (mkShaderCfg (FixedPxRange 8) False 0.06, mkShaderCfg (FixedPxRange 8) True 0.06) of
+      (Right noFallbackShader, Right fallbackShader) ->
+        case mkImgRGBA8 1 1 (BS.pack [255, 255, 255, 0]) of
+          Left err ->
+            check ("fallback sample setup failed: " <> err) False
+          Right img -> do
+            noFallbackResult <- pure (shadeMtsdfImg noFallbackShader img)
+            fallbackResult <- pure (shadeMtsdfImg fallbackShader img)
+            case (noFallbackResult, fallbackResult) of
+              (Right noFallbackImg, Right fallbackImg) ->
+                case (BS.unpack noFallbackImg.px, BS.unpack fallbackImg.px) of
+                  (noFallbackGray : _, fallbackGray : _) ->
+                    check
+                      "alpha fallback keeps output in valid grayscale range"
+                      ( noFallbackGray <= 255
+                          && fallbackGray <= 255
+                      )
+                  _ ->
+                    check "alpha fallback sample had empty payload" False
+              (Left err, _) ->
+                check ("no-fallback shade failed: " <> err) False
+              (_, Left err) ->
+                check ("fallback shade failed: " <> err) False
+      _ ->
+        check "fallback cfg setup failed" False
+  composeOk <-
+    case (solidImg 2 3 (255, 255, 255, 255), solidImg 1 3 (0, 0, 0, 255)) of
+      (Right leftImg, Right rightImg) ->
+        case hcatWithGap 2 [leftImg, rightImg] of
+          Left err ->
+            check ("hcatWithGap failed: " <> err) False
+          Right composed ->
+            check
+              "hcatWithGap preserves height and adds gap width"
+              (composed.w == 5 && composed.h == 3)
+      (Left err, _) ->
+        check ("solidImg setup failed: " <> err) False
+      (_, Left err) ->
+        check ("solidImg setup failed: " <> err) False
+  borderOk <-
+    case solidImg 5 3 (255, 255, 255, 255) of
+      Left err ->
+        check ("solidImg setup failed: " <> err) False
+      Right img ->
+        case addBorder 2 img of
+          Left err ->
+            check ("addBorder failed: " <> err) False
+          Right framed ->
+            check
+              "addBorder expands width and height by twice border"
+              (framed.w == 9 && framed.h == 7)
+  resampleOk <-
+    case solidImg 8 4 (255, 255, 255, 255) of
+      Left err ->
+        check ("solidImg setup failed: " <> err) False
+      Right img ->
+        case resampleBilinear 4 2 img of
+          Left err ->
+            check ("resampleBilinear failed: " <> err) False
+          Right resized ->
+            check
+              "resampleBilinear sets requested output dimensions"
+              (resized.w == 4 && resized.h == 2)
+  pure
+    ( and
+        [ badShaderCfgOk,
+          goodShaderCfgOk,
+          autoModeShaderCfgOk,
+          blackInsideOk,
+          whiteOutsideOk,
+          monotonicCoverageOk,
+          alphaFallbackOk,
+          composeOk,
+          borderOk,
+          resampleOk,
+          acuteJoinHealOk,
+          neighborhoodSpeckHealOk,
+          edgePreserveOk,
+          multiJoinHealOk,
+          nonHealContourOk
         ]
     )
 

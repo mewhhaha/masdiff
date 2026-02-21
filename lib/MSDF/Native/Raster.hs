@@ -16,7 +16,6 @@ import qualified Data.IntMap.Strict as IM
 import Data.Word (Word8)
 import MSDF.Native.Types
   ( Channel (..),
-    Contour (..),
     Edge (..),
     Outline (..),
     Pt (..),
@@ -47,13 +46,18 @@ rasterizeOutline cfg outline = do
   let dim = unDim cfg.dim
   let frame = computeFrame cfg outline
   let edgeContours = buildEdgeContours cfg.seed outline.contours
+  let useBoundaryPrepass = cfg.ovlp
+  let edgeContoursSelector =
+        if useBoundaryPrepass
+          then filterBoundaryEdges edgeContours
+          else edgeContours
   let edges = concat edgeContours
   img <-
     if null edges
       then mkImage dim dim (BS.replicate (dim * dim * 4) 0)
       else do
         let pxRange = unPxRange cfg.pxr
-        let rendered = renderImage dim frame pxRange outline.contours edgeContours
+        let rendered = renderImage dim frame pxRange edgeContours edgeContoursSelector
         mkImage dim dim rendered
   pure
     GenOut
@@ -65,8 +69,52 @@ rasterizeOutline cfg outline = do
               scale = Just frame.scale,
               translate = Just (frame.tx, frame.ty),
               range = Just (frame.rangeLo, frame.rangeHi)
-            }
+        }
       }
+
+filterBoundaryEdges :: [[Edge]] -> [[Edge]]
+filterBoundaryEdges edgeContours =
+  fmap (filter isBoundaryEdge) edgeContours
+  where
+    allEdges = concat edgeContours
+    sampleParams = [0.25, 0.5, 0.75]
+
+    isBoundaryEdge edge =
+      let isBoundarySample t =
+            let samplePt = edgePoint edge t
+                tangent = edgeTangent edge t
+                normal = orthonormalFalse tangent
+                sampleOffset = overlapSampleOffset samplePt edge
+                leftSample = samplePt `addPt` scalePt sampleOffset normal
+                rightSample = samplePt `addPt` scalePt (-sampleOffset) normal
+                leftInside = pointWindingInside allEdges leftSample
+                rightInside = pointWindingInside allEdges rightSample
+             in leftInside /= rightInside
+          insideCount = length (filter id (map isBoundarySample sampleParams))
+       in insideCount > div (length sampleParams) 2
+
+edgeTangent :: Edge -> Double -> Pt
+edgeTangent edge t =
+  case edge.c of
+    Nothing -> edgeStartTangent edge
+    Just ctrl -> quadTangent edge.a ctrl edge.b t
+
+overlapSampleOffset :: Pt -> Edge -> Double
+overlapSampleOffset _midpoint edge =
+  let spanX = abs (edge.b.x - edge.a.x)
+      spanY = abs (edge.b.y - edge.a.y)
+      localScale = 2.5e-5 * (spanX + spanY + 1.0)
+      fallbackScale = 2.5e-6
+   in max fallbackScale localScale
+
+pointWindingInside :: [Edge] -> Pt -> Bool
+pointWindingInside edges pt =
+  pointWindingNumber edges pt /= 0
+
+pointWindingNumber :: [Edge] -> Pt -> Int
+pointWindingNumber edges pt =
+  let intersections = preprocessScanlineIntersections (scanlineIntersectionsAt edges pt.y)
+   in fst (consumeIntersections pt.x 0 intersections)
 
 mkImage :: Int -> Int -> ByteString -> Either GenErr ImgRGBA8
 mkImage w h bytes =
@@ -146,15 +194,15 @@ computeFrame cfg outline =
               rangeHi = negate lower
             }
 
-renderImage :: Int -> Frame -> Double -> [Contour] -> [[Edge]] -> ByteString
-renderImage dim frame pxRange _contours edgeContours =
+renderImage :: Int -> Frame -> Double -> [[Edge]] -> [[Edge]] -> ByteString
+renderImage dim frame pxRange edgeContours edgeContoursSelector =
   BS.pack
     [ channel
       | px <- correctedPixels,
         channel <- encodePixel px
     ]
   where
-    selectorContours = map contourSelectorInput edgeContours
+    selectorContours = map contourSelectorInput edgeContoursSelector
     allEdges = concat edgeContours
     fillRows =
       [ scanlineRowFill dim frame allEdges y
@@ -172,7 +220,7 @@ renderImage dim frame pxRange _contours edgeContours =
     correctionThreshold = minDeviationRatioModern / max 1.0e-9 pxRange
     correctedPixels =
       if useModernErrorCorrection
-        then applyModernErrorCorrection dim dim frame pxRange edgeContours correctionInputPixels
+        then applyModernErrorCorrection dim dim frame pxRange edgeContoursSelector correctionInputPixels
         else applyLegacyErrorCorrection dim dim correctionThreshold correctionInputPixels
     useModernErrorCorrection = True
 

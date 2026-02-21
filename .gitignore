@@ -1,10 +1,14 @@
 # Build artifacts
 /dist-newstyle/
+/.stack-work/
 *.hi
 *.hie
 *.o
 *.dyn_o
 *.dyn_hi
+*.prof
+*.hp
+*.eventlog
 
 # Cabal user-local state
 /.cabal/

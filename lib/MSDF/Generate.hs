@@ -153,12 +153,17 @@ buildArgs cfg src glyph outRgba =
          show cfg.seed
        ]
     <> autoframeArg cfg.autoframe
+    <> overlapFixArg cfg.ovlp
     <> [ "-printmetrics",
          "-format",
          "rgba",
          "-o",
          outRgba
        ]
+
+overlapFixArg :: Bool -> [String]
+-- Keep behavior stable for now; overlap-fix wiring is intentionally deferred.
+overlapFixArg _ = []
 
 modeArg :: Mode -> String
 modeArg Mtsdf = "mtsdf"

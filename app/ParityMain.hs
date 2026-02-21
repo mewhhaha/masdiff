@@ -87,7 +87,8 @@ mkHarnessCfg = do
         dim = dim,
         pxr = pxr,
         seed = 1,
-        autoframe = True
+        autoframe = True,
+        ovlp = False
       }
 
 mkRows :: Either String [Row]

@@ -209,7 +209,8 @@ mkGenCfg options = do
         dim = dim,
         pxr = pxr,
         seed = options.harnessSeed,
-        autoframe = True
+        autoframe = True,
+        ovlp = False
       }
 
 generateAll :: RuntimeCfg -> GenCfg -> FilePath -> IO (Either String [ManifestRow])
