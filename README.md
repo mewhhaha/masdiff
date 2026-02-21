@@ -2,15 +2,10 @@
 
 `masdiff` is a Haskell library and CLI for generating MTSDF glyph textures from TrueType/OpenType fonts, validating parity, and preview rendering.
 
-Backends:
+Runtime model:
 
-- `native` (default): Haskell implementation.
-- `process` (oracle): delegates generation to an external oracle binary for validation/parity.
-
-Important:
-
-- `process` mode is for development/oracle comparison workflows.
-- library consumers can stay on `native` only.
+- library/runtime generation is Haskell (`native`).
+- external oracle comparison is development-only (documented below).
 
 ## Build
 
@@ -165,7 +160,7 @@ Default output:
 
 Environment:
 
-- `MASDIFF_BACKEND=native|process|oracle` (default: `native`)
+- `MASDIFF_BACKEND=native` (default)
 - `MTSDF_OUT=out/reference/inter-mtsdf`
 - `MTSDF_DIM=64`
 - `MTSDF_PXRANGE=8.0`

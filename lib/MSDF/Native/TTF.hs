@@ -649,7 +649,7 @@ inferContour coords sparse =
     expIdx = fmap fst explicit
     expMap = Map.fromList explicit
     expExt = expIdx <> fmap (+ n) expIdx
-    pairs = zip expExt (tail expExt)
+    pairs = zip expExt (drop 1 expExt)
     headIdx =
       case expIdx of
         [] -> 0
@@ -661,7 +661,7 @@ inferContour coords sparse =
         Nothing ->
           let j' = if j < headIdx then j + n else j
               picked =
-                case find (\(a, b) -> j' >= a && j' <= b) pairs of
+                case find (\(lo, hi) -> j' >= lo && j' <= hi) pairs of
                   Just p -> p
                   Nothing -> (headIdx, headIdx + n)
               a = fst picked
@@ -780,9 +780,15 @@ applyCompositeVariation font selfGid comps0 =
       pure $
         fmap
           (\(ix, comp) ->
-             comp
-               { dx = comp.dx + (dxs !! ix),
-                 dy = comp.dy + (dys !! ix)
+             Comp
+               { flg = comp.flg,
+                 gid = comp.gid,
+                 dx = comp.dx + (dxs !! ix),
+                 dy = comp.dy + (dys !! ix),
+                 a = comp.a,
+                 b = comp.b,
+                 c = comp.c,
+                 d = comp.d
                }
           )
           (zip [0 ..] comps0)
@@ -1038,10 +1044,11 @@ scaleContour k contour =
 
 scaleEdge :: Double -> Edge -> Edge
 scaleEdge k edge =
-  edge
+  Edge
     { a = scalePt k edge.a,
       b = scalePt k edge.b,
-      c = fmap (scalePt k) edge.c
+      c = fmap (scalePt k) edge.c,
+      col = edge.col
     }
 
 scalePt :: Double -> Pt -> Pt
@@ -1274,7 +1281,7 @@ parseGvar sfnt glyphCount = do
   sharedTupleCount <- fromIntegral <$> u16 gvar 6
   sharedTupleOffset <- fromIntegral <$> u32 gvar 8
   glyphCountRaw <- fromIntegral <$> u16 gvar 12
-  flags <- fromIntegral <$> u16 gvar 14
+  flags <- (fromIntegral <$> u16 gvar 14 :: Either String Int)
   dataOff <- fromIntegral <$> u32 gvar 16
   let glyphCnt = min glyphCount glyphCountRaw
   let offsetCount = glyphCnt + 1
@@ -1416,7 +1423,7 @@ readPackedPointsE bytes pos pointCount = do
           let runCount = (header .&. 0x7F) + 1
           let k = min remaining runCount
           (vals, pos1) <- readUnsignedRun bytes (pos' + 1) k isWord
-          let points = tail (scanl (+) prev vals)
+          let points = drop 1 (scanl (+) prev vals)
           let prev' =
                 case reverse points of
                   [] -> prev
@@ -1482,7 +1489,7 @@ tupleScalar loc0 hdr =
         (*)
         1
         (zipWith scalarAxis peak' loc')
-    Just (start, end) ->
+    Just _ ->
       foldl'
         (*)
         1

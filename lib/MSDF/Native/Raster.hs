@@ -440,10 +440,11 @@ lookupSample samples idx =
 
 flipRgb :: Pixel -> Pixel
 flipRgb px =
-  px
+  Pixel
     { r = 1.0 - px.r,
       g = 1.0 - px.g,
-      b = 1.0 - px.b
+      b = 1.0 - px.b,
+      a = px.a
     }
 
 minDeviationRatioModern :: Double
@@ -1200,7 +1201,12 @@ lookupPixel pixels idx =
 equalizePixel :: Pixel -> Pixel
 equalizePixel px =
   let med = corrMedian3 px.r px.g px.b
-   in px {r = med, g = med, b = med}
+   in Pixel
+        { r = med,
+          g = med,
+          b = med,
+          a = px.a
+        }
 
 median3 :: Double -> Double -> Double -> Double
 median3 x y z = max (min x y) (min (max x y) z)
@@ -1785,9 +1791,9 @@ signedDistanceQuad origin p0 p1 p2 =
         if endDistanceMag < abs startDistance
           then
             let dir1 = diffPt p2 p1
-                minDistance1 = fromIntegral (nonZeroSign (crossVec dir1 endVec)) * endDistanceMag
-                minParam1 = dotVec (diffPt origin p1) dir1 / dotVec dir1 dir1
-             in (minDistance1, minParam1, dir1)
+                endDistanceSigned = fromIntegral (nonZeroSign (crossVec dir1 endVec)) * endDistanceMag
+                endParam = dotVec (diffPt origin p1) dir1 / dotVec dir1 dir1
+             in (endDistanceSigned, endParam, dir1)
           else (startDistance, startParam, dir0)
       (minDistance1, minParam1) = foldl' (considerRoot qa ab br) (minDistance0, minParam0) roots
       dotTerm
@@ -1857,11 +1863,6 @@ solveCubicNormed a b c
     r2 = r * r
     q3 = q * q * q
     aShift = a / 3.0
-
-safeDiv :: Double -> Double -> Double
-safeDiv n d
-  | abs d <= 1.0e-18 = 0.0
-  | otherwise = n / d
 
 distanceToPerpendicularDistance :: SignedDist -> Pt -> Edge -> Double -> SignedDist
 distanceToPerpendicularDistance sample origin edge paramVal
@@ -1945,17 +1946,6 @@ edgeEndTangent edge =
        in if tangent.x == 0.0 && tangent.y == 0.0
             then chord
             else tangent
-
-quadPoint :: Pt -> Pt -> Pt -> Double -> Pt
-quadPoint p0 p1 p2 t =
-  let u = 1.0 - t
-      w0 = u * u
-      w1 = 2.0 * u * t
-      w2 = t * t
-   in Pt
-        { x = (w0 * p0.x) + (w1 * p1.x) + (w2 * p2.x),
-          y = (w0 * p0.y) + (w1 * p1.y) + (w2 * p2.y)
-        }
 
 quadTangent :: Pt -> Pt -> Pt -> Double -> Pt
 quadTangent p0 p1 p2 t =

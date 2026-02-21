@@ -7,11 +7,15 @@ module Main (main) where
 import Control.Exception (evaluate)
 import qualified Data.ByteString as BS
 import Data.Char (ord)
+import qualified Data.Map.Strict as Map
+import qualified Data.Text as T
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import MSDF.Compare (DiffStats (..), diffRGBA8)
 import MSDF.Generate (defaultRuntimeCfg, generateGlyphIO)
 import MSDF.Types
-  ( FontSrc (..),
+  ( AxisTag (..),
+    AxisVal (..),
+    FontSrc (..),
     GenCfg (..),
     GenOut (..),
     GlyphCode,
@@ -29,8 +33,10 @@ main :: IO ()
 main = do
   diffIters <- envInt "BENCH_DIFF_ITERS" 400
   genIters <- envInt "BENCH_GEN_ITERS" 12
+  warmupIters <- envInt "BENCH_WARMUP_ITERS" 1
   putStrLn ("diff iters: " <> show diffIters)
   putStrLn ("generate iters: " <> show genIters)
+  putStrLn ("warmup iters: " <> show warmupIters)
 
   let leftImg = fixedImage64x64 73 19
   let rightImg = fixedImage64x64 31 101
@@ -39,11 +45,26 @@ main = do
   putStrLn ("diffRGBA8 avg ms: " <> show (diffMs / fromIntegral diffIters))
 
   let cfg = benchmarkCfg
-  let font = FontFile {path = "assets/Inter/static/Inter_24pt-Regular.ttf"}
   let glyph = benchmarkGlyphA
-  genMs <- timeLoop genIters (benchmarkGenerateGlyphIO cfg font glyph)
-  putStrLn ("generateGlyphIO total ms: " <> show genMs)
-  putStrLn ("generateGlyphIO avg ms: " <> show (genMs / fromIntegral genIters))
+  let staticFont = FontFile {path = "assets/Inter/static/Inter_24pt-Regular.ttf"}
+  let variableFont =
+        VarFontFile
+          { path = "assets/Inter/Inter-VariableFont_opsz,wght.ttf",
+            axes =
+              Map.fromList
+                [ (AxisTag (T.pack "opsz"), AxisVal 14.0),
+                  (AxisTag (T.pack "wght"), AxisVal 400.0)
+                ]
+          }
+  runGenerateCase warmupIters genIters cfg staticFont glyph "generateGlyphIO/static"
+  runGenerateCase warmupIters genIters cfg variableFont glyph "generateGlyphIO/variable"
+
+runGenerateCase :: Int -> Int -> GenCfg -> FontSrc -> GlyphCode -> String -> IO ()
+runGenerateCase warmupIters genIters cfg src glyph label = do
+  _ <- timeLoop warmupIters (benchmarkGenerateGlyphIO cfg src glyph)
+  genMs <- timeLoop genIters (benchmarkGenerateGlyphIO cfg src glyph)
+  putStrLn (label <> " total ms: " <> show genMs)
+  putStrLn (label <> " avg ms: " <> show (genMs / fromIntegral genIters))
 
 timeLoop :: Int -> IO Int -> IO Double
 timeLoop iters action = do
@@ -94,7 +115,8 @@ benchmarkCfg =
       dim = must "mkDim 64" (mkDim 64),
       pxr = must "mkPxRange 8.0" (mkPxRange 8.0),
       seed = 1,
-      autoframe = False
+      autoframe = False,
+      ovlp = False
     }
 
 benchmarkGlyphA :: GlyphCode
