@@ -5,11 +5,10 @@
 Backends:
 
 - `native` (default): Haskell implementation.
-- `process` (oracle): delegates generation to an external `msdfgen` binary for validation/parity.
+- `process` (oracle): delegates generation to an external oracle binary for validation/parity.
 
 Important:
 
-- `masdiff` does not ship, vendor, or link `msdfgen`.
 - `process` mode is for development/oracle comparison workflows.
 - library consumers can stay on `native` only.
 
@@ -167,7 +166,6 @@ Default output:
 Environment:
 
 - `MASDIFF_BACKEND=native|process|oracle` (default: `native`)
-- `MSDFGEN_BIN=/path/to/msdfgen` (needed for `process`)
 - `MTSDF_OUT=out/reference/inter-mtsdf`
 - `MTSDF_DIM=64`
 - `MTSDF_PXRANGE=8.0`
@@ -197,7 +195,7 @@ cabal run masdiff-text-render -- \
   --pxrange 6.0
 ```
 
-### Single glyph generation (msdfgen-like subset)
+### Single glyph generation (CLI subset)
 
 ```bash
 cabal run masdiff -- \
@@ -215,6 +213,8 @@ cabal run masdiff -- \
 This is the workflow used during development to tune and verify native output.
 `msdfgen` is treated as an external oracle only and is not a runtime dependency
 of the shipped native library path.
+
+Reference project: [Chlumsky/msdfgen](https://github.com/Chlumsky/msdfgen)
 
 ### 1) Generate oracle fixtures with external `msdfgen`
 
