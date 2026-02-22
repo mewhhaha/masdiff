@@ -490,3 +490,24 @@ Before shipping:
 - Prefer TDD when practical (failing test first).
 - Benchmarks/tests rerun for touched behavior.
 - Public exports are intentionally minimal.
+
+## Pause Handoff: Next Steps
+
+Current focus is native raster performance while preserving exact parity.
+
+Resume sequence:
+1. Re-run current baseline (3 runs, `-N1`) and record medians:
+   - `CABAL_DIR="$PWD/.cabal" CABAL_LOGDIR="$PWD/.cabal-logs" BENCH_DIFF_ITERS=800 BENCH_GEN_ITERS=24 BENCH_WARMUP_ITERS=2 cabal bench masdiff-bench --benchmark-options='+RTS -N1 -s -RTS'`
+2. Apply one small optimization candidate at a time in `lib/MSDF/Native/Raster.hs`:
+   - prefer removing repeated per-pixel arithmetic/allocation in `findErrorsModern` and related stencil passes,
+   - avoid broad algorithm rewrites in the same diff.
+3. After each candidate, run correctness gates:
+   - `cabal test masdiff-test`
+   - `cabal run masdiff-parity -- --require-exact`
+4. Keep only candidates with repeatable median wins and zero parity drift.
+5. Document every pass in `docs/PERFORMANCE.md`:
+   - command,
+   - log paths,
+   - medians/deltas,
+   - whether candidate was kept or reverted.
+6. Commit in small, reversible steps once a pass is validated.

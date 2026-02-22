@@ -24,7 +24,7 @@ import Font
   )
 import MSDF.Compare (DiffStats (..), diffRGBA8, passesGate, strictGate)
 import MSDF.Encode (decodeMsdfgenRgba, encodeMsdfgenRgba)
-import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphIO)
+import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphBatchIO, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestMeta (..), ManifestRow (..), loadManifest)
 import MSDF.TextRender
   ( ScreenPxRange (..),
@@ -41,6 +41,7 @@ import MSDF.Types
     AxisVal (..),
     FontSrc (..),
     GenCfg (..),
+    GenErr (..),
     GenOut (..),
     ImgRGBA8 (..),
     Mode (..),
@@ -81,6 +82,7 @@ main = do
   variableAxesOk <- checkVariableAxes
   fontFilesOk <- checkFontFiles
   fontBehaviorOk <- runFontBehaviorChecks
+  batchGenerateOk <- runBatchGenerateChecks
   variableAxisNativeOk <- runVariableAxisNativeRegression
   backendParityOk <- runBackendParitySmoke
   thinItalicStrictParityOk <- runThinItalicStrictParityRegression
@@ -98,6 +100,7 @@ main = do
             variableAxesOk,
             fontFilesOk,
             fontBehaviorOk,
+            batchGenerateOk,
             variableAxisNativeOk,
             backendParityOk,
             thinItalicStrictParityOk,
@@ -256,6 +259,71 @@ runParityCase strictEnabled nativeRuntime processRuntime cfg (label, src, codepo
                     else
                       pure ()
                   check (label <> parityLabel strictEnabled) ok
+
+runBatchGenerateChecks :: IO Bool
+runBatchGenerateChecks =
+  case mkParityCfg of
+    Left err ->
+      check ("batch generation config failed: " <> err) False
+    Right cfg ->
+      case traverse mkGlyphCode [ord 'A', ord 'B', ord 'C', ord 'D'] of
+        Left err ->
+          check ("batch generation glyph setup failed: " <> err) False
+        Right glyphs -> do
+          let runtime = defaultRuntimeCfg {backend = BackendNative}
+          let src = FontFile {path = "assets/Inter/static/Inter_18pt-Regular.ttf"}
+          seqResults <- traverse (generateGlyphIO runtime cfg src) glyphs
+          batchJobs1 <- generateGlyphBatchIO runtime 1 cfg src glyphs
+          batchJobs4 <- generateGlyphBatchIO runtime 4 cfg src glyphs
+          jobs1Ok <-
+            check
+              "generateGlyphBatchIO jobs=1 matches sequential generateGlyphIO"
+              (batchJobs1 == seqResults)
+          jobs4Ok <-
+            check
+              "generateGlyphBatchIO jobs=4 matches sequential generateGlyphIO"
+              (batchJobs4 == seqResults)
+          let variableSrc =
+                VarFontFile
+                  { path = "assets/Inter/Inter-VariableFont_opsz,wght.ttf",
+                    axes =
+                      Map.fromList
+                        [ (AxisTag (T.pack "wght"), AxisVal 700),
+                          (AxisTag (T.pack "opsz"), AxisVal 14)
+                        ]
+                  }
+          variableSeq <- traverse (generateGlyphIO runtime cfg variableSrc) glyphs
+          variableBatch <- generateGlyphBatchIO runtime 4 cfg variableSrc glyphs
+          variableOk <-
+            check
+              "generateGlyphBatchIO variable jobs=4 matches sequential generateGlyphIO"
+              (variableBatch == variableSeq)
+          missingBatch <- generateGlyphBatchIO runtime 4 cfg (FontFile {path = "/tmp/masdiff_missing_font.ttf"}) glyphs
+          missingOk <-
+            check
+              "generateGlyphBatchIO reports MissingInput for missing font"
+              (all isMissingInput missingBatch)
+          let processRuntimeMissing =
+                defaultRuntimeCfg
+                  { backend = BackendProcess,
+                    msdfgenBin = "/tmp/masdiff_missing_msdfgen_bin"
+                  }
+          processMissingJobs1 <- generateGlyphBatchIO processRuntimeMissing 1 cfg src glyphs
+          processMissingJobs4 <- generateGlyphBatchIO processRuntimeMissing 4 cfg src glyphs
+          processMissingJobs1Ok <-
+            check
+              "generateGlyphBatchIO process jobs=1 reports MissingInput for missing msdfgen executable"
+              (all isMissingInput processMissingJobs1)
+          processMissingJobs4Ok <-
+            check
+              "generateGlyphBatchIO process jobs=4 reports MissingInput for missing msdfgen executable"
+              (all isMissingInput processMissingJobs4)
+          pure (jobs1Ok && jobs4Ok && variableOk && missingOk && processMissingJobs1Ok && processMissingJobs4Ok)
+  where
+    isMissingInput result =
+      case result of
+        Left (MissingInput _) -> True
+        _ -> False
 
 runVariableAxisNativeRegression :: IO Bool
 runVariableAxisNativeRegression =

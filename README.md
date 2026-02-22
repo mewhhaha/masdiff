@@ -53,6 +53,46 @@ main = do
     Right out -> writePngRGBA8File "A.mtsdf.png" out.img
 ```
 
+### 1b) Generate a glyph batch with bounded parallelism
+
+```haskell
+import Data.Char (ord)
+import MSDF.Generate (defaultRuntimeCfg, generateGlyphBatchIO)
+import MSDF.Types
+  ( FontSrc (..),
+    GenCfg (..),
+    Mode (..),
+    mkDim,
+    mkGlyphCode,
+    mkPxRange
+  )
+
+main :: IO ()
+main = do
+  dim <- either fail pure (mkDim 64)
+  pxr <- either fail pure (mkPxRange 8.0)
+  let cfg =
+        GenCfg
+          { mode = Mtsdf
+          , dim = dim
+          , pxr = pxr
+          , seed = 1
+          , autoframe = True
+          , ovlp = False
+          }
+      src = FontFile {path = "assets/Inter/static/Inter_24pt-Regular.ttf"}
+  -- jobs=1 is sequential; jobs>1 enables bounded worker concurrency.
+  glyphs <- traverse (either fail pure . mkGlyphCode . ord) "MASDIFF"
+  results <- generateGlyphBatchIO defaultRuntimeCfg 8 cfg src glyphs
+  case sequence results of
+    Left err -> fail (show err)
+    Right outs -> putStrLn ("Generated " <> show (length outs) <> " glyphs")
+```
+
+Notes:
+- In `BackendNative`, batch generation parses OpenType/TrueType tables once per batch (not once per glyph).
+- For multicore throughput, run with `+RTS -N -RTS` and choose `jobs` around `numCapabilities`.
+
 Texture contract:
 
 - `rgb` = MSDF channels.

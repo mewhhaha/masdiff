@@ -38,6 +38,7 @@ library
         MSDF.Native.Types
     -- other-extensions:
     build-depends:
+        array,
         base ^>=4.21.0.0,
         binary,
         bytestring,

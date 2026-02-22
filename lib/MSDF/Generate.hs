@@ -8,10 +8,15 @@ module MSDF.Generate
     defaultRuntimeCfg,
     parseBackendModeEnv,
     generateGlyphIO,
+    generateGlyphBatchIO,
     renderMetrics,
   )
 where
 
+import Control.Concurrent (forkFinally)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
+import Control.Exception (mask, onException, throwIO)
 import Data.Char (toLower)
 import Data.List (find, intercalate, stripPrefix)
 import qualified Data.Map.Strict as Map
@@ -82,6 +87,49 @@ generateGlyphIO runtime cfg src glyph = do
       case runtime.backend of
         BackendNative -> Native.generateGlyphIO cfg src glyph
         BackendProcess -> generateGlyphProcessIO runtime cfg src glyph
+
+generateGlyphBatchIO :: RuntimeCfg -> Int -> GenCfg -> FontSrc -> [GlyphCode] -> IO [Either GenErr GenOut]
+generateGlyphBatchIO runtime jobs cfg src glyphs
+  | runtime.backend == BackendNative = Native.generateGlyphBatchIO jobs cfg src glyphs
+  | jobs <= 1 = traverse runOne glyphs
+  | otherwise = mapConcurrentlyBounded jobs runOne glyphs
+  where
+    runOne glyph = generateGlyphIO runtime cfg src glyph
+
+mapConcurrentlyBounded :: Int -> (a -> IO b) -> [a] -> IO [b]
+mapConcurrentlyBounded jobs action inputs = do
+  sem <- newQSem (max 1 jobs)
+  resultVars <- traverse (spawnOne sem) inputs
+  results <- traverse takeMVar resultVars
+  case firstFailure results of
+    Just ex -> throwIO ex
+    Nothing -> pure (collectRights results)
+  where
+    spawnOne sem input = do
+      mask $ \restore -> do
+        waitQSem sem
+        resultVar <- newEmptyMVar
+        let release = signalQSem sem
+        _ <-
+          forkFinally
+            (restore (action input))
+            (\result -> do
+               putMVar resultVar result
+               release
+            )
+            `onException` release
+        pure resultVar
+
+    firstFailure = foldr pickFirstFailure Nothing
+    pickFirstFailure result acc =
+      case result of
+        Left ex -> Just ex
+        Right _ -> acc
+    collectRights = foldr collect []
+    collect result acc =
+      case result of
+        Left _ -> acc
+        Right value -> value : acc
 
 generateGlyphProcessIO :: RuntimeCfg -> GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)
 generateGlyphProcessIO runtime cfg src glyph = do

@@ -127,6 +127,7 @@ data RuntimeCfg = RuntimeCfg
 defaultRuntimeCfg :: RuntimeCfg
 parseBackendModeEnv :: Maybe String -> Either String BackendMode
 generateGlyphIO :: RuntimeCfg -> GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)
+generateGlyphBatchIO :: RuntimeCfg -> Int -> GenCfg -> FontSrc -> [GlyphCode] -> IO [Either GenErr GenOut]
 renderMetrics :: Metrics -> String
 ```
 

@@ -8,15 +8,17 @@ module MSDF.Native.Raster
 where
 
 import Data.Bits ((.&.), (.|.))
+import Data.Array ((!),
+                   listArray)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (sortBy)
 import Data.Ord (comparing)
 import qualified Data.IntMap.Strict as IM
 import Data.Word (Word8)
+import GHC.Conc (numCapabilities, par, pseq)
 import MSDF.Native.Types
-  ( Channel (..),
-    Edge (..),
+  ( Edge (..),
     Outline (..),
     Pt (..),
     buildEdgeContours,
@@ -204,16 +206,11 @@ renderImage dim frame pxRange edgeContours edgeContoursSelector =
   where
     selectorContours = map contourSelectorInput edgeContoursSelector
     allEdges = concat edgeContours
-    fillRows =
-      [ scanlineRowFill dim frame allEdges y
-        | y <- [0 .. dim - 1]
-      ]
-
+    useParallelRows = numCapabilities > 1 && dim >= 192
     rawPixels =
-      [ samplePixel x y fill
-        | (y, rowFill) <- zip [0 ..] fillRows,
-          (x, fill) <- zip [0 ..] rowFill
-      ]
+      if useParallelRows
+        then rawPixelsParallel dim frame pxRange allEdges selectorContours
+        else rawPixelsSequential dim frame pxRange allEdges selectorContours
 
     signCorrectedPixels = applyAmbiguousSignFix dim dim rawPixels
     correctionInputPixels = fmap floatLikePixel signCorrectedPixels
@@ -224,52 +221,150 @@ renderImage dim frame pxRange edgeContours edgeContoursSelector =
         else applyLegacyErrorCorrection dim dim correctionThreshold correctionInputPixels
     useModernErrorCorrection = True
 
-    samplePixel x y fill =
-      let glyphPoint = pixelToGlyph frame dim x y
-          samples = accumulateSamples glyphPoint selectorContours
-          dA = samples.dA
-          dR = samples.dR
-          dG = samples.dG
-          dB = samples.dB
-          scaleToPx d = d * frame.scale
-          rRaw = 0.5 + (scaleToPx dR / pxRange)
-          gRaw = 0.5 + (scaleToPx dG / pxRange)
-          bRaw = 0.5 + (scaleToPx dB / pxRange)
-          aRaw = 0.5 + (scaleToPx dA / pxRange)
-          med = corrMedian3 rRaw gRaw bRaw
-          (rSigned, gSigned, bSigned, matchVal)
-            | med == 0.5 = (rRaw, gRaw, bRaw, 0)
-            | (med > 0.5) /= fill = (1.0 - rRaw, 1.0 - gRaw, 1.0 - bRaw, -1)
-            | otherwise = (rRaw, gRaw, bRaw, 1)
-          aSigned
-            | (aRaw > 0.5) /= fill = 1.0 - aRaw
-            | otherwise = aRaw
-       in PixelSample
-            { px =
-                Pixel
-                  { r = rSigned,
-                    g = gSigned,
-                    b = bSigned,
-                    a = aSigned
-                  },
-              match = matchVal
-            }
-
-    encodePixel px =
-      [ toWord8 px.r,
-        toWord8 px.g,
-        toWord8 px.b,
-        toWord8 px.a
+rawPixelsSequential :: Int -> Frame -> Double -> [Edge] -> [ContourSelectorInput] -> [PixelSample]
+rawPixelsSequential dim frame pxRange allEdges selectorContours =
+  [ samplePixelAt dim frame pxRange selectorContours x y fill
+    | (y, rowFill) <- zip [0 ..] fillRows,
+      (x, fill) <- zip [0 ..] rowFill
+  ]
+  where
+    fillRows =
+      [ scanlineRowFill dim frame allEdges y
+        | y <- [0 .. dim - 1]
       ]
 
-contourTriples :: [Edge] -> [(Edge, Edge, Edge)]
+rawPixelsParallel :: Int -> Frame -> Double -> [Edge] -> [ContourSelectorInput] -> [PixelSample]
+rawPixelsParallel dim frame pxRange allEdges selectorContours =
+  concat (parMapChunked rowChunkN forcePixelSampleRow sampleRow rowInput)
+  where
+    rowIndices = [0 .. dim - 1]
+    fillRows =
+      [ scanlineRowFill dim frame allEdges y
+        | y <- rowIndices
+      ]
+    rowInput = zip rowIndices fillRows
+    rowChunkN =
+      max
+        8
+        (dim `quot` max 1 (numCapabilities * 2))
+    sampleRow (y, rowFill) =
+      [ samplePixelAt dim frame pxRange selectorContours x y fill
+        | (x, fill) <- zip [0 ..] rowFill
+      ]
+
+samplePixelAt :: Int -> Frame -> Double -> [ContourSelectorInput] -> Int -> Int -> Bool -> PixelSample
+samplePixelAt dim frame pxRange selectorContours x y fill =
+  let glyphPoint = pixelToGlyph frame dim x y
+      samples = accumulateSamples glyphPoint selectorContours
+      dA = samples.dA
+      dR = samples.dR
+      dG = samples.dG
+      dB = samples.dB
+      scaleToPx d = d * frame.scale
+      rRaw = 0.5 + (scaleToPx dR / pxRange)
+      gRaw = 0.5 + (scaleToPx dG / pxRange)
+      bRaw = 0.5 + (scaleToPx dB / pxRange)
+      aRaw = 0.5 + (scaleToPx dA / pxRange)
+      med = corrMedian3 rRaw gRaw bRaw
+      (rSigned, gSigned, bSigned, matchVal)
+        | med == 0.5 = (rRaw, gRaw, bRaw, 0)
+        | (med > 0.5) /= fill = (1.0 - rRaw, 1.0 - gRaw, 1.0 - bRaw, -1)
+        | otherwise = (rRaw, gRaw, bRaw, 1)
+      aSigned
+        | (aRaw > 0.5) /= fill = 1.0 - aRaw
+        | otherwise = aRaw
+   in PixelSample
+        { px =
+            Pixel
+              { r = rSigned,
+                g = gSigned,
+                b = bSigned,
+                a = aSigned
+              },
+          match = matchVal
+        }
+
+encodePixel :: Pixel -> [Word8]
+encodePixel px =
+  [ toWord8 px.r,
+    toWord8 px.g,
+    toWord8 px.b,
+    toWord8 px.a
+  ]
+
+parMapChunked :: Int -> (b -> ()) -> (a -> b) -> [a] -> [b]
+parMapChunked chunkN forceB f =
+  go . chunkList (max 1 chunkN)
+  where
+    go chunks =
+      case chunks of
+        [] -> []
+        chunk : rest ->
+          let ys = fmap f chunk
+              ysForced = forceListBy forceB ys
+              zs = go rest
+           in ysForced `par` (zs `pseq` (ys <> zs))
+
+chunkList :: Int -> [a] -> [[a]]
+chunkList n values =
+  case values of
+    [] -> []
+    _ ->
+      let (prefix, suffix) = splitAt n values
+       in prefix : chunkList n suffix
+
+forceListBy :: (a -> ()) -> [a] -> ()
+forceListBy forceElem values =
+  foldl' step () values
+  where
+    step () value = forceElem value `seq` ()
+
+forcePixelSampleRow :: [PixelSample] -> ()
+forcePixelSampleRow = forceListBy forcePixelSample
+
+forcePixelSample :: PixelSample -> ()
+forcePixelSample sample = sample `seq` ()
+
+data ContourTriple = ContourTriple
+  { curEdge :: !Edge,
+    hasR :: !Bool,
+    hasG :: !Bool,
+    hasB :: !Bool,
+    aBlend :: !Pt,
+    bBlend :: !Pt,
+    negADir :: !Pt,
+    bDir :: !Pt
+  }
+  deriving stock (Eq, Show)
+
+contourTriples :: [Edge] -> [ContourTriple]
 contourTriples edges =
   case edges of
     [] -> []
-    _ -> zip3 (rotateRight (rotateRight edges)) (rotateRight edges) edges
+    _ -> fmap prepare (zip3 (rotateRight (rotateRight edges)) (rotateRight edges) edges)
+  where
+    prepare (prevEdge, curEdge, nextEdge) =
+      let colMask = curEdge.col
+          hasR = colMask .&. 1 /= 0
+          hasG = colMask .&. 2 /= 0
+          hasB = colMask .&. 4 /= 0
+          aDir = normalizeAllowZero (edgeStartTangent curEdge)
+          bDir = normalizeAllowZero (edgeEndTangent curEdge)
+          prevDir = normalizeAllowZero (edgeEndTangent prevEdge)
+          nextDir = normalizeAllowZero (edgeStartTangent nextEdge)
+       in ContourTriple
+            { curEdge = curEdge,
+              hasR = hasR,
+              hasG = hasG,
+              hasB = hasB,
+              aBlend = addPt prevDir aDir,
+              bBlend = addPt bDir nextDir,
+              negADir = negPt aDir,
+              bDir = bDir
+            }
 
 data ContourSelectorInput = ContourSelectorInput
-  { triples :: ![(Edge, Edge, Edge)],
+  { triples :: ![ContourTriple],
     winding :: !Int
   }
   deriving stock (Eq, Show)
@@ -345,6 +440,17 @@ data PixelSample = PixelSample
   }
   deriving stock (Eq, Show)
 
+type PixelLookup = Int -> Pixel
+
+zeroPixel :: Pixel
+zeroPixel =
+  Pixel
+    { r = 0.0,
+      g = 0.0,
+      b = 0.0,
+      a = 0.0
+    }
+
 floatLike :: Double -> Double
 floatLike x = realToFrac (realToFrac x :: Float)
 
@@ -395,48 +501,41 @@ cxxMedian3 x y z = msMaxD (msMinD x y) (msMinD (msMaxD x y) z)
 applyAmbiguousSignFix :: Int -> Int -> [PixelSample] -> [Pixel]
 applyAmbiguousSignFix w h samples =
   let count = w * h
-      sampleMap = IM.fromDistinctAscList (zip [0 .. count - 1] samples)
-   in fmap (resolvePixel sampleMap) [0 .. count - 1]
+   in if count <= 0
+        then []
+        else
+          let sampleArr = listArray (0, count - 1) samples
+           in fmap (resolvePixel sampleArr) [0 .. count - 1]
   where
-    resolvePixel sampleMap idx =
-      let sample = lookupSample sampleMap idx
+    resolvePixel sampleArr idx =
+      let sample = sampleArr ! idx
        in if sample.match /= 0
             then sample.px
             else
               let (x, y) = fromIndex w idx
-                  neighborSum =
-                    sum
-                      [ (lookupSample sampleMap (toIndex w nx ny)).match
-                        | (dx, dy) <- neighborOffsetsCardinal,
-                          let nx = x + dx,
-                          let ny = y + dy,
-                          nx >= 0,
-                          nx < w,
-                          ny >= 0,
-                          ny < h
-                      ]
+                  leftMatch =
+                    if x > 0
+                      then (sampleArr ! (idx - 1)).match
+                      else 0
+                  rightMatch =
+                    if x < w - 1
+                      then (sampleArr ! (idx + 1)).match
+                      else 0
+                  upMatch =
+                    if y > 0
+                      then (sampleArr ! (idx - w)).match
+                      else 0
+                  downMatch =
+                    if y < h - 1
+                      then (sampleArr ! (idx + w)).match
+                      else 0
+                  neighborSum = leftMatch + rightMatch + upMatch + downMatch
                in if neighborSum < 0
                     then flipRgb sample.px
                     else sample.px
 
 fromIndex :: Int -> Int -> (Int, Int)
 fromIndex w idx = (idx `mod` w, idx `div` w)
-
-lookupSample :: IM.IntMap PixelSample -> Int -> PixelSample
-lookupSample samples idx =
-  case IM.lookup idx samples of
-    Just sample -> sample
-    Nothing ->
-      PixelSample
-        { px =
-            Pixel
-              { r = 0.0,
-                g = 0.0,
-                b = 0.0,
-                a = 0.0
-              },
-          match = 1
-        }
 
 flipRgb :: Pixel -> Pixel
 flipRgb px =
@@ -494,7 +593,14 @@ data DistanceAwareEval = DistanceAwareEval
 applyModernErrorCorrection :: Int -> Int -> Frame -> Double -> [[Edge]] -> [Pixel] -> [Pixel]
 applyModernErrorCorrection w h frame pxRange edgeContours pixels =
   let count = w * h
-      pixelMap = IM.fromDistinctAscList (zip [0 .. count - 1] pixels)
+      pixelArr =
+        if count <= 0
+          then listArray (0, 0) [zeroPixel]
+          else listArray (0, count - 1) pixels
+      pixelAt idx =
+        if idx >= 0 && idx < count
+          then pixelArr ! idx
+          else zeroPixel
       selectorContours = fmap contourSelectorInput edgeContours
       safePxRange = max 1.0e-9 pxRange
       hvDelta = 1.0 / safePxRange
@@ -507,20 +613,21 @@ applyModernErrorCorrection w h frame pxRange edgeContours pixels =
       dRadius = protectionRadiusTolerance * dDelta
       stencil0 = IM.empty
       stencil1 = protectCornersModern w h frame edgeContours stencil0
-      stencil2 = protectEdgesModern w h hRadius vRadius dRadius pixelMap stencil1
-      stencil3 = findErrorsModern w h hSpan vSpan dSpan pixelMap stencil2
+      stencil2 = protectEdgesModern w h hRadius vRadius dRadius pixelAt stencil1
+      stencil3 = findErrorsModern w h hSpan vSpan dSpan pixelAt stencil2
       stencil4 =
         if useDistanceAwareSecondPass
           then
             let stencilProtected = protectAllTexels w h stencil3
+                pixelMap = IM.fromDistinctAscList (zip [0 .. count - 1] pixels)
              in findErrorsModernDistanceAware w h frame safePxRange selectorContours hSpan vSpan dSpan pixelMap stencilProtected
           else stencil3
       useDistanceAwareSecondPass = False
-   in fmap (applyStencilCorrection stencil4 pixelMap) [0 .. count - 1]
+   in fmap (applyStencilCorrection stencil4 pixelAt) [0 .. count - 1]
 
-applyStencilCorrection :: IM.IntMap Int -> IM.IntMap Pixel -> Int -> Pixel
-applyStencilCorrection stencil pixels idx =
-  let px = lookupPixel pixels idx
+applyStencilCorrection :: IM.IntMap Int -> PixelLookup -> Int -> Pixel
+applyStencilCorrection stencil pixelAt idx =
+  let px = pixelAt idx
    in if hasStencilFlag stencilErrorFlag (lookupStencilValue stencil idx)
         then equalizePixel px
         else px
@@ -587,10 +694,10 @@ protectEdgesModern ::
   Double ->
   Double ->
   Double ->
-  IM.IntMap Pixel ->
+  PixelLookup ->
   IM.IntMap Int ->
   IM.IntMap Int
-protectEdgesModern w h hRadius vRadius dRadius pixels stencil0 =
+protectEdgesModern w h hRadius vRadius dRadius pixelAt stencil0 =
   let stencilH =
         foldl'
           protectHorizontal
@@ -616,8 +723,8 @@ protectEdgesModern w h hRadius vRadius dRadius pixels stencil0 =
         ]
   where
     protectHorizontal stencil (x, y) =
-      let left = lookupPixel pixels (toIndex w x y)
-          right = lookupPixel pixels (toIndex w (x + 1) y)
+      let left = pixelAt (toIndex w x y)
+          right = pixelAt (toIndex w (x + 1) y)
           lm = corrMedian3 left.r left.g left.b
           rm = corrMedian3 right.r right.g right.b
        in if abs (lm - 0.5) + abs (rm - 0.5) < hRadius
@@ -628,8 +735,8 @@ protectEdgesModern w h hRadius vRadius dRadius pixels stencil0 =
             else stencil
 
     protectVertical stencil (x, y) =
-      let bottom = lookupPixel pixels (toIndex w x y)
-          top = lookupPixel pixels (toIndex w x (y + 1))
+      let bottom = pixelAt (toIndex w x y)
+          top = pixelAt (toIndex w x (y + 1))
           bm = corrMedian3 bottom.r bottom.g bottom.b
           tm = corrMedian3 top.r top.g top.b
        in if abs (bm - 0.5) + abs (tm - 0.5) < vRadius
@@ -640,10 +747,10 @@ protectEdgesModern w h hRadius vRadius dRadius pixels stencil0 =
             else stencil
 
     protectDiagonal stencil (x, y) =
-      let lb = lookupPixel pixels (toIndex w x y)
-          rb = lookupPixel pixels (toIndex w (x + 1) y)
-          lt = lookupPixel pixels (toIndex w x (y + 1))
-          rt = lookupPixel pixels (toIndex w (x + 1) (y + 1))
+      let lb = pixelAt (toIndex w x y)
+          rb = pixelAt (toIndex w (x + 1) y)
+          lt = pixelAt (toIndex w x (y + 1))
+          rt = pixelAt (toIndex w (x + 1) (y + 1))
           mlb = corrMedian3 lb.r lb.g lb.b
           mrb = corrMedian3 rb.r rb.g rb.b
           mlt = corrMedian3 lt.r lt.g lt.b
@@ -724,35 +831,38 @@ findErrorsModern ::
   Double ->
   Double ->
   Double ->
-  IM.IntMap Pixel ->
+  PixelLookup ->
   IM.IntMap Int ->
   IM.IntMap Int
-findErrorsModern w h hSpan vSpan dSpan pixels stencil0 =
+findErrorsModern w h hSpan vSpan dSpan pixelAt stencil0 =
   foldl' markErrorAt stencil0 [0 .. count - 1]
   where
     count = w * h
 
     markErrorAt stencil idx =
       let (x, y) = fromIndex w idx
-          center = lookupPixel pixels idx
+          center = pixelAt idx
           centerMedian = corrMedian3 center.r center.g center.b
           protected = hasStencilFlag stencilProtectedFlag (lookupStencilValue stencil idx)
-          left = lookupPixel pixels (toIndex w (x - 1) y)
-          right = lookupPixel pixels (toIndex w (x + 1) y)
-          up = lookupPixel pixels (toIndex w x (y - 1))
-          down = lookupPixel pixels (toIndex w x (y + 1))
-          leftUp = lookupPixel pixels (toIndex w (x - 1) (y - 1))
-          rightUp = lookupPixel pixels (toIndex w (x + 1) (y - 1))
-          leftDown = lookupPixel pixels (toIndex w (x - 1) (y + 1))
-          rightDown = lookupPixel pixels (toIndex w (x + 1) (y + 1))
-          eLeft = x > 0 && hasLinearArtifact (BaseArtifactClassifier hSpan protected) centerMedian center left
-          eUp = y > 0 && hasLinearArtifact (BaseArtifactClassifier vSpan protected) centerMedian center up
-          eRight = x < w - 1 && hasLinearArtifact (BaseArtifactClassifier hSpan protected) centerMedian center right
-          eDown = y < h - 1 && hasLinearArtifact (BaseArtifactClassifier vSpan protected) centerMedian center down
-          eLeftUp = x > 0 && y > 0 && hasDiagonalArtifact (BaseArtifactClassifier dSpan protected) centerMedian center left up leftUp
-          eRightUp = x < w - 1 && y > 0 && hasDiagonalArtifact (BaseArtifactClassifier dSpan protected) centerMedian center right up rightUp
-          eLeftDown = x > 0 && y < h - 1 && hasDiagonalArtifact (BaseArtifactClassifier dSpan protected) centerMedian center left down leftDown
-          eRightDown = x < w - 1 && y < h - 1 && hasDiagonalArtifact (BaseArtifactClassifier dSpan protected) centerMedian center right down rightDown
+          hClassifier = BaseArtifactClassifier hSpan protected
+          vClassifier = BaseArtifactClassifier vSpan protected
+          dClassifier = BaseArtifactClassifier dSpan protected
+          left = pixelAt (toIndex w (x - 1) y)
+          right = pixelAt (toIndex w (x + 1) y)
+          up = pixelAt (toIndex w x (y - 1))
+          down = pixelAt (toIndex w x (y + 1))
+          leftUp = pixelAt (toIndex w (x - 1) (y - 1))
+          rightUp = pixelAt (toIndex w (x + 1) (y - 1))
+          leftDown = pixelAt (toIndex w (x - 1) (y + 1))
+          rightDown = pixelAt (toIndex w (x + 1) (y + 1))
+          eLeft = x > 0 && hasLinearArtifact hClassifier centerMedian center left
+          eUp = y > 0 && hasLinearArtifact vClassifier centerMedian center up
+          eRight = x < w - 1 && hasLinearArtifact hClassifier centerMedian center right
+          eDown = y < h - 1 && hasLinearArtifact vClassifier centerMedian center down
+          eLeftUp = x > 0 && y > 0 && hasDiagonalArtifact dClassifier centerMedian center left up leftUp
+          eRightUp = x < w - 1 && y > 0 && hasDiagonalArtifact dClassifier centerMedian center right up rightUp
+          eLeftDown = x > 0 && y < h - 1 && hasDiagonalArtifact dClassifier centerMedian center left down leftDown
+          eRightDown = x < w - 1 && y < h - 1 && hasDiagonalArtifact dClassifier centerMedian center right down rightDown
           hasError = eLeft || eUp || eRight || eDown || eLeftUp || eRightUp || eLeftDown || eRightDown
        in if hasError
             then setStencilFlag stencilErrorFlag idx stencil
@@ -782,6 +892,9 @@ findErrorsModernDistanceAware w h frame safePxRange selectorContours hSpan vSpan
               center = lookupPixel pixels idx
               centerMedian = corrMedian3 center.r center.g center.b
               protected = hasStencilFlag stencilProtectedFlag (lookupStencilValue stencil idx)
+              hClassifier = BaseArtifactClassifier hSpan protected
+              vClassifier = BaseArtifactClassifier vSpan protected
+              dClassifier = BaseArtifactClassifier dSpan protected
               eval =
                 DistanceAwareEval
                   { evalW = w,
@@ -794,20 +907,24 @@ findErrorsModernDistanceAware w h frame safePxRange selectorContours hSpan vSpan
                     evalY = y,
                     evalCenter = center,
                     evalCenterMedian = centerMedian
-                  }
+              }
               left = lookupPixel pixels (toIndex w (x - 1) y)
               right = lookupPixel pixels (toIndex w (x + 1) y)
               up = lookupPixel pixels (toIndex w x (y - 1))
               down = lookupPixel pixels (toIndex w x (y + 1))
+              leftUp = lookupPixel pixels (toIndex w (x - 1) (y - 1))
+              rightUp = lookupPixel pixels (toIndex w (x + 1) (y - 1))
+              leftDown = lookupPixel pixels (toIndex w (x - 1) (y + 1))
+              rightDown = lookupPixel pixels (toIndex w (x + 1) (y + 1))
               hasError =
-                (x > 0 && hasLinearArtifactDistanceAware (BaseArtifactClassifier hSpan protected) eval left (-1.0) 0.0)
-                  || (y > 0 && hasLinearArtifactDistanceAware (BaseArtifactClassifier vSpan protected) eval up 0.0 (-1.0))
-                  || (x < w - 1 && hasLinearArtifactDistanceAware (BaseArtifactClassifier hSpan protected) eval right 1.0 0.0)
-                  || (y < h - 1 && hasLinearArtifactDistanceAware (BaseArtifactClassifier vSpan protected) eval down 0.0 1.0)
-                  || (x > 0 && y > 0 && hasDiagonalArtifactDistanceAware (BaseArtifactClassifier dSpan protected) eval left up (lookupPixel pixels (toIndex w (x - 1) (y - 1))) (-1.0) (-1.0))
-                  || (x < w - 1 && y > 0 && hasDiagonalArtifactDistanceAware (BaseArtifactClassifier dSpan protected) eval right up (lookupPixel pixels (toIndex w (x + 1) (y - 1))) 1.0 (-1.0))
-                  || (x > 0 && y < h - 1 && hasDiagonalArtifactDistanceAware (BaseArtifactClassifier dSpan protected) eval left down (lookupPixel pixels (toIndex w (x - 1) (y + 1))) (-1.0) 1.0)
-                  || (x < w - 1 && y < h - 1 && hasDiagonalArtifactDistanceAware (BaseArtifactClassifier dSpan protected) eval right down (lookupPixel pixels (toIndex w (x + 1) (y + 1))) 1.0 1.0)
+                (x > 0 && hasLinearArtifactDistanceAware hClassifier eval left (-1.0) 0.0)
+                  || (y > 0 && hasLinearArtifactDistanceAware vClassifier eval up 0.0 (-1.0))
+                  || (x < w - 1 && hasLinearArtifactDistanceAware hClassifier eval right 1.0 0.0)
+                  || (y < h - 1 && hasLinearArtifactDistanceAware vClassifier eval down 0.0 1.0)
+                  || (x > 0 && y > 0 && hasDiagonalArtifactDistanceAware dClassifier eval left up leftUp (-1.0) (-1.0))
+                  || (x < w - 1 && y > 0 && hasDiagonalArtifactDistanceAware dClassifier eval right up rightUp 1.0 (-1.0))
+                  || (x > 0 && y < h - 1 && hasDiagonalArtifactDistanceAware dClassifier eval left down leftDown (-1.0) 1.0)
+                  || (x < w - 1 && y < h - 1 && hasDiagonalArtifactDistanceAware dClassifier eval right down rightDown 1.0 1.0)
            in if hasError
                 then setStencilFlag stencilErrorFlag idx stencil
                 else stencil
@@ -1190,13 +1307,7 @@ lookupPixel :: IM.IntMap Pixel -> Int -> Pixel
 lookupPixel pixels idx =
   case IM.lookup idx pixels of
     Just px -> px
-    Nothing ->
-      Pixel
-        { r = 0.0,
-          g = 0.0,
-          b = 0.0,
-          a = 0.0
-        }
+    Nothing -> zeroPixel
 
 equalizePixel :: Pixel -> Pixel
 equalizePixel px =
@@ -1590,21 +1701,36 @@ distanceForContour point contourInput =
           winding = contourInput.winding
         }
   where
-    step selectors (prevEdge, curEdge, nextEdge) =
-      selectors
-        { rSel =
-            if hasChannel ChR curEdge
-              then selectorAddEdge point prevEdge curEdge nextEdge selectors.rSel
-              else selectors.rSel,
-          gSel =
-            if hasChannel ChG curEdge
-              then selectorAddEdge point prevEdge curEdge nextEdge selectors.gSel
-              else selectors.gSel,
-          bSel =
-            if hasChannel ChB curEdge
-              then selectorAddEdge point prevEdge curEdge nextEdge selectors.bSel
-              else selectors.bSel
-        }
+    step selectors triple =
+      if not (triple.hasR || triple.hasG || triple.hasB)
+        then selectors
+        else
+          let curEdge = triple.curEdge
+              (edgeDistance, edgeParam) = signedDistance point curEdge
+              ap = diffPt point curEdge.a
+              bp = diffPt point curEdge.b
+              add = dotVec ap triple.aBlend
+              bdd = negate (dotVec bp triple.bBlend)
+              negPd =
+                if add > 0.0
+                  then fmap negate (getPerpendicularDistance edgeDistance.distance ap triple.negADir)
+                  else Nothing
+              posPd =
+                if bdd > 0.0
+                  then getPerpendicularDistance edgeDistance.distance bp triple.bDir
+                  else Nothing
+              addEdge =
+                selectorAddEdgePrepared
+                  curEdge
+                  edgeDistance
+                  edgeParam
+                  negPd
+                  posPd
+           in selectors
+                { rSel = if triple.hasR then addEdge selectors.rSel else selectors.rSel,
+                  gSel = if triple.hasG then addEdge selectors.gSel else selectors.gSel,
+                  bSel = if triple.hasB then addEdge selectors.bSel else selectors.bSel
+                }
 
 distanceFromSet :: Pt -> SelectorSet -> DistanceValue
 distanceFromSet point selectors =
@@ -1656,17 +1782,6 @@ rotateRight values =
     [] -> []
     v : rest -> v : reverse rest
 
-hasChannel :: Channel -> Edge -> Bool
-hasChannel channel edge =
-  edge.col .&. channelBit channel /= 0
-
-channelBit :: Channel -> Word8
-channelBit channel =
-  case channel of
-    ChR -> 1
-    ChG -> 2
-    ChB -> 4
-
 lessSignedDist :: SignedDist -> SignedDist -> Bool
 lessSignedDist a b =
   let absA = abs a.distance
@@ -1674,35 +1789,21 @@ lessSignedDist a b =
    in absA < absB
         || (absA == absB && a.dot < b.dot)
 
-selectorAddEdge :: Pt -> Edge -> Edge -> Edge -> Selector -> Selector
-selectorAddEdge point prevEdge curEdge nextEdge selector =
-  let (edgeDistance, edgeParam) = signedDistance point curEdge
-      selectorTrue =
+selectorAddEdgePrepared ::
+  Edge ->
+  SignedDist ->
+  Double ->
+  Maybe Double ->
+  Maybe Double ->
+  Selector ->
+  Selector
+selectorAddEdgePrepared curEdge edgeDistance edgeParam negPd posPd selector =
+  let selectorTrue =
         if lessSignedDist edgeDistance selector.minTrue
           then selector {minTrue = edgeDistance, nearEdge = Just curEdge, nearParam = edgeParam}
           else selector
-      ap = diffPt point curEdge.a
-      bp = diffPt point curEdge.b
-      aDir = normalizeAllowZero (edgeStartTangent curEdge)
-      bDir = normalizeAllowZero (edgeEndTangent curEdge)
-      prevDir = normalizeAllowZero (edgeEndTangent prevEdge)
-      nextDir = normalizeAllowZero (edgeStartTangent nextEdge)
-      add = dotVec ap (addPt prevDir aDir)
-      bdd = negate (dotVec bp (addPt bDir nextDir))
-      selectorA =
-        if add > 0.0
-          then
-            case getPerpendicularDistance edgeDistance.distance ap (negPt aDir) of
-              Just pd -> addPerpendicularDistance selectorTrue (negate pd)
-              Nothing -> selectorTrue
-          else selectorTrue
-      selectorB =
-        if bdd > 0.0
-          then
-            case getPerpendicularDistance edgeDistance.distance bp bDir of
-              Just pd -> addPerpendicularDistance selectorA pd
-              Nothing -> selectorA
-          else selectorA
+      selectorA = maybe selectorTrue (addPerpendicularDistance selectorTrue) negPd
+      selectorB = maybe selectorA (addPerpendicularDistance selectorA) posPd
    in selectorB
 
 addPerpendicularDistance :: Selector -> Double -> Selector

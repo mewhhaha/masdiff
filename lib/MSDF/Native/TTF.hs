@@ -6,6 +6,7 @@
 module MSDF.Native.TTF
   ( VariationAxes (..),
     loadOutlineIO,
+    loadOutlinesIO,
   )
 where
 
@@ -153,9 +154,24 @@ loadOutlineIO fontPath axes glyph = do
   raw <- BS.readFile fontPath
   pure (decodeOutline raw axes glyph)
 
+loadOutlinesIO :: FilePath -> VariationAxes -> [GlyphCode] -> IO [Either String Outline]
+loadOutlinesIO fontPath axes glyphs = do
+  raw <- BS.readFile fontPath
+  pure (decodeOutlines raw axes glyphs)
+
 decodeOutline :: BS.ByteString -> VariationAxes -> GlyphCode -> Either String Outline
 decodeOutline raw axes glyph = do
   font <- parseFont raw axes
+  decodeOutlineFromFont font glyph
+
+decodeOutlines :: BS.ByteString -> VariationAxes -> [GlyphCode] -> [Either String Outline]
+decodeOutlines raw axes glyphs =
+  case parseFont raw axes of
+    Left err -> fmap (const (Left err)) glyphs
+    Right font -> fmap (decodeOutlineFromFont font) glyphs
+
+decodeOutlineFromFont :: Font -> GlyphCode -> Either String Outline
+decodeOutlineFromFont font glyph = do
   gid <- glyphIndex font.cmap (unGlyphCode glyph)
   advBase <- glyphAdvance font gid
   adv <- applyAdvanceVariation font gid advBase
