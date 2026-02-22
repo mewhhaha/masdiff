@@ -88,6 +88,7 @@ Options:
 Notes:
 
 - This command exercises both backends internally and expects `msdfgen` to be available on `PATH` for process runs.
+- Oracle parity is intentionally limited to static fonts and the baseline variable setting (`wght=400`, `opsz=14`) because some `msdfgen` builds ignore variable-axis changes.
 
 ## `masdiff-text-render`
 

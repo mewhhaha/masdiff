@@ -240,6 +240,22 @@ cabal run masdiff-validate -- --manifest out/reference/inter-mtsdf/manifest.tsv 
 cabal run masdiff-parity -- --verbose
 ```
 
+## SDL3 Spirdo text example
+
+For SDL3 users, see the bundled example at `examples/sdl3-spirdo-text`:
+- It demonstrates **manual SDL3 bindings** with no `slop` dependency.
+- It generates/shades text with `masdiff` and renders it in an SDL3 window.
+- It compiles WGSL with **Spirdo** as a shader validation step.
+
+Run the example:
+
+```bash
+cd examples/sdl3-spirdo-text
+cabal run sdl3-spirdo-text
+```
+
+See [`examples/sdl3-spirdo-text/README.md`](examples/sdl3-spirdo-text/README.md) for exact launch steps.
+
 ### Render preview line
 
 ```bash
@@ -332,6 +348,7 @@ Notes:
 - `masdiff-parity` requires an external `msdfgen` on `PATH` (or configured via `MSDFGEN_BIN`).
 - oracle comparison is a development gate only.
 - production/runtime usage should use `native` generation and the WGSL shader path above.
+- some `msdfgen` builds do not apply variable-font axes in `-varfont` mode; when that is detected, strict SDL process-oracle checks are automatically downgraded to smoke checks.
 
 ## Docs
 

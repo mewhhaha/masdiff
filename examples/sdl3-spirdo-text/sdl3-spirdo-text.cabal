@@ -1,0 +1,29 @@
+cabal-version:      3.14
+name:               sdl3-spirdo-text
+version:            0.1.0.0
+license:            MIT
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+common ghc
+    default-language: GHC2024
+
+executable sdl3-spirdo-text
+    import:            warnings, ghc
+    hs-source-dirs:     app
+    main-is:           Main.hs
+    pkgconfig-depends: sdl3
+    build-tool-depends:
+        hsc2hs:hsc2hs
+    build-depends:
+        base ^>=4.21.0.0,
+        array,
+        bytestring,
+        containers,
+        directory,
+        filepath,
+        masdiff,
+        spirdo,
+        text

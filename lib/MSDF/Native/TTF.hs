@@ -1462,20 +1462,19 @@ readPackedDeltasE bytes pos count = go pos count []
       | remaining <= 0 = Right (acc, pos')
       | otherwise = do
           header <- fromIntegral <$> u8 bytes pos'
-          let sizeMask = header .&. 0xC0
+          let szMask = header .&. 0xC0
           let runCount = (header .&. 0x3F) + 1
           let k = min remaining runCount
-          case sizeMask of
-            0x80 ->
-              go (pos' + 1) (remaining - k) (acc <> replicate k 0)
+          case szMask of
+            0x80 -> go (pos' + 1) (remaining - k) (acc <> replicate k 0)
             0x40 -> do
               (vals, pos1) <- readSignedRun bytes (pos' + 1) k 2
               go pos1 (remaining - k) (acc <> vals)
-            0x00 -> do
-              (vals, pos1) <- readSignedRun bytes (pos' + 1) k 1
+            0xC0 -> do
+              (vals, pos1) <- readSignedRun bytes (pos' + 1) k 4
               go pos1 (remaining - k) (acc <> vals)
             _ -> do
-              (vals, pos1) <- readSignedRun bytes (pos' + 1) k 4
+              (vals, pos1) <- readSignedRun bytes (pos' + 1) k 1
               go pos1 (remaining - k) (acc <> vals)
 
 readSignedRun :: BS.ByteString -> Int -> Int -> Int -> Either String ([Int], Int)

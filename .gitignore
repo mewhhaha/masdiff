@@ -1,5 +1,6 @@
 # Build artifacts
 /dist-newstyle/
+examples/**/dist-newstyle/
 /.stack-work/
 *.hi
 *.hie
@@ -12,9 +13,12 @@
 
 # Cabal user-local state
 /.cabal/
+examples/**/.cabal/
 /.cabal-logs/
 /cabal.project.local
 /cabal.project.local~
+examples/**/cabal.project.local
+examples/**/cabal.project.local~
 
 # Tooling
 /.ghc.environment.*
@@ -24,6 +28,7 @@
 # Generated outputs
 /out/
 /tmp/
+examples/**/out/
 
 # Editor/system
 *~

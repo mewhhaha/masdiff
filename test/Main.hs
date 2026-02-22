@@ -3,7 +3,7 @@
 module Main (main) where
 
 import Control.Exception (bracket)
-import Control.Monad (forM)
+import Control.Monad (forM, when)
 import Data.Char (ord, toLower)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -35,6 +35,7 @@ import MSDF.TextRender
     mkShaderCfg,
     resampleBilinear,
     shadeMtsdfImg,
+    shadeMtsdfImgTo,
     solidImg
   )
 import MSDF.Types
@@ -76,6 +77,19 @@ import Test.QuickCheck.Test (isSuccess)
 
 main :: IO ()
 main = do
+  processVarAxisSupportResult <- probeProcessVarAxisSupport
+  (processVarAxisProbeOk, processVarAxisSupported) <-
+    case processVarAxisSupportResult of
+      Left err -> do
+        ok <- check ("process variable-axis capability probe failed: " <> err) False
+        pure (ok, False)
+      Right supported -> do
+        putStrLn
+          ( if supported
+              then "INFO: process backend variable-axis support detected."
+              else "INFO: process backend variable-axis support not detected; strict SDL process-oracle checks will run in smoke mode."
+          )
+        pure (True, supported)
   staticCountOk <- check "at least 8 static font cases" (countKind Static >= 8)
   variableCountOk <- check "at least 8 variable font cases" (countKind Variable >= 8)
   uniqueFontIdsOk <- check "font case IDs are unique" (unique (fmap fontCaseId interHarnessFontCases))
@@ -89,6 +103,8 @@ main = do
   variableAxisNativeOk <- runVariableAxisNativeRegression
   backendParityOk <- runBackendParitySmoke
   thinItalicStrictParityOk <- runThinItalicStrictParityRegression
+  sdlDemoVarBoldStrictParityOk <- runSdlDemoVarBoldStrictParity processVarAxisSupported
+  sdlDemoRenderParityOk <- runSdlDemoRenderParity processVarAxisSupported
   compareBehaviorOk <- runCompareBehaviorChecks
   textRenderOk <- runTextRenderChecks
   decodeChecksOk <- runDecodeChecks
@@ -108,6 +124,9 @@ main = do
             variableAxisNativeOk,
             backendParityOk,
             thinItalicStrictParityOk,
+            processVarAxisProbeOk,
+            sdlDemoVarBoldStrictParityOk,
+            sdlDemoRenderParityOk,
             compareBehaviorOk,
             textRenderOk,
             decodeChecksOk,
@@ -221,6 +240,73 @@ parityCases =
     )
   ]
 
+mkDemoCfg :: Either String GenCfg
+mkDemoCfg = do
+  dim <- mkDim 128
+  pxr <- mkPxRange 8.0
+  pure
+    GenCfg
+      { mode = Mtsdf,
+        dim = dim,
+        pxr = pxr,
+        seed = 1,
+        autoframe = True,
+        ovlp = False
+      }
+
+demoRegularSrc :: FontSrc
+demoRegularSrc = FontFile {path = "assets/Inter/static/Inter_24pt-Regular.ttf"}
+
+demoVarLightSrc :: FontSrc
+demoVarLightSrc =
+  VarFontFile
+    { path = "assets/Inter/Inter-VariableFont_opsz,wght.ttf",
+      axes =
+        Map.fromList
+          [ (AxisTag (T.pack "wght"), AxisVal 300),
+            (AxisTag (T.pack "opsz"), AxisVal 14)
+          ]
+    }
+
+demoVarBoldSrc :: FontSrc
+demoVarBoldSrc =
+  VarFontFile
+    { path = "assets/Inter/Inter-VariableFont_opsz,wght.ttf",
+      axes =
+        Map.fromList
+          [ (AxisTag (T.pack "wght"), AxisVal 900),
+            (AxisTag (T.pack "opsz"), AxisVal 32)
+          ]
+    }
+
+demoLineSpecs :: [(String, FontSrc, String)]
+demoLineSpecs =
+  [ ("demo-line-regular-1", demoRegularSrc, "MASDIFF SDL3"),
+    ("demo-line-regular-2", demoRegularSrc, "AaRMYgq 0123 ?!"),
+    ("demo-line-var-light", demoVarLightSrc, "VAR 300/14: AaRMY"),
+    ("demo-line-var-bold", demoVarBoldSrc, "VAR 900/32: AaRMY")
+  ]
+
+probeProcessVarAxisSupport :: IO (Either String Bool)
+probeProcessVarAxisSupport =
+  case (mkParityCfg, mkGlyphCode (ord 'V')) of
+    (Left err, _) ->
+      pure (Left ("probe config failed: " <> err))
+    (_, Left err) ->
+      pure (Left ("probe glyph setup failed: " <> err))
+    (Right cfg, Right glyph) -> do
+      let processRuntime = RuntimeCfg {backend = BackendProcess, msdfgenBin = defaultRuntimeCfg.msdfgenBin}
+      lightResult <- generateGlyphIO processRuntime cfg demoVarLightSrc glyph
+      boldResult <- generateGlyphIO processRuntime cfg demoVarBoldSrc glyph
+      pure $
+        case (lightResult, boldResult) of
+          (Left err, _) ->
+            Left ("probe light generation failed: " <> show err)
+          (_, Left err) ->
+            Left ("probe bold generation failed: " <> show err)
+          (Right lightOut, Right boldOut) ->
+            Right (lightOut /= boldOut)
+
 runParityCase :: Bool -> RuntimeCfg -> RuntimeCfg -> GenCfg -> (String, FontSrc, Int) -> IO Bool
 runParityCase strictEnabled nativeRuntime processRuntime cfg (label, src, codepoint) =
   case mkGlyphCode codepoint of
@@ -263,6 +349,179 @@ runParityCase strictEnabled nativeRuntime processRuntime cfg (label, src, codepo
                     else
                       pure ()
                   check (label <> parityLabel strictEnabled) ok
+
+runSdlDemoVarBoldStrictParity :: Bool -> IO Bool
+runSdlDemoVarBoldStrictParity processVarAxisSupported = do
+  strictRaw <- lookupEnv "MASDIFF_STRICT_SDL_DEMO_PARITY"
+  let strictRequested = parseBool strictRaw
+  let strictEnabled = strictRequested && processVarAxisSupported
+  when (strictRequested && not processVarAxisSupported) $
+    putStrLn "INFO: SDL demo var-bold strict parity downgraded to smoke (process backend does not vary by axis in this environment)."
+  case mkDemoCfg of
+    Left err ->
+      check ("SDL demo strict parity config failed: " <> err) False
+    Right cfg -> do
+      let nativeRuntime = defaultRuntimeCfg {backend = BackendNative}
+      let processRuntime = RuntimeCfg {backend = BackendProcess, msdfgenBin = defaultRuntimeCfg.msdfgenBin}
+      let chars = nub (filter (/= ' ') "VAR 900/32: AaRMY")
+      checks <-
+        traverse
+          ( \ch ->
+              runParityCase
+                strictEnabled
+                nativeRuntime
+                processRuntime
+                cfg
+                ("parity-sdl-varbold-" <> show (ord ch), demoVarBoldSrc, ord ch)
+          )
+          chars
+      pure (and checks)
+
+runSdlDemoRenderParity :: Bool -> IO Bool
+runSdlDemoRenderParity processVarAxisSupported = do
+  strictRaw <- lookupEnv "MASDIFF_STRICT_SDL_DEMO_PARITY"
+  let strictRequested = parseBool strictRaw
+  let strictEnabled = strictRequested && processVarAxisSupported
+  when (strictRequested && not processVarAxisSupported) $
+    putStrLn "INFO: SDL demo render strict parity downgraded to smoke (process backend does not vary by axis in this environment)."
+  case (mkDemoCfg, mkShaderCfg (AutoPxRange 8.0) True 0.0) of
+    (Left err, _) ->
+      check ("SDL demo render parity config failed: " <> err) False
+    (_, Left err) ->
+      check ("SDL demo render parity shader config failed: " <> err) False
+    (Right cfg, Right shader) -> do
+      let nativeRuntime = defaultRuntimeCfg {backend = BackendNative}
+      let processRuntime = RuntimeCfg {backend = BackendProcess, msdfgenBin = defaultRuntimeCfg.msdfgenBin}
+      nativeImgResult <- renderDemoPreview nativeRuntime cfg shader
+      processImgResult <- renderDemoPreview processRuntime cfg shader
+      case (nativeImgResult, processImgResult) of
+        (Left err, _) ->
+          check ("SDL demo native render parity failed: " <> err) False
+        (_, Left err) ->
+          check ("SDL demo process render parity failed: " <> err) False
+        (Right nativeImg, Right processImg) ->
+          case diffRGBA8 nativeImg processImg of
+            Left err ->
+              check ("SDL demo render parity diff failed: " <> err) False
+            Right stats -> do
+              let strictOk = passesGate strictGate stats && stats.maxAbs <= 1
+              let smokeOk = stats.pxCount > 0 && stats.chCount > 0
+              if strictEnabled && not strictOk
+                then
+                  putStrLn
+                    ( "FAIL details: sdl-demo-render-parity"
+                        <> " maxAbs="
+                        <> show stats.maxAbs
+                        <> " p99="
+                        <> show stats.p99Abs
+                        <> " mean="
+                        <> show stats.meanAbs
+                        <> " mismatch="
+                        <> show stats.mismatch
+                    )
+                else pure ()
+              check
+                (if strictEnabled then "SDL demo render parity strict gate" else "SDL demo render parity smoke")
+                (if strictEnabled then strictOk else smokeOk)
+
+renderDemoPreview :: RuntimeCfg -> GenCfg -> ShaderCfg -> IO (Either String ImgRGBA8)
+renderDemoPreview runtime cfg shader = do
+  lineResults <- traverse (renderDemoLine runtime cfg shader) demoLineSpecs
+  pure $ do
+    lines0 <- sequence lineResults
+    padded <- padImagesToWidth lines0
+    vcatWithGap 10 padded
+
+renderDemoLine :: RuntimeCfg -> GenCfg -> ShaderCfg -> (String, FontSrc, String) -> IO (Either String ImgRGBA8)
+renderDemoLine runtime cfg shader (_label, src, txt) = do
+  let chars = nub [ch | ch <- txt, ch /= ' ']
+  glyphPairsResult <-
+    pure $
+      traverse
+        ( \ch -> do
+            glyph <- mkGlyphCode (ord ch)
+            Right (ch, glyph)
+        )
+        chars
+  case glyphPairsResult of
+    Left err ->
+      pure (Left ("SDL demo line glyph setup failed: " <> err))
+    Right glyphPairs -> do
+      let glyphCodes = fmap snd glyphPairs
+      generated <- generateGlyphBatchIO runtime 1 cfg src glyphCodes
+      case sequence generated of
+        Left genErr ->
+          pure (Left ("SDL demo line generation failed: " <> show genErr))
+        Right outs -> do
+          let glyphMap = Map.fromList (zip (fmap fst glyphPairs) outs)
+          let cell = 96
+          let spaceW = 40
+          let spaceImgResult = solidImg spaceW cell (255, 255, 255, 255)
+          case spaceImgResult of
+            Left err ->
+              pure (Left ("SDL demo line space image failed: " <> err))
+            Right spaceImg -> do
+              atomResults <- traverse (renderAtom glyphMap spaceImg shader cell) txt
+              pure $ do
+                atomImgs <- sequence atomResults
+                hcatWithGap 6 atomImgs
+
+renderAtom ::
+  Map.Map Char GenOut ->
+  ImgRGBA8 ->
+  ShaderCfg ->
+  Int ->
+  Char ->
+  IO (Either String ImgRGBA8)
+renderAtom glyphMap spaceImg shader cell ch
+  | ch == ' ' = pure (Right spaceImg)
+  | otherwise =
+      case Map.lookup ch glyphMap of
+        Nothing ->
+          pure (Left ("SDL demo line missing generated glyph for char: " <> show ch))
+        Just out ->
+          pure (shadeMtsdfImgTo shader cell cell out.img)
+
+vcatWithGap :: Int -> [ImgRGBA8] -> Either String ImgRGBA8
+vcatWithGap gap imgs
+  | gap < 0 = Left "vertical gap must be >= 0."
+  | otherwise =
+      case imgs of
+        [] -> Left "Need at least one image to compose vertically."
+        firstImg : _ ->
+          let w0 = firstImg.w
+           in if any (\img -> img.w /= w0) imgs
+                then Left "All images must have the same width."
+                else do
+                  let totalH = sum (fmap (.h) imgs) + gap * (length imgs - 1)
+                  let whiteRow = BS.replicate (w0 * 4) 255
+                  let gapRows = BS.concat (replicate gap whiteRow)
+                  let imgBody img = BS.concat [sliceRow img y | y <- [0 .. img.h - 1]]
+                  let px = BS.intercalate gapRows (fmap imgBody imgs)
+                  mkImgRGBA8 w0 totalH px
+
+padImagesToWidth :: [ImgRGBA8] -> Either String [ImgRGBA8]
+padImagesToWidth imgs =
+  case imgs of
+    [] -> Right []
+    _ ->
+      let targetW = maximum (fmap (.w) imgs)
+       in traverse (padImageRight targetW) imgs
+
+padImageRight :: Int -> ImgRGBA8 -> Either String ImgRGBA8
+padImageRight targetW img
+  | targetW < img.w = Left "target width cannot be smaller than source width."
+  | targetW == img.w = Right img
+  | otherwise = do
+      let padBytes = BS.replicate ((targetW - img.w) * 4) 255
+      let rows = [sliceRow img y <> padBytes | y <- [0 .. img.h - 1]]
+      mkImgRGBA8 targetW img.h (BS.concat rows)
+
+sliceRow :: ImgRGBA8 -> Int -> BS.ByteString
+sliceRow img y =
+  BS.take rowBytes (BS.drop (y * rowBytes) img.px)
+  where
+    rowBytes = img.w * 4
 
 runAtlasChecks :: IO Bool
 runAtlasChecks = do
