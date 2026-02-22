@@ -24,6 +24,7 @@ library
     import:           haskell-defaults
     exposed-modules:
         Font
+        MSDF.Atlas
         MSDF.Compare
         MSDF.Encode
         MSDF.Generate
@@ -110,6 +111,19 @@ executable masdiff-text-render
     build-depends:
         base ^>=4.21.0.0,
         containers,
+        masdiff,
+        text
+
+executable masdiff-atlas
+    import:           warnings
+    import:           haskell-defaults
+    hs-source-dirs:   app
+    main-is:          AtlasMain.hs
+    build-depends:
+        base ^>=4.21.0.0,
+        containers,
+        directory,
+        filepath,
         masdiff,
         text
 

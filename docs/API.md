@@ -135,10 +135,56 @@ renderMetrics :: Metrics -> String
 
 Direct native backend entrypoint.
 
-### Exported function
+### Exported functions
 
 ```haskell
 generateGlyphNativeIO :: GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)
+generateGlyphBatchNativeIO :: Int -> GenCfg -> FontSrc -> [GlyphCode] -> IO [Either GenErr GenOut]
+```
+
+## Module `MSDF.Atlas`
+
+Atlas packing API for turning generated glyph images into atlas pages + metadata.
+
+### Exported types
+
+```haskell
+data AtlasCfg
+
+data AtlasRect = AtlasRect
+  { x :: Int
+  , y :: Int
+  , w :: Int
+  , h :: Int
+  }
+
+data AtlasEntry = AtlasEntry
+  { glyph :: GlyphCode
+  , page :: Int
+  , rect :: AtlasRect
+  , metrics :: Metrics
+  }
+
+data AtlasPage = AtlasPage
+  { idx :: Int
+  , img :: ImgRGBA8
+  }
+
+data Atlas = Atlas
+  { cfg :: AtlasCfg
+  , pages :: [AtlasPage]
+  , entries :: [AtlasEntry]
+  }
+```
+
+### Exported functions
+
+```haskell
+defaultAtlasCfg :: AtlasCfg
+mkAtlasCfg :: Int -> Int -> Int -> Either String AtlasCfg
+packAtlas :: AtlasCfg -> [(GlyphCode, GenOut)] -> Either String Atlas
+generateAtlasIO :: RuntimeCfg -> Int -> AtlasCfg -> GenCfg -> FontSrc -> [GlyphCode] -> IO (Either String Atlas)
+renderAtlasTsv :: Atlas -> String
 ```
 
 ## Module `MSDF.Encode`

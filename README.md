@@ -93,6 +93,28 @@ Notes:
 - In `BackendNative`, batch generation parses OpenType/TrueType tables once per batch (not once per glyph).
 - For multicore throughput, run with `+RTS -N -RTS` and choose `jobs` around `numCapabilities`.
 
+### 1c) Build atlas pages from Haskell
+
+```haskell
+import Data.Char (ord)
+import MSDF.Atlas (defaultAtlasCfg, generateAtlasIO, renderAtlasTsv)
+import MSDF.Encode (writePngRGBA8File)
+import MSDF.Generate (defaultRuntimeCfg)
+import MSDF.Types (mkGlyphCode)
+
+main :: IO ()
+main = do
+  glyphs <- traverse (either fail pure . mkGlyphCode . ord) "MASDIFF ATLAS"
+  atlasResult <- generateAtlasIO defaultRuntimeCfg 8 defaultAtlasCfg cfg src glyphs
+  atlas <- either fail pure atlasResult
+  traverse_ (\page -> writePngRGBA8File ("atlas.page-" <> show page.idx <> ".png") page.img) atlas.pages
+  writeFile "atlas.tsv" (renderAtlasTsv atlas)
+```
+
+Atlas notes:
+- input glyph list may contain duplicates; atlas generation deduplicates by glyph code.
+- output includes page images and TSV metadata (`page`, `x`, `y`, `w`, `h`, metrics).
+
 Texture contract:
 
 - `rgb` = MSDF channels.
@@ -229,6 +251,26 @@ cabal run masdiff-text-render -- \
   --dim 32 \
   --pxrange 6.0
 ```
+
+### Build atlas pages (CLI)
+
+```bash
+cabal run masdiff-atlas -- \
+  --text "PACK MY BOX WITH FIVE DOZEN LIQUOR JUGS" \
+  -font assets/Inter/static/Inter_24pt-Regular.ttf \
+  --out-prefix out/atlas/inter24 \
+  --gen-dim 64 \
+  --pxrange 8.0 \
+  --atlas-w 1024 \
+  --atlas-h 1024 \
+  --padding 1 \
+  --jobs 8 \
+  --verbose
+```
+
+Outputs:
+- `out/atlas/inter24.page-000.png`, `out/atlas/inter24.page-001.png`, ...
+- `out/atlas/inter24.tsv`
 
 ### Single glyph generation (CLI subset)
 

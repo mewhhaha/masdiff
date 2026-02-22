@@ -8,7 +8,7 @@ import Data.Char (ord, toLower)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
-import Data.List (isInfixOf, nub)
+import Data.List (isInfixOf, nub, tails)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Word (Word8)
@@ -23,6 +23,7 @@ import Font
     interHarnessGlyphs,
   )
 import MSDF.Compare (DiffStats (..), diffRGBA8, passesGate, strictGate)
+import MSDF.Atlas (Atlas (..), AtlasEntry (..), AtlasRect (..), generateAtlasIO, mkAtlasCfg, packAtlas, renderAtlasTsv)
 import MSDF.Encode (decodeMsdfgenRgba, encodeMsdfgenRgba)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphBatchIO, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestMeta (..), ManifestRow (..), loadManifest)
@@ -44,6 +45,7 @@ import MSDF.Types
     GenErr (..),
     GenOut (..),
     ImgRGBA8 (..),
+    Metrics (..),
     Mode (..),
     mkDim,
     mkGlyphCode,
@@ -82,6 +84,7 @@ main = do
   variableAxesOk <- checkVariableAxes
   fontFilesOk <- checkFontFiles
   fontBehaviorOk <- runFontBehaviorChecks
+  atlasChecksOk <- runAtlasChecks
   batchGenerateOk <- runBatchGenerateChecks
   variableAxisNativeOk <- runVariableAxisNativeRegression
   backendParityOk <- runBackendParitySmoke
@@ -100,6 +103,7 @@ main = do
             variableAxesOk,
             fontFilesOk,
             fontBehaviorOk,
+            atlasChecksOk,
             batchGenerateOk,
             variableAxisNativeOk,
             backendParityOk,
@@ -259,6 +263,110 @@ runParityCase strictEnabled nativeRuntime processRuntime cfg (label, src, codepo
                     else
                       pure ()
                   check (label <> parityLabel strictEnabled) ok
+
+runAtlasChecks :: IO Bool
+runAtlasChecks = do
+  invalidWOk <- check "mkAtlasCfg rejects width <= 0" (isLeft (mkAtlasCfg 0 128 1))
+  invalidHOk <- check "mkAtlasCfg rejects height <= 0" (isLeft (mkAtlasCfg 128 0 1))
+  invalidPadOk <- check "mkAtlasCfg rejects negative padding" (isLeft (mkAtlasCfg 128 128 (-1)))
+  case (mkAtlasCfg 96 96 1, mkGlyphCode (ord 'A'), mkGlyphCode (ord 'B'), mkGlyphCode (ord 'C')) of
+    (Right atlasCfg, Right glyphA, Right glyphB, Right glyphC) ->
+      case sequence [mkSolidOut 33, mkSolidOut 77, mkSolidOut 121] of
+        Left err ->
+          check ("atlas test setup failed: " <> err) False
+        Right outs -> do
+          let firstOut =
+                case outs of
+                  [] -> Nothing
+                  x : _ -> Just x
+          let packed = packAtlas atlasCfg (zip [glyphA, glyphB, glyphC] outs)
+          packedOk <-
+            case packed of
+              Left err ->
+                check ("packAtlas failed: " <> err) False
+              Right atlas -> do
+                entryCountOk <- check "packAtlas emits one entry per glyph" (length atlas.entries == 3)
+                boundsOk <- check "packAtlas entries stay within page bounds" (all withinPage atlas.entries)
+                overlapOk <- check "packAtlas entries do not overlap on same page" (noOverlap atlas.entries)
+                tsvOk <- check "renderAtlasTsv emits atlas header + columns" ("# atlas_w=" `isInfixOf` renderAtlasTsv atlas && "glyph_hex\tpage\tx\ty\tw\th" `isInfixOf` renderAtlasTsv atlas)
+                pure (entryCountOk && boundsOk && overlapOk && tsvOk)
+          oversizeOk <-
+            case mkAtlasCfg 16 16 0 of
+              Left err ->
+                check ("atlas oversize config failed: " <> err) False
+              Right smallCfg ->
+                case firstOut of
+                  Nothing ->
+                    check "atlas oversize setup failed: missing first test output" False
+                  Just outA ->
+                    check "packAtlas rejects oversized glyphs" (isLeft (packAtlas smallCfg [(glyphA, outA)]))
+          multiPageOk <-
+            case mkAtlasCfg 32 32 1 of
+              Left err ->
+                check ("atlas multipage config failed: " <> err) False
+              Right smallCfg ->
+                case packAtlas smallCfg (zip [glyphA, glyphB, glyphC] outs) of
+                  Left err ->
+                    check ("packAtlas multipage failed: " <> err) False
+                  Right atlas ->
+                    check "packAtlas spills to multiple pages when needed" (length atlas.pages >= 2)
+          runtimeOk <-
+            case mkParityCfg of
+              Left err ->
+                check ("atlas runtime config failed: " <> err) False
+              Right cfg -> do
+                let runtime = defaultRuntimeCfg {backend = BackendNative}
+                let src = FontFile {path = "assets/Inter/static/Inter_18pt-Regular.ttf"}
+                atlasResult <- generateAtlasIO runtime 2 atlasCfg cfg src [glyphA, glyphB, glyphA]
+                case atlasResult of
+                  Left err ->
+                    check ("generateAtlasIO failed: " <> err) False
+                  Right atlas -> do
+                    dedupeOk <- check "generateAtlasIO deduplicates repeated glyph codes" (length atlas.entries == 2)
+                    pageOk <- check "generateAtlasIO produces at least one page" (not (null atlas.pages))
+                    pure (dedupeOk && pageOk)
+          pure (invalidWOk && invalidHOk && invalidPadOk && packedOk && oversizeOk && multiPageOk && runtimeOk)
+    _ ->
+      check "atlas test glyph/config setup failed" False
+  where
+    mkSolidOut value = do
+      img <- mkImgRGBA8 24 24 (BS.replicate (24 * 24 * 4) value)
+      pure
+        GenOut
+          { img = img,
+            metrics =
+              Metrics
+                { adv = 12.0,
+                  bounds = (0.0, 0.0, 1.0, 1.0),
+                  scale = Nothing,
+                  translate = Nothing,
+                  range = Nothing
+                }
+          }
+    withinPage entry =
+      let rect = entry.rect
+       in rect.x >= 0
+            && rect.y >= 0
+            && rect.x + rect.w <= 96
+            && rect.y + rect.h <= 96
+    noOverlap entries = all disjoint (pairs entries)
+    disjoint (a, b)
+      | a.page /= b.page = True
+      | otherwise = not (rectsOverlap a.rect b.rect)
+    rectsOverlap r0 r1 =
+      let x0 = r0.x
+          y0 = r0.y
+          x1 = r1.x
+          y1 = r1.y
+       in x0 < x1 + r1.w
+            && x1 < x0 + r0.w
+            && y0 < y1 + r1.h
+            && y1 < y0 + r0.h
+    pairs xs =
+      [ (x, y)
+        | (x : ys) <- tails xs,
+          y <- ys
+      ]
 
 runBatchGenerateChecks :: IO Bool
 runBatchGenerateChecks =

@@ -116,3 +116,40 @@ Options:
 - `--overlap-fix`
 - `--verbose`
 
+## `masdiff-atlas`
+
+Builds one or more atlas pages from a text string and writes atlas metadata TSV.
+
+```bash
+cabal run masdiff-atlas -- \
+  --text "PACK MY BOX" \
+  -font assets/Inter/static/Inter_24pt-Regular.ttf \
+  --out-prefix out/atlas/inter24 \
+  --gen-dim 64 \
+  --pxrange 8.0 \
+  --atlas-w 1024 \
+  --atlas-h 1024 \
+  --padding 1 \
+  --jobs 8 \
+  --verbose
+```
+
+Options:
+
+- `--text <text>` (required)
+- `-font <font.ttf>` or `-varfont <font.ttf?axis=val&...>` (required)
+- `--out-prefix <path>` default `out/atlas/atlas`
+- `--gen-dim <n>` default `64`
+- `--pxrange <x>` default `8.0`
+- `--seed <n>` default `1`
+- `--atlas-w <n>` default `1024`
+- `--atlas-h <n>` default `1024`
+- `--padding <n>` default `1`
+- `--jobs <n>` default `1`
+- `--overlap-fix` / `--no-overlap-fix`
+- `--verbose`
+
+Outputs:
+
+- `<out-prefix>.page-000.png`, `<out-prefix>.page-001.png`, ...
+- `<out-prefix>.tsv` (glyph -> page/rect/metrics table)
