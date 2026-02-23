@@ -17,7 +17,7 @@ cabal run generate-inter-mtsdf-fixtures
 
 Environment:
 
-- `MASDIFF_BACKEND` (default `native`)
+- `MASDIFF_BACKEND` (default `native`; use `process` for oracle comparison)
 - `MSDFGEN_BIN` (used when backend is `process`)
 - `MTSDF_OUT` (default `out/reference/inter-mtsdf`)
 - `MTSDF_DIM` (default `64`)

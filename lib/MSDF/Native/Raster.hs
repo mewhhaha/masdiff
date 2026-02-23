@@ -3,7 +3,8 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 
 module MSDF.Native.Raster
-  ( rasterizeOutline,
+  ( outlineMetrics,
+    rasterizeOutline,
   )
 where
 
@@ -64,15 +65,19 @@ rasterizeOutline cfg outline = do
   pure
     GenOut
       { img = img,
-        metrics =
-          Metrics
-            { adv = outline.adv,
-              bounds = outline.bounds,
-              scale = Just frame.scale,
-              translate = Just (frame.tx, frame.ty),
-              range = Just (frame.rangeLo, frame.rangeHi)
-        }
+        metrics = outlineMetrics cfg outline
       }
+
+outlineMetrics :: GenCfg -> Outline -> Metrics
+outlineMetrics cfg outline =
+  let frame = computeFrame cfg outline
+   in Metrics
+        { adv = outline.adv,
+          bounds = outline.bounds,
+          scale = Just frame.scale,
+          translate = Just (frame.tx, frame.ty),
+          range = Just (frame.rangeLo, frame.rangeHi)
+        }
 
 filterBoundaryEdges :: [[Edge]] -> [[Edge]]
 filterBoundaryEdges edgeContours =

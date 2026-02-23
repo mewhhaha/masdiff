@@ -511,3 +511,33 @@ Resume sequence:
    - medians/deltas,
    - whether candidate was kept or reverted.
 6. Commit in small, reversible steps once a pass is validated.
+
+## Pause Handoff: SDL3 GPU Generation Crash
+
+Current focus is stabilizing `examples/sdl3-spirdo-text` GPU generation on Vulkan/SDL3.
+
+What is already known:
+1. Crash point is deterministic: `SDL_CreateGPUGraphicsPipeline` for the generation pipeline.
+2. `array<struct>` uniform layout in the generation fragment shader triggers a driver crash (`signal 11`) during pipeline creation.
+3. A flattened layout (`array<vec4>` pairs) avoids the crash and allows `just sdl3` to run.
+4. Crash is reproducible on demand with:
+   - `MASDIFF_SDL_PIPELINE_PROBE=1 MASDIFF_SDL_GEN_SHADER=struct just sdl3`
+5. Non-crashing probe path:
+   - `MASDIFF_SDL_PIPELINE_PROBE=1 MASDIFF_SDL_GEN_SHADER=flat just sdl3`
+
+Resume sequence:
+1. Verify probe matrix first (fast, no full scene run):
+   - `MASDIFF_SDL_PIPELINE_PROBE=1 MASDIFF_SDL_GEN_SHADER=flat just sdl3`
+   - `MASDIFF_SDL_PIPELINE_PROBE=1 MASDIFF_SDL_GEN_SHADER=struct just sdl3` (expected crash)
+   - `MASDIFF_SDL_PIPELINE_PROBE=1 MASDIFF_SDL_GEN_SHADER=sanity just sdl3`
+2. Keep `flat` as default generation shader mode unless `struct` stops crashing on target drivers.
+3. Re-run full demo:
+   - `just sdl3`
+4. Capture deterministic artifacts for visual diffing:
+   - `just sdl3-harness`
+5. If GPU coverage is too low (many segment-overflow fallbacks), tune:
+   - `gpuRasterMaxSegs` and shader `MAX_SEGS` together,
+   - keep total pushed uniform bytes <= `gpuRasterMaxPushBytes`.
+6. Before commit, rerun:
+   - `cabal test masdiff-test -j1`
+   - `just sdl3`

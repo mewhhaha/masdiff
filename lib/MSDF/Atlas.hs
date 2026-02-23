@@ -12,6 +12,7 @@ module MSDF.Atlas
     AtlasRect (..),
     defaultAtlasCfg,
     generateAtlasIO,
+    generateAtlasWithRasterIO,
     mkAtlasCfg,
     packAtlas,
     renderAtlasTsv,
@@ -19,7 +20,7 @@ module MSDF.Atlas
 where
 
 import Control.Monad (forM_, foldM)
-import Control.Exception (AsyncException, displayException, fromException, throwIO, try)
+import Control.Exception (AsyncException, SomeException, displayException, fromException, throwIO, try)
 import Data.Array.MArray (getElems, newArray, writeArray)
 import Data.Array.ST (STUArray)
 import qualified Data.ByteString as BS
@@ -27,9 +28,11 @@ import qualified Data.IntMap.Strict as IM
 import Control.Monad.ST (ST, runST)
 import Data.Word (Word8)
 import MSDF.Generate (RuntimeCfg, generateGlyphBatchIO)
+import MSDF.Native (RasterPreparedIO, generateGlyphBatchNativeWithIO)
 import MSDF.Types
   ( FontSrc,
     GenCfg,
+    GenErr,
     GenOut (..),
     GlyphCode,
     ImgRGBA8 (..),
@@ -105,6 +108,20 @@ generateAtlasIO :: RuntimeCfg -> Int -> AtlasCfg -> GenCfg -> FontSrc -> [GlyphC
 generateAtlasIO runtime jobs atlasCfg genCfg src glyphs = do
   let uniqueGlyphs = dedupeGlyphs glyphs
   generatedResult <- try (generateGlyphBatchIO runtime jobs genCfg src uniqueGlyphs)
+  assembleAtlasFromBatchIO atlasCfg uniqueGlyphs generatedResult
+
+generateAtlasWithRasterIO :: Int -> RasterPreparedIO -> AtlasCfg -> GenCfg -> FontSrc -> [GlyphCode] -> IO (Either String Atlas)
+generateAtlasWithRasterIO jobs raster atlasCfg genCfg src glyphs = do
+  let uniqueGlyphs = dedupeGlyphs glyphs
+  generatedResult <- try (generateGlyphBatchNativeWithIO jobs raster genCfg src uniqueGlyphs)
+  assembleAtlasFromBatchIO atlasCfg uniqueGlyphs generatedResult
+
+assembleAtlasFromBatchIO ::
+  AtlasCfg ->
+  [GlyphCode] ->
+  Either SomeException [Either GenErr GenOut] ->
+  IO (Either String Atlas)
+assembleAtlasFromBatchIO atlasCfg uniqueGlyphs generatedResult =
   case generatedResult of
     Left ex ->
       case fromException ex of

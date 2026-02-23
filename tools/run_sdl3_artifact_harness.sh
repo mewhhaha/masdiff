@@ -26,6 +26,8 @@ run_case() {
       "CABAL_DIR=$PWD/.cabal"
       "CABAL_LOGDIR=$PWD/.cabal-logs"
       "SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-dummy}"
+      "MASDIFF_SDL_GEN_BACKEND=${MASDIFF_SDL_GEN_BACKEND:-gpu}"
+      "MASDIFF_SDL_GEN_STRICT=${MASDIFF_SDL_GEN_STRICT:-1}"
       "MASDIFF_SDL_SCENE=$scene"
       "MASDIFF_SDL_CAPTURE=$image"
       "MASDIFF_SDL_META=$meta"

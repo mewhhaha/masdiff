@@ -135,9 +135,26 @@ renderMetrics :: Metrics -> String
 
 Direct native backend entrypoint.
 
+### Exported types
+
+```haskell
+type RasterPreparedIO = GenCfg -> PreparedGlyph -> IO (Either GenErr GenOut)
+
+data PreparedGlyph = PreparedGlyph
+  { ol :: Outline
+  }
+```
+
 ### Exported functions
 
 ```haskell
+prepareGlyphNativeIO :: FontSrc -> GlyphCode -> IO (Either GenErr PreparedGlyph)
+prepareGlyphBatchNativeIO :: FontSrc -> [GlyphCode] -> IO [Either GenErr PreparedGlyph]
+rasterPreparedCpu :: GenCfg -> PreparedGlyph -> Either GenErr GenOut
+
+generateGlyphNativeWithIO :: RasterPreparedIO -> GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)
+generateGlyphBatchNativeWithIO :: Int -> RasterPreparedIO -> GenCfg -> FontSrc -> [GlyphCode] -> IO [Either GenErr GenOut]
+
 generateGlyphNativeIO :: GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)
 generateGlyphBatchNativeIO :: Int -> GenCfg -> FontSrc -> [GlyphCode] -> IO [Either GenErr GenOut]
 ```
@@ -184,6 +201,7 @@ defaultAtlasCfg :: AtlasCfg
 mkAtlasCfg :: Int -> Int -> Int -> Either String AtlasCfg
 packAtlas :: AtlasCfg -> [(GlyphCode, GenOut)] -> Either String Atlas
 generateAtlasIO :: RuntimeCfg -> Int -> AtlasCfg -> GenCfg -> FontSrc -> [GlyphCode] -> IO (Either String Atlas)
+generateAtlasWithRasterIO :: Int -> RasterPreparedIO -> AtlasCfg -> GenCfg -> FontSrc -> [GlyphCode] -> IO (Either String Atlas)
 renderAtlasTsv :: Atlas -> String
 ```
 

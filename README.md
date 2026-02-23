@@ -5,6 +5,7 @@
 Runtime model:
 
 - library/runtime generation is Haskell (`native`).
+- consumers can plug in their own raster backend via `MSDF.Native.generateGlyphNativeWithIO` / `generateGlyphBatchNativeWithIO`.
 - external oracle comparison is development-only (documented below).
 
 ## Build
@@ -93,7 +94,57 @@ Notes:
 - In `BackendNative`, batch generation parses OpenType/TrueType tables once per batch (not once per glyph).
 - For multicore throughput, run with `+RTS -N -RTS` and choose `jobs` around `numCapabilities`.
 
-### 1c) Build atlas pages from Haskell
+### 1c) Prepare once, raster later (advanced API)
+
+Use this path when you want to cache font parsing/outline prep separately from raster strategy.
+
+```haskell
+{-# LANGUAGE OverloadedRecordDot #-}
+
+import Data.Char (ord)
+import MSDF.Native
+  ( prepareGlyphNativeIO
+  , rasterPreparedCpu
+  )
+import MSDF.Types (FontSrc (..), GenCfg (..), Mode (..), mkDim, mkGlyphCode, mkPxRange)
+
+main :: IO ()
+main = do
+  dim <- either fail pure (mkDim 64)
+  pxr <- either fail pure (mkPxRange 8.0)
+  g <- either fail pure (mkGlyphCode (ord 'A'))
+  let cfg = GenCfg {mode = Mtsdf, dim = dim, pxr = pxr, seed = 1, autoframe = True, ovlp = False}
+      src = FontFile {path = "assets/Inter/static/Inter_24pt-Regular.ttf"}
+  prepared <- prepareGlyphNativeIO src g >>= either (fail . show) pure
+  outCpu <- either fail pure (rasterPreparedCpu cfg prepared)
+  print outCpu.metrics.adv
+```
+
+### 1d) Consumer-managed GPU raster callback
+
+If you have your own Vulkan/WGPU rasterizer, keep `masdiff` for font parsing + prep and provide your own raster callback.
+
+```haskell
+{-# LANGUAGE OverloadedRecordDot #-}
+
+import MSDF.Native
+  ( RasterPreparedIO
+  , generateGlyphBatchNativeWithIO
+  , rasterPreparedCpu
+  )
+import MSDF.Atlas (generateAtlasWithRasterIO)
+
+-- Replace this with your own GPU implementation.
+gpuRaster :: RasterPreparedIO
+gpuRaster cfg prepared =
+  pure (rasterPreparedCpu cfg prepared)
+
+-- Then call:
+-- results <- generateGlyphBatchNativeWithIO 8 gpuRaster cfg src glyphs
+-- atlas  <- generateAtlasWithRasterIO 8 gpuRaster atlasCfg cfg src glyphs
+```
+
+### 1e) Build atlas pages from Haskell
 
 ```haskell
 import Data.Char (ord)
@@ -223,6 +274,7 @@ Default output:
 Environment:
 
 - `MASDIFF_BACKEND=native` (default)
+- `MASDIFF_BACKEND=process` (optional oracle backend for comparison/fixtures)
 - `MTSDF_OUT=out/reference/inter-mtsdf`
 - `MTSDF_DIM=64`
 - `MTSDF_PXRANGE=8.0`
@@ -251,7 +303,7 @@ Run the example:
 
 ```bash
 cd examples/sdl3-spirdo-text
-cabal run sdl3-spirdo-text
+MASDIFF_SDL_GEN_BACKEND=gpu MASDIFF_SDL_GEN_STRICT=1 cabal run sdl3-spirdo-text
 ```
 
 See [`examples/sdl3-spirdo-text/README.md`](examples/sdl3-spirdo-text/README.md) for exact launch steps.
@@ -354,4 +406,5 @@ Notes:
 
 - CLI reference: `docs/CLI.md`
 - Exposed API: `docs/API.md`
+- GPU backend handoff: `docs/GPU_BACKEND_HANDOFF.md`
 - Docs index: `docs/README.md`

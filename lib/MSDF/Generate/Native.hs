@@ -4,7 +4,10 @@ module MSDF.Generate.Native
   )
 where
 
-import MSDF.Native (generateGlyphBatchNativeIO, generateGlyphNativeIO)
+import MSDF.Native
+  ( generateGlyphBatchNativeIO,
+    generateGlyphNativeIO,
+  )
 import MSDF.Types (FontSrc, GenCfg, GenErr, GenOut, GlyphCode)
 
 generateGlyphIO :: GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)

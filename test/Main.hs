@@ -8,6 +8,7 @@ import Data.Char (ord, toLower)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf, nub, tails)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
@@ -23,10 +24,11 @@ import Font
     interHarnessGlyphs,
   )
 import MSDF.Compare (DiffStats (..), diffRGBA8, passesGate, strictGate)
-import MSDF.Atlas (Atlas (..), AtlasEntry (..), AtlasRect (..), generateAtlasIO, mkAtlasCfg, packAtlas, renderAtlasTsv)
+import MSDF.Atlas (Atlas (..), AtlasEntry (..), AtlasRect (..), generateAtlasIO, generateAtlasWithRasterIO, mkAtlasCfg, packAtlas, renderAtlasTsv)
 import MSDF.Encode (decodeMsdfgenRgba, encodeMsdfgenRgba)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphBatchIO, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestMeta (..), ManifestRow (..), loadManifest)
+import MSDF.Native (generateGlyphBatchNativeWithIO, rasterPreparedCpu)
 import MSDF.TextRender
   ( ScreenPxRange (..),
     ShaderCfg (..),
@@ -584,7 +586,27 @@ runAtlasChecks = do
                     dedupeOk <- check "generateAtlasIO deduplicates repeated glyph codes" (length atlas.entries == 2)
                     pageOk <- check "generateAtlasIO produces at least one page" (not (null atlas.pages))
                     pure (dedupeOk && pageOk)
-          pure (invalidWOk && invalidHOk && invalidPadOk && packedOk && oversizeOk && multiPageOk && runtimeOk)
+          callbackRuntimeOk <-
+            case mkParityCfg of
+              Left err ->
+                check ("atlas callback runtime config failed: " <> err) False
+              Right cfg -> do
+                let src = FontFile {path = "assets/Inter/static/Inter_18pt-Regular.ttf"}
+                hitRef <- newIORef (0 :: Int)
+                let countingRaster cfg0 prepared = do
+                      modifyIORef' hitRef (+ 1)
+                      pure (rasterPreparedCpu cfg0 prepared)
+                atlasResult <- generateAtlasWithRasterIO 2 countingRaster atlasCfg cfg src [glyphA, glyphB, glyphA]
+                hitCount <- readIORef hitRef
+                case atlasResult of
+                  Left err ->
+                    check ("generateAtlasWithRasterIO failed: " <> err) False
+                  Right atlas -> do
+                    dedupeOk <- check "generateAtlasWithRasterIO deduplicates repeated glyph codes" (length atlas.entries == 2)
+                    pageOk <- check "generateAtlasWithRasterIO produces at least one page" (not (null atlas.pages))
+                    callbackCountOk <- check "generateAtlasWithRasterIO invokes raster callback for deduplicated glyphs" (hitCount == 2)
+                    pure (dedupeOk && pageOk && callbackCountOk)
+          pure (invalidWOk && invalidHOk && invalidPadOk && packedOk && oversizeOk && multiPageOk && runtimeOk && callbackRuntimeOk)
     _ ->
       check "atlas test glyph/config setup failed" False
   where
@@ -665,11 +687,36 @@ runBatchGenerateChecks =
             check
               "generateGlyphBatchIO variable jobs=4 matches sequential generateGlyphIO"
               (variableBatch == variableSeq)
+          callbackHitRef <- newIORef (0 :: Int)
+          let countingRaster cfg0 prepared = do
+                modifyIORef' callbackHitRef (+ 1)
+                pure (rasterPreparedCpu cfg0 prepared)
+          callbackBatch <- generateGlyphBatchNativeWithIO 4 countingRaster cfg src glyphs
+          callbackBatchOk <-
+            check
+              "generateGlyphBatchNativeWithIO callback path matches sequential generateGlyphIO"
+              (callbackBatch == seqResults)
+          callbackHitCount <- readIORef callbackHitRef
+          callbackCountOk <-
+            check
+              "generateGlyphBatchNativeWithIO invokes callback once per prepared glyph"
+              (callbackHitCount == length glyphs)
           missingBatch <- generateGlyphBatchIO runtime 4 cfg (FontFile {path = "/tmp/masdiff_missing_font.ttf"}) glyphs
           missingOk <-
             check
               "generateGlyphBatchIO reports MissingInput for missing font"
               (all isMissingInput missingBatch)
+          missingCallbackHitRef <- newIORef (0 :: Int)
+          let missingCountingRaster cfg0 prepared = do
+                modifyIORef' missingCallbackHitRef (+ 1)
+                pure (rasterPreparedCpu cfg0 prepared)
+          missingWithCallback <-
+            generateGlyphBatchNativeWithIO 4 missingCountingRaster cfg (FontFile {path = "/tmp/masdiff_missing_font.ttf"}) glyphs
+          missingCallbackHitCount <- readIORef missingCallbackHitRef
+          missingCallbackOk <-
+            check
+              "generateGlyphBatchNativeWithIO skips callback when preparation fails"
+              (all isMissingInput missingWithCallback && missingCallbackHitCount == 0)
           let processRuntimeMissing =
                 defaultRuntimeCfg
                   { backend = BackendProcess,
@@ -685,7 +732,17 @@ runBatchGenerateChecks =
             check
               "generateGlyphBatchIO process jobs=4 reports MissingInput for missing msdfgen executable"
               (all isMissingInput processMissingJobs4)
-          pure (jobs1Ok && jobs4Ok && variableOk && missingOk && processMissingJobs1Ok && processMissingJobs4Ok)
+          pure
+            ( jobs1Ok
+                && jobs4Ok
+                && variableOk
+                && callbackBatchOk
+                && callbackCountOk
+                && missingOk
+                && missingCallbackOk
+                && processMissingJobs1Ok
+                && processMissingJobs4Ok
+            )
   where
     isMissingInput result =
       case result of
