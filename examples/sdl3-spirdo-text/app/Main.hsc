@@ -85,6 +85,7 @@ data SDLGPUShader
 data SDLGPUGraphicsPipeline
 data SDLGPUSampler
 data SDLGPUTexture
+data SDLGPUBuffer
 data SDLGPUTransferBuffer
 data SDLGPUCommandBuffer
 data SDLGPUCopyPass
@@ -320,7 +321,8 @@ data PlacedGlyph = PlacedGlyph
   }
 
 data LineBuild = LineBuild
-  { atlas :: !ImgRGBA8,
+  { atlasImg :: !(Maybe ImgRGBA8),
+    atlasTex :: !(Maybe (Ptr SDLGPUTexture)),
     glyphs :: ![PlacedGlyph],
     w :: !Double,
     h :: !Double
@@ -402,6 +404,7 @@ data GpuBatchCtx = GpuBatchCtx
 data GpuAtlasDraw = GpuAtlasDraw
   { viewport :: !GpuViewport,
     scissor :: !SdlRect,
+    dimX :: !Int,
     dimY :: !Int,
     scale :: !Double,
     tx :: !Double,
@@ -469,6 +472,12 @@ foreign import ccall unsafe "SDL_CreateGPUTexture"
 foreign import ccall unsafe "SDL_ReleaseGPUTexture"
   c_sdlReleaseGPUTexture :: Ptr SDLGPUDevice -> Ptr SDLGPUTexture -> IO ()
 
+foreign import ccall unsafe "SDL_CreateGPUBuffer"
+  c_sdlCreateGPUBuffer :: Ptr SDLGPUDevice -> Ptr () -> IO (Ptr SDLGPUBuffer)
+
+foreign import ccall unsafe "SDL_ReleaseGPUBuffer"
+  c_sdlReleaseGPUBuffer :: Ptr SDLGPUDevice -> Ptr SDLGPUBuffer -> IO ()
+
 foreign import ccall unsafe "SDL_CreateGPUTransferBuffer"
   c_sdlCreateGPUTransferBuffer :: Ptr SDLGPUDevice -> Ptr () -> IO (Ptr SDLGPUTransferBuffer)
 
@@ -489,6 +498,9 @@ foreign import ccall unsafe "SDL_BeginGPUCopyPass"
 
 foreign import ccall unsafe "SDL_UploadToGPUTexture"
   c_sdlUploadToGPUTexture :: Ptr SDLGPUCopyPass -> Ptr () -> Ptr () -> CBool -> IO ()
+
+foreign import ccall unsafe "SDL_UploadToGPUBuffer"
+  c_sdlUploadToGPUBuffer :: Ptr SDLGPUCopyPass -> Ptr () -> Ptr () -> CBool -> IO ()
 
 foreign import ccall unsafe "SDL_DownloadFromGPUTexture"
   c_sdlDownloadFromGPUTexture :: Ptr SDLGPUCopyPass -> Ptr () -> Ptr () -> IO ()
@@ -518,6 +530,9 @@ foreign import ccall unsafe "SDL_BindGPUGraphicsPipeline"
 
 foreign import ccall unsafe "SDL_BindGPUFragmentSamplers"
   c_sdlBindGPUFragmentSamplers :: Ptr SDLGPURenderPass -> Word32 -> Ptr () -> Word32 -> IO ()
+
+foreign import ccall unsafe "SDL_BindGPUFragmentStorageBuffers"
+  c_sdlBindGPUFragmentStorageBuffers :: Ptr SDLGPURenderPass -> Word32 -> Ptr (Ptr SDLGPUBuffer) -> Word32 -> IO ()
 
 foreign import ccall unsafe "SDL_PushGPUVertexUniformData"
   c_sdlPushGPUVertexUniformData :: Ptr SDLGPUCommandBuffer -> Word32 -> Ptr () -> Word32 -> IO ()
@@ -595,6 +610,9 @@ sdlGpuTextureUsageSampler = #{const SDL_GPU_TEXTUREUSAGE_SAMPLER}
 sdlGpuTextureUsageColorTarget :: Word32
 sdlGpuTextureUsageColorTarget = #{const SDL_GPU_TEXTUREUSAGE_COLOR_TARGET}
 
+sdlGpuBufferUsageGraphicsStorageRead :: Word32
+sdlGpuBufferUsageGraphicsStorageRead = #{const SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ}
+
 sdlGpuTransferUsageUpload :: CInt
 sdlGpuTransferUsageUpload = #{const SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD}
 
@@ -659,11 +677,12 @@ main = do
   rasterMode <- either die pure (parseRasterMode rasterModeRaw)
   strictGpuGeneration <- readBoolEnvDefault "MASDIFF_SDL_GEN_STRICT" False
   debugLog <- readBoolEnvDefault "MASDIFF_SDL_DEBUG" False
+  presentHeal <- readBoolEnvDefault "MASDIFF_SDL_PRESENT_HEAL" True
   genShaderRaw <- lookupEnv "MASDIFF_SDL_GEN_SHADER"
   genShaderMode <- either die pure (parseGenFragShaderMode genShaderRaw)
   pipelineProbe <- readBoolEnvDefault "MASDIFF_SDL_PIPELINE_PROBE" False
   requestedGpuBatch <- readBoolEnvDefault "MASDIFF_SDL_GPU_BATCH" False
-  let useGpuBatch = False
+  let useGpuBatch = requestedGpuBatch && rasterMode == RasterModeGpu
   maxSegsRaw <- readPositiveIntEnvDefault "MASDIFF_SDL_GEN_MAX_SEGS" gpuRasterShaderMaxSegs
   maxPushBytes <- readPositiveIntEnvDefault "MASDIFF_SDL_GEN_MAX_PUSH_BYTES" gpuRasterDefaultMaxPushBytes
   let rasterLimits =
@@ -676,8 +695,6 @@ main = do
         <> show rasterMode
         <> if strictGpuGeneration then " (strict)" else ""
     )
-  when (rasterMode == RasterModeGpu && requestedGpuBatch) $
-    putStrLn "SDL generation batching requested but disabled (known rendering regressions)"
   when (rasterMode == RasterModeGpu) $
     putStrLn ("SDL generation batching: " <> if useGpuBatch then "enabled" else "disabled")
   logDbg debugLog ("scene preset: " <> show scenePreset)
@@ -693,7 +710,7 @@ main = do
           Just p | not (null p) -> Just p
           _ -> Nothing
   let vtx = vertexShader
-  let frag = fragmentShader
+  let frag = if presentHeal then fragmentShader else fragmentShaderNoHeal
   let gvx = genVertexShader
   let gfg =
         case genShaderMode of
@@ -703,6 +720,7 @@ main = do
   logDbg debugLog ("gen vertex shader: " <> renderShaderInfo gvx)
   logDbg debugLog ("gen fragment shader: " <> renderShaderInfo gfg)
   logDbg debugLog ("generation fragment shader mode: " <> show genShaderMode)
+  logDbg debugLog ("presentation heal: " <> show presentHeal)
   logDbg
     debugLog
     ( "generation limits: maxSegs="
@@ -723,7 +741,7 @@ main = do
             withGpuShader dev gfg $ \gfs -> do
               logDbg debugLog "create gen fragment shader (ok)"
               logDbg debugLog "create gen pipeline (start)"
-              withGpuPipeline dev sdlGpuTextureFormatRgba8Unorm gvs gfs $ \gpipe -> do
+              withGpuPipeline dev sdlGpuTextureFormatRgba8Unorm False gvs gfs $ \gpipe -> do
                 logDbg debugLog "create gen pipeline (ok)"
                 logDbg debugLog "generation pipeline ready"
                 if pipelineProbe
@@ -759,7 +777,7 @@ main = do
                       withGpuShader dev frag $ \fs -> do
                         logDbg debugLog "create present fragment shader (ok)"
                         logDbg debugLog "create present pipeline (start)"
-                        withGpuPipeline dev swapFmt vs fs $ \pipe -> do
+                        withGpuPipeline dev swapFmt True vs fs $ \pipe -> do
                           logDbg debugLog "create present pipeline (ok)"
                           withGpuSampler dev $ \smp ->
                             withLineTextures dev scene $ \lineTexs -> do
@@ -851,7 +869,7 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
           pure $ do
             runMap <- runsByEntries page0.img.w page0.img.h (toEntries atlas.entries)
             atoms <- lineAtoms runMap
-            layoutLine page0.img atoms
+            layoutLineCpu page0.img atoms
         _ -> pure (Left "line atlas spilled to multiple pages; increase atlas size for this demo")
 
     dumpAtlasMaybe :: ImgRGBA8 -> IO ()
@@ -886,8 +904,8 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
                   cropY0 = 0
                   cW = rect0.w
                   cH = rect0.h
-                  insetX = 0.0 :: Double
-                  insetY = 0.0 :: Double
+                  insetX = if cW > 1 then 0.5 else 0.0
+                  insetY = if cH > 1 then 0.5 else 0.0
                   ox0 = (sc0 * tx0) - 0.5
                   oy0 = (gh - (sc0 * ty0)) - 0.5
                   desc0 = max 0 ((-ymin) * sc0)
@@ -969,15 +987,15 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
           case firstOverflow placed atlasW atlasH of
             Just msg -> pure (Left msg)
             Nothing -> do
-              atlasResult <- rasterPreparedGpuAtlasImage gpuCtx cfg0 atlasW atlasH placed
+              atlasResult <- rasterPreparedGpuAtlasTexture gpuCtx cfg0 atlasW atlasH placed
               case atlasResult of
                 Left err -> pure (Left err)
-                Right atlasImg -> do
+                Right atlasTex0 -> do
                   let entries = [(g, r, mtr) | (g, _, r, mtr, _) <- placed]
                   pure $ do
                     runMap <- runsByEntries atlasW atlasH entries
                     atoms <- lineAtoms runMap
-                    layoutLine atlasImg atoms
+                    layoutLineGpu atlasTex0 atoms
 
     firstOverflow :: [(GlyphCode, PreparedGlyph, AtlasRect, Metrics, [PreparedLineSeg])] -> Int -> Int -> Maybe String
     firstOverflow placed atlasW atlasH =
@@ -1111,23 +1129,20 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
     metrics = metricsPrepared cfg prepared
 
 gpuRasterShaderMaxSegs :: Int
-gpuRasterShaderMaxSegs = 120
+gpuRasterShaderMaxSegs = 2048
 
 gpuRasterDefaultMaxPushBytes :: Int
--- Keep this aligned with payload size for gpuRasterShaderMaxSegs.
+-- In buffer-backed mode this is a segment-bytes budget, not push-uniform size.
 gpuRasterDefaultMaxPushBytes = gpuRasterBytesForSegments gpuRasterShaderMaxSegs
 
 gpuRasterHeaderBytes :: Int
 gpuRasterHeaderBytes = 32
 
-gpuRasterSegVec4Bytes :: Int
-gpuRasterSegVec4Bytes = 16
-
-gpuRasterSegMetaOffset :: Int
-gpuRasterSegMetaOffset = gpuRasterHeaderBytes + (gpuRasterShaderMaxSegs * gpuRasterSegVec4Bytes)
+gpuRasterSegStrideBytes :: Int
+gpuRasterSegStrideBytes = 32
 
 gpuRasterBytesForSegments :: Int -> Int
-gpuRasterBytesForSegments _n = gpuRasterSegMetaOffset + (gpuRasterShaderMaxSegs * gpuRasterSegVec4Bytes)
+gpuRasterBytesForSegments n = n * gpuRasterSegStrideBytes
 
 rasterPreparedGpuImage ::
   Ptr SDLGPUDevice ->
@@ -1142,31 +1157,33 @@ rasterPreparedGpuImage ::
 rasterPreparedGpuImage dev genPipe dim scale0 tx0 ty0 pxr0 segs0 = do
   let usage = sdlGpuTextureUsageSampler .|. sdlGpuTextureUsageColorTarget
       clear = FColor 0 0 0 0
-      segs = take gpuRasterShaderMaxSegs segs0
+      segs = segs0
   bracket
     (withTextureCreateInfoUsage sdlGpuTextureFormatRgba8Unorm usage dim dim (\ci -> requirePtr "SDL_CreateGPUTexture(gen)" (c_sdlCreateGPUTexture dev ci)))
     (c_sdlReleaseGPUTexture dev)
     (\tex -> do
        cmd <- requirePtr "SDL_AcquireGPUCommandBuffer(gen)" (c_sdlAcquireGPUCommandBuffer dev)
-       withColorTargetInfo tex clear $ \ctInfo -> do
-         rp <- requirePtr "SDL_BeginGPURenderPass(gen)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
-         c_sdlBindGPUGraphicsPipeline rp genPipe
-         withGpuRasterUniform dim scale0 tx0 ty0 pxr0 segs $ \uPtr uSize ->
-           c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
-         c_sdlDrawGPUPrimitives rp 6 1 0 0
-         c_sdlEndGPURenderPass rp
+       withUploadedSegBuffer dev cmd segs $ \segBuf -> do
+         withColorTargetInfo tex clear $ \ctInfo -> do
+           rp <- requirePtr "SDL_BeginGPURenderPass(gen)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
+           c_sdlBindGPUGraphicsPipeline rp genPipe
+           with segBuf $ \bufPtr -> c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 1
+           withGpuRasterUniform dim dim scale0 tx0 ty0 pxr0 segs $ \uPtr uSize ->
+             c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
+           c_sdlDrawGPUPrimitives rp 6 1 0 0
+           c_sdlEndGPURenderPass rp
        bytes <- downloadSwapTexture dev cmd tex dim dim
        pure (mkImgRGBA8 dim dim bytes)
     )
 
-rasterPreparedGpuAtlasImage ::
+rasterPreparedGpuAtlasTexture ::
   GpuBatchCtx ->
   GenCfg ->
   Int ->
   Int ->
   [(GlyphCode, PreparedGlyph, AtlasRect, Metrics, [PreparedLineSeg])] ->
-  IO (Either String ImgRGBA8)
-rasterPreparedGpuAtlasImage gpuCtx cfg atlasW atlasH glyphs = do
+  IO (Either String (Ptr SDLGPUTexture))
+rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
   let usage = sdlGpuTextureUsageSampler .|. sdlGpuTextureUsageColorTarget
       clear = FColor 0 0 0 0
   case sequence (fmap mkDraw glyphs) of
@@ -1175,26 +1192,30 @@ rasterPreparedGpuAtlasImage gpuCtx cfg atlasW atlasH glyphs = do
       pure (Left err)
     Right draws -> do
       logDbg gpuCtx.debugLog ("gpuRasterBatch: draws=" <> show (length draws) <> " atlas=" <> show atlasW <> "x" <> show atlasH)
-      bracket
-        (withTextureCreateInfoUsage sdlGpuTextureFormatRgba8Unorm usage atlasW atlasH (\ci -> requirePtr "SDL_CreateGPUTexture(gen-atlas)" (c_sdlCreateGPUTexture gpuCtx.dev ci)))
-        (c_sdlReleaseGPUTexture gpuCtx.dev)
-        (\tex -> do
-           cmd <- requirePtr "SDL_AcquireGPUCommandBuffer(gen-atlas)" (c_sdlAcquireGPUCommandBuffer gpuCtx.dev)
-           withColorTargetInfo tex clear $ \ctInfo -> do
-             rp <- requirePtr "SDL_BeginGPURenderPass(gen-atlas)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
-             c_sdlBindGPUGraphicsPipeline rp gpuCtx.genPipe
-             forM_ draws $ \d -> do
-               with d.viewport $ \vpPtr -> c_sdlSetGPUViewport rp vpPtr
-               with d.scissor $ \scPtr -> c_sdlSetGPUScissor rp scPtr
-               withGpuRasterUniform d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) d.segs $ \uPtr uSize ->
-                 c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
-               c_sdlDrawGPUPrimitives rp 6 1 0 0
-             c_sdlEndGPURenderPass rp
-           bytes <- downloadSwapTexture gpuCtx.dev cmd tex atlasW atlasH
-           logDbg gpuCtx.debugLog "gpuRasterBatch: success"
-           modifyIORef' gpuCtx.statsRef (\stats -> stats {ok = stats.ok + length draws})
-           pure (mkImgRGBA8 atlasW atlasH bytes)
-        )
+      tex <- withTextureCreateInfoUsage sdlGpuTextureFormatRgba8Unorm usage atlasW atlasH (\ci -> requirePtr "SDL_CreateGPUTexture(gen-atlas)" (c_sdlCreateGPUTexture gpuCtx.dev ci))
+      res <- try $ do
+        cmd <- requirePtr "SDL_AcquireGPUCommandBuffer(gen-atlas)" (c_sdlAcquireGPUCommandBuffer gpuCtx.dev)
+        withColorTargetInfo tex clear $ \ctInfo -> do
+          rp <- requirePtr "SDL_BeginGPURenderPass(gen-atlas)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
+          c_sdlBindGPUGraphicsPipeline rp gpuCtx.genPipe
+          forM_ draws $ \d -> do
+            with d.viewport $ \vpPtr -> c_sdlSetGPUViewport rp vpPtr
+            with d.scissor $ \scPtr -> c_sdlSetGPUScissor rp scPtr
+            withUploadedSegBuffer gpuCtx.dev cmd d.segs $ \segBuf -> do
+              with segBuf $ \bufPtr -> c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 1
+              withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) d.segs $ \uPtr uSize ->
+                c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
+              c_sdlDrawGPUPrimitives rp 6 1 0 0
+          c_sdlEndGPURenderPass rp
+        requireTrue "SDL_SubmitGPUCommandBuffer(gen-atlas)" (c_sdlSubmitGPUCommandBuffer cmd)
+      case res of
+        Left (ex :: SomeException) -> do
+          c_sdlReleaseGPUTexture gpuCtx.dev tex
+          pure (Left ("GPU atlas raster failed: " <> displayException ex))
+        Right () -> do
+          logDbg gpuCtx.debugLog "gpuRasterBatch: success"
+          modifyIORef' gpuCtx.statsRef (\stats -> stats {ok = stats.ok + length draws})
+          pure (Right tex)
   where
     dimI = unDim cfg.dim
 
@@ -1224,9 +1245,10 @@ rasterPreparedGpuAtlasImage gpuCtx cfg atlasW atlasH glyphs = do
                               w = fromIntegral rect0.w,
                               h = fromIntegral rect0.h
                             },
-                        dimY = dimI + rect0.y,
+                        dimX = dimI,
+                        dimY = dimI,
                         scale = scale0,
-                        tx = tx0 + (fromIntegral rect0.x / scale0),
+                        tx = tx0,
                         ty = ty0,
                         segs = segs
                       }
@@ -1235,6 +1257,7 @@ rasterPreparedGpuAtlasImage gpuCtx cfg atlasW atlasH glyphs = do
 
 withGpuRasterUniform ::
   Int ->
+  Int ->
   Double ->
   Double ->
   Double ->
@@ -1242,28 +1265,55 @@ withGpuRasterUniform ::
   [PreparedLineSeg] ->
   (Ptr () -> Int -> IO a) ->
   IO a
-withGpuRasterUniform dim scale0 tx0 ty0 pxRange segs action =
+withGpuRasterUniform dimX dimY scale0 tx0 ty0 pxRange segs action =
   allocaBytes totalBytes $ \ptr -> do
     let pokeF off v = pokeByteOff ptr off (realToFrac v :: CFloat)
     fillBytes ptr 0 totalBytes
-    pokeF 0 (fromIntegral dim)
-    pokeF 4 (fromIntegral dim)
+    pokeF 0 (fromIntegral dimX)
+    pokeF 4 (fromIntegral dimY)
     pokeF 8 scale0
     pokeF 12 tx0
     pokeF 16 ty0
     pokeF 20 pxRange
     pokeF 24 (fromIntegral (length segs))
-    forM_ (zip [0 ..] segs) $ \(ix, seg) -> do
-      let pBase = gpuRasterHeaderBytes + (ix * gpuRasterSegVec4Bytes)
-          mBase = gpuRasterSegMetaOffset + (ix * gpuRasterSegVec4Bytes)
-      pokeF (pBase + 0) (realToFrac seg.x0)
-      pokeF (pBase + 4) (realToFrac seg.y0)
-      pokeF (pBase + 8) (realToFrac seg.x1)
-      pokeF (pBase + 12) (realToFrac seg.y1)
-      pokeF (mBase + 0) (fromIntegral seg.col)
     action (castPtr ptr) totalBytes
   where
-    totalBytes = gpuRasterBytesForSegments (length segs)
+    totalBytes = gpuRasterHeaderBytes
+
+withUploadedSegBuffer :: Ptr SDLGPUDevice -> Ptr SDLGPUCommandBuffer -> [PreparedLineSeg] -> (Ptr SDLGPUBuffer -> IO a) -> IO a
+withUploadedSegBuffer dev cmd segs action = do
+  let segBytes = gpuRasterBytesForSegments (length segs)
+  bracket
+    (withBufferCreateInfo sdlGpuBufferUsageGraphicsStorageRead segBytes (\ci -> requirePtr "SDL_CreateGPUBuffer(segs)" (c_sdlCreateGPUBuffer dev ci)))
+    (c_sdlReleaseGPUBuffer dev)
+    (\segBuf ->
+       bracket
+         (withTransferBufferCreateInfo sdlGpuTransferUsageUpload segBytes (\ci -> requirePtr "SDL_CreateGPUTransferBuffer(seg-upload)" (c_sdlCreateGPUTransferBuffer dev ci)))
+         (c_sdlReleaseGPUTransferBuffer dev)
+         (\tb -> do
+            mapped <- c_sdlMapGPUTransferBuffer dev tb 0
+            when (mapped == nullPtr) (dieSdl "SDL_MapGPUTransferBuffer(seg-upload)")
+            writeSegBytes mapped segs
+            c_sdlUnmapGPUTransferBuffer dev tb
+            cp <- requirePtr "SDL_BeginGPUCopyPass(seg-upload)" (c_sdlBeginGPUCopyPass cmd)
+            withTransferBufferLocation tb 0 $ \srcLoc ->
+              withBufferRegion segBuf 0 segBytes $ \dstRegion ->
+                c_sdlUploadToGPUBuffer cp srcLoc dstRegion 0
+            c_sdlEndGPUCopyPass cp
+            action segBuf
+         )
+    )
+
+writeSegBytes :: Ptr () -> [PreparedLineSeg] -> IO ()
+writeSegBytes base segs =
+  forM_ (zip [0 ..] segs) $ \(ix, seg) -> do
+    let off = ix * gpuRasterSegStrideBytes
+        pokeF rel v = pokeByteOff base (off + rel) (realToFrac v :: CFloat)
+    pokeF 0 seg.x0
+    pokeF 4 seg.y0
+    pokeF 8 seg.x1
+    pokeF 12 seg.y1
+    pokeF 16 (fromIntegral seg.col :: Float)
 
 uniqueGlyphCodes :: String -> [(Char, Either String GlyphCode)]
 uniqueGlyphCodes txt =
@@ -1272,8 +1322,8 @@ uniqueGlyphCodes txt =
       ch /= ' '
   ]
 
-layoutLine :: ImgRGBA8 -> [LineAtom] -> Either String LineBuild
-layoutLine atlasImg atoms =
+layoutLineCore :: [LineAtom] -> Either String ([PlacedGlyph], Double, Double)
+layoutLineCore atoms =
   if null atoms
     then Left "line is empty"
     else do
@@ -1290,12 +1340,7 @@ layoutLine atlasImg atoms =
           case lineBounds placed of
             Nothing ->
               Right
-                LineBuild
-                  { atlas = atlasImg,
-                    glyphs = [],
-                    w = penEnd,
-                    h = 1
-                  }
+                ([], penEnd, 1)
             Just (minX, minY, maxX, maxY) -> do
               let padI = 1 :: Int
                   padD = fromIntegral padI
@@ -1314,13 +1359,31 @@ layoutLine atlasImg atoms =
                         }
                       | (ch, x, y, gW, gH, uv, spr) <- placed
                     ]
-              Right
-                LineBuild
-                  { atlas = atlasImg,
-                    glyphs = shifted,
-                    w = fromIntegral (maxX - minX + (2 * padI)),
-                    h = fromIntegral (maxY - minY + (2 * padI))
-                  }
+              Right (shifted, fromIntegral (maxX - minX + (2 * padI)), fromIntegral (maxY - minY + (2 * padI)))
+
+layoutLineCpu :: ImgRGBA8 -> [LineAtom] -> Either String LineBuild
+layoutLineCpu atlas0 atoms = do
+  (placed, outW, outH) <- layoutLineCore atoms
+  Right
+    LineBuild
+      { atlasImg = Just atlas0,
+        atlasTex = Nothing,
+        glyphs = placed,
+        w = outW,
+        h = outH
+      }
+
+layoutLineGpu :: Ptr SDLGPUTexture -> [LineAtom] -> Either String LineBuild
+layoutLineGpu tex0 atoms = do
+  (placed, outW, outH) <- layoutLineCore atoms
+  Right
+    LineBuild
+      { atlasImg = Nothing,
+        atlasTex = Just tex0,
+        glyphs = placed,
+        w = outW,
+        h = outH
+      }
 
 placeAtom :: Double -> Double -> LineAtom -> (Double, Maybe (Char, Double, Double, Double, Double, UvRect, Double))
 placeAtom baseline pen atom =
@@ -1427,9 +1490,15 @@ withLineTextures :: Ptr SDLGPUDevice -> [LineBuild] -> ([(Ptr SDLGPUTexture, Lin
 withLineTextures dev lines0 action = bracket acquire release action
   where
     acquire = traverse mk lines0
-    mk line = do
-      tex <- uploadTexture dev line.atlas
-      pure (tex, line)
+    mk line =
+      case line.atlasTex of
+        Just tex -> pure (tex, line)
+        Nothing ->
+          case line.atlasImg of
+            Just atlas0 -> do
+              tex <- uploadTexture dev atlas0
+              pure (tex, line)
+            Nothing -> die "line has no atlas image or atlas texture"
     release pairs =
       forM_ pairs (\(tex, _) -> c_sdlReleaseGPUTexture dev tex)
 
@@ -1669,15 +1738,16 @@ withGpuShader dev bundle action =
 withGpuPipeline ::
   Ptr SDLGPUDevice ->
   CInt ->
+  Bool ->
   Ptr SDLGPUShader ->
   Ptr SDLGPUShader ->
   (Ptr SDLGPUGraphicsPipeline -> IO a) ->
   IO a
-withGpuPipeline dev swapFmt vs fs action =
+withGpuPipeline dev swapFmt enableBlend vs fs action =
   bracket create destroy action
   where
     create =
-      withPipelineCreateInfo swapFmt vs fs $ \ci ->
+      withPipelineCreateInfo swapFmt enableBlend vs fs $ \ci ->
         requirePtr "SDL_CreateGPUGraphicsPipeline" (c_sdlCreateGPUGraphicsPipeline dev ci)
     destroy pipe = c_sdlReleaseGPUGraphicsPipeline dev pipe
 
@@ -1723,20 +1793,31 @@ withShaderCreateInfo code stage numSamplers numStorageTextures numStorageBuffers
 
 withPipelineCreateInfo ::
   CInt ->
+  Bool ->
   Ptr SDLGPUShader ->
   Ptr SDLGPUShader ->
   (Ptr () -> IO a) ->
   IO a
-withPipelineCreateInfo swapFmt vs fs action =
+withPipelineCreateInfo swapFmt enableBlend vs fs action =
   withZeroStruct #{size SDL_GPUColorTargetDescription} $ \ctDesc -> do
     pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, format} swapFmt
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.src_color_blendfactor} sdlGpuBlendFactorSrcAlpha
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.dst_color_blendfactor} sdlGpuBlendFactorOneMinusSrcAlpha
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.color_blend_op} sdlGpuBlendOpAdd
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.src_alpha_blendfactor} sdlGpuBlendFactorOne
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.dst_alpha_blendfactor} sdlGpuBlendFactorOneMinusSrcAlpha
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.alpha_blend_op} sdlGpuBlendOpAdd
-    pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.enable_blend} (1 :: CBool)
+    if enableBlend
+      then do
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.src_color_blendfactor} sdlGpuBlendFactorSrcAlpha
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.dst_color_blendfactor} sdlGpuBlendFactorOneMinusSrcAlpha
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.color_blend_op} sdlGpuBlendOpAdd
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.src_alpha_blendfactor} sdlGpuBlendFactorOne
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.dst_alpha_blendfactor} sdlGpuBlendFactorOneMinusSrcAlpha
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.alpha_blend_op} sdlGpuBlendOpAdd
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.enable_blend} (1 :: CBool)
+      else do
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.src_color_blendfactor} sdlGpuBlendFactorOne
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.dst_color_blendfactor} sdlGpuBlendFactorOne
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.color_blend_op} sdlGpuBlendOpAdd
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.src_alpha_blendfactor} sdlGpuBlendFactorOne
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.dst_alpha_blendfactor} sdlGpuBlendFactorOne
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.alpha_blend_op} sdlGpuBlendOpAdd
+        pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.enable_blend} (0 :: CBool)
     pokeByteOff ctDesc #{offset SDL_GPUColorTargetDescription, blend_state.enable_color_write_mask} (0 :: CBool)
     withZeroStruct #{size SDL_GPUGraphicsPipelineCreateInfo} $ \ptr -> do
       pokeByteOff ptr #{offset SDL_GPUGraphicsPipelineCreateInfo, vertex_shader} vs
@@ -1795,6 +1876,14 @@ withTransferBufferCreateInfo usage bytes action =
     pokeByteOff ptr #{offset SDL_GPUTransferBufferCreateInfo, props} (0 :: Word32)
     action ptr
 
+withBufferCreateInfo :: Word32 -> Int -> (Ptr () -> IO a) -> IO a
+withBufferCreateInfo usage bytes action =
+  withZeroStruct #{size SDL_GPUBufferCreateInfo} $ \ptr -> do
+    pokeByteOff ptr #{offset SDL_GPUBufferCreateInfo, usage} usage
+    pokeByteOff ptr #{offset SDL_GPUBufferCreateInfo, size} (fromIntegral bytes :: Word32)
+    pokeByteOff ptr #{offset SDL_GPUBufferCreateInfo, props} (0 :: Word32)
+    action ptr
+
 withTextureTransferInfo :: Ptr SDLGPUTransferBuffer -> Int -> Int -> (Ptr () -> IO a) -> IO a
 withTextureTransferInfo tb w h action =
   withZeroStruct #{size SDL_GPUTextureTransferInfo} $ \ptr -> do
@@ -1802,6 +1891,21 @@ withTextureTransferInfo tb w h action =
     pokeByteOff ptr #{offset SDL_GPUTextureTransferInfo, offset} (0 :: Word32)
     pokeByteOff ptr #{offset SDL_GPUTextureTransferInfo, pixels_per_row} (fromIntegral w :: Word32)
     pokeByteOff ptr #{offset SDL_GPUTextureTransferInfo, rows_per_layer} (fromIntegral h :: Word32)
+    action ptr
+
+withTransferBufferLocation :: Ptr SDLGPUTransferBuffer -> Int -> (Ptr () -> IO a) -> IO a
+withTransferBufferLocation tb off action =
+  withZeroStruct #{size SDL_GPUTransferBufferLocation} $ \ptr -> do
+    pokeByteOff ptr #{offset SDL_GPUTransferBufferLocation, transfer_buffer} tb
+    pokeByteOff ptr #{offset SDL_GPUTransferBufferLocation, offset} (fromIntegral off :: Word32)
+    action ptr
+
+withBufferRegion :: Ptr SDLGPUBuffer -> Int -> Int -> (Ptr () -> IO a) -> IO a
+withBufferRegion buf off bytes action =
+  withZeroStruct #{size SDL_GPUBufferRegion} $ \ptr -> do
+    pokeByteOff ptr #{offset SDL_GPUBufferRegion, buffer} buf
+    pokeByteOff ptr #{offset SDL_GPUBufferRegion, offset} (fromIntegral off :: Word32)
+    pokeByteOff ptr #{offset SDL_GPUBufferRegion, size} (fromIntegral bytes :: Word32)
     action ptr
 
 withTextureRegion :: Ptr SDLGPUTexture -> Int -> Int -> (Ptr () -> IO a) -> IO a
@@ -2129,16 +2233,22 @@ genFragmentShaderFlat :: GpuShader
 genFragmentShaderFlat =
   mkGpuShader
     [weslShader|
-const MAX_SEGS: u32 = 120u;
-
 struct FsU {
   meta0: vec4<f32>, // dimX, dimY, scale, tx
   meta1: vec4<f32>, // ty, pxRange, segCount, pad
-  p0p1: array<vec4<f32>, MAX_SEGS>,
-  segMeta: array<vec4<f32>, MAX_SEGS>,
+};
+
+struct Seg {
+  p0p1: vec4<f32>,
+  meta: vec4<f32>, // meta.x stores edge color mask in [0..7].
+};
+
+struct SegBuf {
+  data: array<Seg>,
 };
 
 @group(3) @binding(0) var<uniform> u: FsU;
+@group(2) @binding(0) var<storage, read> segBuf: SegBuf;
 
 fn segDistance(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> f32 {
   let v = p1 - p0;
@@ -2174,7 +2284,7 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let tx = u.meta0.w;
   let ty = u.meta1.x;
   let pxRange = max(1.0, u.meta1.y);
-  let segCount = min(MAX_SEGS, u32(u.meta1.z + 0.5));
+  let segCount = u32(u.meta1.z + 0.5);
 
   let px = vec2<f32>(uv.x * dimX, uv.y * dimY);
   let glyph = vec2<f32>(
@@ -2189,11 +2299,12 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   var winding = 0;
 
   for (var i: u32 = 0u; i < segCount; i = i + 1u) {
-    let p = u.p0p1[i];
+    let seg = segBuf.data[i];
+    let p = seg.p0p1;
     let p0 = p.xy;
     let p1 = p.zw;
     let d = segDistance(glyph, p0, p1);
-    let col = u32(u.segMeta[i].x + 0.5);
+    let col = u32(seg.meta.x + 0.5);
     dA = min(dA, d);
     if ((col & 1u) != 0u) {
       dR = min(dR, d);
@@ -2527,6 +2638,66 @@ fn main(
   let ld = sampleCoverage(uvCenter - pxU + pxV, uvLo, uvHi, halfTexel, range);
   let rd = sampleCoverage(uvCenter + pxU + pxV, uvLo, uvHi, halfTexel, range);
   let opacity = clamp(healCoverage(baseOpacity, l, r, u, d, lu, ru, ld, rd), 0.0, 1.0);
+  let fg = vec3<f32>(0.92, 0.94, 0.98);
+  return vec4<f32>(fg, opacity);
+}
+|]
+
+fragmentShaderNoHeal :: GpuShader
+fragmentShaderNoHeal =
+  mkGpuShader
+    [weslShader|
+@group(2) @binding(0) var tx: texture_2d<f32>;
+@group(2) @binding(1) var smp: sampler;
+
+fn median3(a: f32, b: f32, c: f32) -> f32 {
+  return max(min(a, b), min(max(a, b), c));
+}
+
+fn screenPxRange(uv: vec2<f32>, pxRange: f32) -> f32 {
+  let dims = max(vec2<f32>(textureDimensions(tx)), vec2<f32>(1.0, 1.0));
+  let unitRange = vec2<f32>(pxRange, pxRange) / dims;
+  let screenTexSize = vec2<f32>(1.0, 1.0) / max(fwidth(uv), vec2<f32>(1.0e-6, 1.0e-6));
+  return max(0.5 * dot(unitRange, screenTexSize), 1.0);
+}
+
+fn coverageFromMtsdf(s: vec4<f32>, range: f32) -> f32 {
+  let msdfSd = median3(s.r, s.g, s.b) - 0.5;
+  let sdfSd = s.a - 0.5;
+  let msdfCov = clamp((range * msdfSd) + 0.5, 0.0, 1.0);
+  let sdfCov = clamp((range * sdfSd) + 0.5, 0.0, 1.0);
+  if (abs(msdfSd - sdfSd) > 0.0) {
+    return max(msdfCov, sdfCov);
+  }
+  return msdfCov;
+}
+
+fn sampleCoverage(uv: vec2<f32>, uvLo: vec2<f32>, uvHi: vec2<f32>, halfTexel: vec2<f32>, range: f32) -> f32 {
+  let uvSafe = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
+  let s = textureSample(tx, smp, uvSafe);
+  return coverageFromMtsdf(s, range);
+}
+
+@fragment
+fn main(
+  @location(0) uv: vec2<f32>,
+  @location(1) sprIn: f32,
+  @location(2) uvLo: vec2<f32>,
+  @location(3) uvHi: vec2<f32>
+) -> @location(0) vec4<f32> {
+  let pxRange = max(1.0, sprIn);
+  let dims = max(vec2<f32>(textureDimensions(tx)), vec2<f32>(1.0, 1.0));
+  let texel = vec2<f32>(1.0, 1.0) / dims;
+  let halfTexel = 0.5 * texel;
+  let uvCenter = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
+  let range = screenPxRange(uvCenter, pxRange);
+  let du = 0.25 * dpdx(uvCenter);
+  let dv = 0.25 * dpdy(uvCenter);
+  let c0 = sampleCoverage(uvCenter - du - dv, uvLo, uvHi, halfTexel, range);
+  let c1 = sampleCoverage(uvCenter + du - dv, uvLo, uvHi, halfTexel, range);
+  let c2 = sampleCoverage(uvCenter - du + dv, uvLo, uvHi, halfTexel, range);
+  let c3 = sampleCoverage(uvCenter + du + dv, uvLo, uvHi, halfTexel, range);
+  let opacity = clamp(0.25 * (c0 + c1 + c2 + c3), 0.0, 1.0);
   let fg = vec3<f32>(0.92, 0.94, 0.98);
   return vec4<f32>(fg, opacity);
 }
