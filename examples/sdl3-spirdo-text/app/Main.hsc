@@ -662,6 +662,7 @@ main = do
   genShaderRaw <- lookupEnv "MASDIFF_SDL_GEN_SHADER"
   genShaderMode <- either die pure (parseGenFragShaderMode genShaderRaw)
   pipelineProbe <- readBoolEnvDefault "MASDIFF_SDL_PIPELINE_PROBE" False
+  useGpuBatch <- readBoolEnvDefault "MASDIFF_SDL_GPU_BATCH" False
   maxSegsRaw <- readPositiveIntEnvDefault "MASDIFF_SDL_GEN_MAX_SEGS" gpuRasterShaderMaxSegs
   maxPushBytes <- readPositiveIntEnvDefault "MASDIFF_SDL_GEN_MAX_PUSH_BYTES" gpuRasterDefaultMaxPushBytes
   let rasterLimits =
@@ -674,6 +675,8 @@ main = do
         <> show rasterMode
         <> if strictGpuGeneration then " (strict)" else ""
     )
+  when (rasterMode == RasterModeGpu) $
+    putStrLn ("SDL generation batching: " <> if useGpuBatch then "enabled" else "disabled")
   logDbg debugLog ("scene preset: " <> show scenePreset)
   capturePathRaw <- lookupEnv "MASDIFF_SDL_CAPTURE"
   metaPathRaw <- lookupEnv "MASDIFF_SDL_META"
@@ -740,7 +743,7 @@ main = do
                             RasterModeGpu -> gpuRasterIO debugLog strictGpuGeneration rasterLimits gpuStatsRef gpuCacheRef dev gpipe
                             RasterModeCpu -> cpuRasterIO
                     logDbg debugLog "building scene"
-                    scene <- buildScene rasterMode (if rasterMode == RasterModeGpu then Just gpuBatchCtx else Nothing) raster scenePreset
+                    scene <- buildScene rasterMode useGpuBatch (if rasterMode == RasterModeGpu then Just gpuBatchCtx else Nothing) raster scenePreset
                     when (rasterMode == RasterModeGpu) $ do
                       gpuStats <- readIORef gpuStatsRef
                       putStrLn ("GPU generation stats: " <> renderGpuRasterStats gpuStats)
@@ -768,8 +771,8 @@ main = do
                                 Just path -> writeDrawMeta path draws
                               runLoop win dev pipe smp draws swapFmt 8.0 capturePath
 
-buildScene :: RasterMode -> Maybe GpuBatchCtx -> RasterPreparedIO -> ScenePreset -> IO [LineBuild]
-buildScene rasterMode gpuBatch raster scenePreset = do
+buildScene :: RasterMode -> Bool -> Maybe GpuBatchCtx -> RasterPreparedIO -> ScenePreset -> IO [LineBuild]
+buildScene rasterMode useGpuBatch gpuBatch raster scenePreset = do
   singleEm <- readPositiveDoubleEnvDefault "MASDIFF_SDL_SINGLE_EM" 640.0
   overlapSupport <- readBoolEnvDefault "MASDIFF_SDL_OVLP" False
   dim <- either (die . ("invalid dim: " <>)) pure (mkDim 192)
@@ -817,19 +820,19 @@ buildScene rasterMode gpuBatch raster scenePreset = do
             [ LineSpec {src = varLight, txt = [ch], em = singleEm} ]
           SceneSingleVarBold ch ->
             [ LineSpec {src = varBold, txt = [ch], em = singleEm} ]
-  built <- traverse (buildLine rasterMode gpuBatch raster cfg atlasCfg) specs
+  built <- traverse (buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg) specs
   either (die . ("scene build failed: " <>)) pure (sequence built)
 
-buildLine :: RasterMode -> Maybe GpuBatchCtx -> RasterPreparedIO -> GenCfg -> AtlasCfg -> LineSpec -> IO (Either String LineBuild)
-buildLine rasterMode gpuBatch raster cfg atlasCfg spec = do
+buildLine :: RasterMode -> Bool -> Maybe GpuBatchCtx -> RasterPreparedIO -> GenCfg -> AtlasCfg -> LineSpec -> IO (Either String LineBuild)
+buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
   let atlasCodes = uniqueGlyphCodes spec.txt
   let glyphList = snd <$> atlasCodes
   case sequence glyphList of
     Left err -> pure (Left err)
     Right glyphs -> do
       putStrLn ("[sdl3] buildLine: txt=\"" <> spec.txt <> "\" glyphs=" <> show (length glyphs) <> " em=" <> show spec.em)
-      case (rasterMode, gpuBatch) of
-        (RasterModeGpu, Just gpuCtx) -> buildLineGpu gpuCtx cfg spec glyphs
+      case (rasterMode, useGpuBatch, gpuBatch) of
+        (RasterModeGpu, True, Just gpuCtx) -> buildLineGpu gpuCtx cfg spec glyphs
         _ -> do
           atlasResult <- generateAtlasWithRasterIO 1 raster atlasCfg cfg spec.src glyphs
           case atlasResult of
