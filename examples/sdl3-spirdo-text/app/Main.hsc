@@ -662,7 +662,8 @@ main = do
   genShaderRaw <- lookupEnv "MASDIFF_SDL_GEN_SHADER"
   genShaderMode <- either die pure (parseGenFragShaderMode genShaderRaw)
   pipelineProbe <- readBoolEnvDefault "MASDIFF_SDL_PIPELINE_PROBE" False
-  useGpuBatch <- readBoolEnvDefault "MASDIFF_SDL_GPU_BATCH" False
+  requestedGpuBatch <- readBoolEnvDefault "MASDIFF_SDL_GPU_BATCH" False
+  let useGpuBatch = False
   maxSegsRaw <- readPositiveIntEnvDefault "MASDIFF_SDL_GEN_MAX_SEGS" gpuRasterShaderMaxSegs
   maxPushBytes <- readPositiveIntEnvDefault "MASDIFF_SDL_GEN_MAX_PUSH_BYTES" gpuRasterDefaultMaxPushBytes
   let rasterLimits =
@@ -675,6 +676,8 @@ main = do
         <> show rasterMode
         <> if strictGpuGeneration then " (strict)" else ""
     )
+  when (rasterMode == RasterModeGpu && requestedGpuBatch) $
+    putStrLn "SDL generation batching requested but disabled (known rendering regressions)"
   when (rasterMode == RasterModeGpu) $
     putStrLn ("SDL generation batching: " <> if useGpuBatch then "enabled" else "disabled")
   logDbg debugLog ("scene preset: " <> show scenePreset)
@@ -837,17 +840,28 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
           atlasResult <- generateAtlasWithRasterIO 1 raster atlasCfg cfg spec.src glyphs
           case atlasResult of
             Left err -> pure (Left err)
-            Right atlas -> pure (assembleAtlas atlas)
+            Right atlas -> assembleAtlasIO atlas
   where
-    assembleAtlas :: Atlas -> Either String LineBuild
-    assembleAtlas atlas =
+    assembleAtlasIO :: Atlas -> IO (Either String LineBuild)
+    assembleAtlasIO atlas =
       case atlas.pages of
-        [] -> Left "atlas build produced no pages"
+        [] -> pure (Left "atlas build produced no pages")
         [page0] -> do
-          runMap <- runsByEntries page0.img.w page0.img.h (toEntries atlas.entries)
-          atoms <- lineAtoms runMap
-          layoutLine page0.img atoms
-        _ -> Left "line atlas spilled to multiple pages; increase atlas size for this demo"
+          dumpAtlasMaybe page0.img
+          pure $ do
+            runMap <- runsByEntries page0.img.w page0.img.h (toEntries atlas.entries)
+            atoms <- lineAtoms runMap
+            layoutLine page0.img atoms
+        _ -> pure (Left "line atlas spilled to multiple pages; increase atlas size for this demo")
+
+    dumpAtlasMaybe :: ImgRGBA8 -> IO ()
+    dumpAtlasMaybe img = do
+      dumpAtlasPath <- lookupEnv "MASDIFF_SDL_DUMP_LINE_ATLAS"
+      case dumpAtlasPath of
+        Just p | not (null p) -> do
+          _ <- writePngRGBA8File p img
+          pure ()
+        _ -> pure ()
 
     toEntries :: [AtlasEntry] -> [(GlyphCode, AtlasRect, Metrics)]
     toEntries entries = [(e.glyph, e.rect, e.metrics) | e <- entries]
@@ -1097,7 +1111,7 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
     metrics = metricsPrepared cfg prepared
 
 gpuRasterShaderMaxSegs :: Int
-gpuRasterShaderMaxSegs = 512
+gpuRasterShaderMaxSegs = 120
 
 gpuRasterDefaultMaxPushBytes :: Int
 -- Keep this aligned with payload size for gpuRasterShaderMaxSegs.
@@ -1106,11 +1120,14 @@ gpuRasterDefaultMaxPushBytes = gpuRasterBytesForSegments gpuRasterShaderMaxSegs
 gpuRasterHeaderBytes :: Int
 gpuRasterHeaderBytes = 32
 
-gpuRasterSegStrideBytes :: Int
-gpuRasterSegStrideBytes = 32
+gpuRasterSegVec4Bytes :: Int
+gpuRasterSegVec4Bytes = 16
+
+gpuRasterSegMetaOffset :: Int
+gpuRasterSegMetaOffset = gpuRasterHeaderBytes + (gpuRasterShaderMaxSegs * gpuRasterSegVec4Bytes)
 
 gpuRasterBytesForSegments :: Int -> Int
-gpuRasterBytesForSegments n = gpuRasterHeaderBytes + (n * gpuRasterSegStrideBytes)
+gpuRasterBytesForSegments _n = gpuRasterSegMetaOffset + (gpuRasterShaderMaxSegs * gpuRasterSegVec4Bytes)
 
 rasterPreparedGpuImage ::
   Ptr SDLGPUDevice ->
@@ -1237,12 +1254,13 @@ withGpuRasterUniform dim scale0 tx0 ty0 pxRange segs action =
     pokeF 20 pxRange
     pokeF 24 (fromIntegral (length segs))
     forM_ (zip [0 ..] segs) $ \(ix, seg) -> do
-      let base = gpuRasterHeaderBytes + (ix * gpuRasterSegStrideBytes)
-      pokeF (base + 0) (realToFrac seg.x0)
-      pokeF (base + 4) (realToFrac seg.y0)
-      pokeF (base + 8) (realToFrac seg.x1)
-      pokeF (base + 12) (realToFrac seg.y1)
-      pokeF (base + 16) (fromIntegral seg.col)
+      let pBase = gpuRasterHeaderBytes + (ix * gpuRasterSegVec4Bytes)
+          mBase = gpuRasterSegMetaOffset + (ix * gpuRasterSegVec4Bytes)
+      pokeF (pBase + 0) (realToFrac seg.x0)
+      pokeF (pBase + 4) (realToFrac seg.y0)
+      pokeF (pBase + 8) (realToFrac seg.x1)
+      pokeF (pBase + 12) (realToFrac seg.y1)
+      pokeF (mBase + 0) (fromIntegral seg.col)
     action (castPtr ptr) totalBytes
   where
     totalBytes = gpuRasterBytesForSegments (length segs)
@@ -2070,6 +2088,7 @@ genVertexShader =
     [weslShader|
 struct VsOut {
   @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
 };
 
 fn corner(vid: u32) -> vec2<f32> {
@@ -2091,6 +2110,7 @@ fn main(@builtin(vertex_index) vid: u32) -> VsOut {
   let ndc = vec2<f32>((c.x * 2.0) - 1.0, 1.0 - (c.y * 2.0));
   var out: VsOut;
   out.pos = vec4<f32>(ndc, 0.0, 1.0);
+  out.uv = c;
   return out;
 }
 	|]
@@ -2109,7 +2129,7 @@ genFragmentShaderFlat :: GpuShader
 genFragmentShaderFlat =
   mkGpuShader
     [weslShader|
-const MAX_SEGS: u32 = 512u;
+const MAX_SEGS: u32 = 120u;
 
 struct FsU {
   meta0: vec4<f32>, // dimX, dimY, scale, tx
@@ -2147,7 +2167,8 @@ fn windingStep(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
 }
 
 @fragment
-fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+  let dimX = max(1.0, u.meta0.x);
   let dimY = max(1.0, u.meta0.y);
   let scale = max(1.0e-6, u.meta0.z);
   let tx = u.meta0.w;
@@ -2155,7 +2176,7 @@ fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let pxRange = max(1.0, u.meta1.y);
   let segCount = min(MAX_SEGS, u32(u.meta1.z + 0.5));
 
-  let px = pos.xy;
+  let px = vec2<f32>(uv.x * dimX, uv.y * dimY);
   let glyph = vec2<f32>(
     (px.x / scale) - tx,
     ((dimY - px.y) / scale) - ty
@@ -2196,7 +2217,7 @@ fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     dB = dA;
   }
 
-  let sign = select(1.0, -1.0, winding != 0);
+  let sign = select(-1.0, 1.0, winding != 0);
   let r = clamp(0.5 + ((scale * sign * dR) / pxRange), 0.0, 1.0);
   let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
   let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
@@ -2209,7 +2230,7 @@ genFragmentShader :: GpuShader
 genFragmentShader =
   mkGpuShader
     [weslShader|
-const MAX_SEGS: u32 = 512u;
+const MAX_SEGS: u32 = 120u;
 
 struct Seg {
   p0p1: vec4<f32>,
@@ -2251,7 +2272,7 @@ fn windingStep(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
 }
 
 @fragment
-fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let dimX = max(1.0, u.meta0.x);
   let dimY = max(1.0, u.meta0.y);
   let scale = max(1.0e-6, u.meta0.z);
@@ -2260,7 +2281,7 @@ fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let pxRange = max(1.0, u.meta1.y);
   let segCount = min(MAX_SEGS, u32(u.meta1.z + 0.5));
 
-  let px = pos.xy;
+  let px = vec2<f32>(uv.x * dimX, uv.y * dimY);
   let glyph = vec2<f32>(
     (px.x / scale) - tx,
     ((dimY - px.y) / scale) - ty
@@ -2301,7 +2322,7 @@ fn main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     dB = dA;
   }
 
-  let sign = select(1.0, -1.0, winding != 0);
+  let sign = select(-1.0, 1.0, winding != 0);
   let r = clamp(0.5 + ((scale * sign * dR) / pxRange), 0.0, 1.0);
   let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
   let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
