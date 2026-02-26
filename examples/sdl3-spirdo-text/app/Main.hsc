@@ -38,6 +38,7 @@ import MSDF.Native
     metricsPrepared,
     prepareGlyphBatchNativeIO,
     preparedLineSegs,
+    requiresNonZeroWinding,
     rasterPreparedCpu,
   )
 import MSDF.Types
@@ -387,7 +388,8 @@ data GpuRasterCacheKey = GpuRasterCacheKey
     sc :: !Double,
     tx :: !Double,
     ty :: !Double,
-    segs :: ![PreparedLineSeg]
+    selectorSegs :: ![PreparedLineSeg],
+    windingSegs :: ![PreparedLineSeg]
   }
   deriving stock (Eq, Show)
 
@@ -409,7 +411,8 @@ data GpuAtlasDraw = GpuAtlasDraw
     scale :: !Double,
     tx :: !Double,
     ty :: !Double,
-    segs :: ![PreparedLineSeg]
+    selectorSegs :: ![PreparedLineSeg],
+    windingSegs :: ![PreparedLineSeg]
   }
 
 foreign import ccall unsafe "SDL_Init"
@@ -573,6 +576,12 @@ fontPathRegular = "../../assets/Inter/static/Inter_24pt-Regular.ttf"
 fontPathVar :: FilePath
 fontPathVar = "../../assets/Inter/Inter-VariableFont_opsz,wght.ttf"
 
+fontPathRegularRoboto :: FilePath
+fontPathRegularRoboto = "../../assets/roboto-flex-source/RobotoFlex-VF.ttf"
+
+fontPathVarRoboto :: FilePath
+fontPathVarRoboto = "../../assets/roboto-flex-source/RobotoFlex-VF.ttf"
+
 winW, winH :: Int
 winW = 1024
 winH = 1024
@@ -677,7 +686,7 @@ main = do
   rasterMode <- either die pure (parseRasterMode rasterModeRaw)
   strictGpuGeneration <- readBoolEnvDefault "MASDIFF_SDL_GEN_STRICT" False
   debugLog <- readBoolEnvDefault "MASDIFF_SDL_DEBUG" False
-  presentHeal <- readBoolEnvDefault "MASDIFF_SDL_PRESENT_HEAL" True
+  presentHeal <- readBoolEnvDefault "MASDIFF_SDL_PRESENT_HEAL" False
   genShaderRaw <- lookupEnv "MASDIFF_SDL_GEN_SHADER"
   genShaderMode <- either die pure (parseGenFragShaderMode genShaderRaw)
   pipelineProbe <- readBoolEnvDefault "MASDIFF_SDL_PIPELINE_PROBE" False
@@ -795,9 +804,12 @@ main = do
 buildScene :: RasterMode -> Bool -> Maybe GpuBatchCtx -> RasterPreparedIO -> ScenePreset -> IO [LineBuild]
 buildScene rasterMode useGpuBatch gpuBatch raster scenePreset = do
   singleEm <- readPositiveDoubleEnvDefault "MASDIFF_SDL_SINGLE_EM" 640.0
-  overlapSupport <- readBoolEnvDefault "MASDIFF_SDL_OVLP" False
-  dim <- either (die . ("invalid dim: " <>)) pure (mkDim 192)
-  pxr <- either (die . ("invalid px range: " <>)) pure (mkPxRange 6.0)
+  fontPreset <- readFontPresetEnv
+  overlapSupport <- readBoolEnvDefault "MASDIFF_SDL_OVLP" True
+  dimRaw <- readPositiveIntEnvDefault "MASDIFF_SDL_DIM" 256
+  pxRangeRaw <- readPositiveDoubleEnvDefault "MASDIFF_SDL_PXRANGE" 6.0
+  dim <- either (die . ("invalid dim: " <>)) pure (mkDim dimRaw)
+  pxr <- either (die . ("invalid px range: " <>)) pure (mkPxRange pxRangeRaw)
   atlasCfg <- either (die . ("invalid atlas cfg: " <>)) pure (mkAtlasCfg 2048 2048 12)
   let cfg =
         GenCfg
@@ -808,10 +820,18 @@ buildScene rasterMode useGpuBatch gpuBatch raster scenePreset = do
             autoframe = True,
             ovlp = overlapSupport
           }
-  let regular = FontFile {path = fontPathRegular}
+  let regularPath =
+        case fontPreset of
+          FontPresetInter -> fontPathRegular
+          FontPresetRoboto -> fontPathRegularRoboto
+      varPath =
+        case fontPreset of
+          FontPresetInter -> fontPathVar
+          FontPresetRoboto -> fontPathVarRoboto
+  let regular = FontFile {path = regularPath}
   let varLight =
         VarFontFile
-          { path = fontPathVar,
+          { path = varPath,
             axes =
               Map.fromList
                 [ (AxisTag (T.pack "wght"), AxisVal 300),
@@ -820,7 +840,7 @@ buildScene rasterMode useGpuBatch gpuBatch raster scenePreset = do
           }
   let varBold =
         VarFontFile
-          { path = fontPathVar,
+          { path = varPath,
             axes =
               Map.fromList
                 [ (AxisTag (T.pack "wght"), AxisVal 900),
@@ -866,8 +886,10 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
         [] -> pure (Left "atlas build produced no pages")
         [page0] -> do
           dumpAtlasMaybe page0.img
+          uvInsetRaw <- readNonNegativeDoubleEnvDefault "MASDIFF_SDL_UV_INSET" 0.25
+          let uvInset = min 0.5 uvInsetRaw
           pure $ do
-            runMap <- runsByEntries page0.img.w page0.img.h (toEntries atlas.entries)
+            runMap <- runsByEntries uvInset page0.img.w page0.img.h (toEntries atlas.entries)
             atoms <- lineAtoms runMap
             layoutLineCpu page0.img atoms
         _ -> pure (Left "line atlas spilled to multiple pages; increase atlas size for this demo")
@@ -884,8 +906,8 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
     toEntries :: [AtlasEntry] -> [(GlyphCode, AtlasRect, Metrics)]
     toEntries entries = [(e.glyph, e.rect, e.metrics) | e <- entries]
 
-    runsByEntries :: Int -> Int -> [(GlyphCode, AtlasRect, Metrics)] -> Either String (IM.IntMap GlyphRun)
-    runsByEntries texWi texHi entries =
+    runsByEntries :: Double -> Int -> Int -> [(GlyphCode, AtlasRect, Metrics)] -> Either String (IM.IntMap GlyphRun)
+    runsByEntries uvInset0 texWi texHi entries =
       foldM step IM.empty entries
       where
         texW = fromIntegral texWi
@@ -904,8 +926,8 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
                   cropY0 = 0
                   cW = rect0.w
                   cH = rect0.h
-                  insetX = if cW > 1 then 0.5 else 0.0
-                  insetY = if cH > 1 then 0.5 else 0.0
+                  insetX = if cW > 1 then uvInset0 else 0.0
+                  insetY = if cH > 1 then uvInset0 else 0.0
                   ox0 = (sc0 * tx0) - 0.5
                   oy0 = (gh - (sc0 * ty0)) - 0.5
                   desc0 = max 0 ((-ymin) * sc0)
@@ -971,6 +993,7 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
       case sequence prepared of
         Left genErr -> pure (Left ("glyph prepare failed: " <> show genErr))
         Right preparedGlyphs -> do
+          let windingCfg = cfg0 {ovlp = False}
           let atlasW = 2048
               atlasH = 2048
               atlasPad = 12
@@ -982,7 +1005,14 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
                     col = ix `rem` cols
                     x0 = (col * cell) + atlasPad
                     y0 = (row * cell) + atlasPad
-                 in (g, p, AtlasRect {x = x0, y = y0, w = dimI, h = dimI}, metricsPrepared cfg0 p, preparedLineSegs cfg0 p)
+                 in
+                  ( g,
+                    p,
+                    AtlasRect {x = x0, y = y0, w = dimI, h = dimI},
+                    metricsPrepared cfg0 p,
+                    preparedLineSegs cfg0 p,
+                    preparedLineSegs windingCfg p
+                  )
               placed = zipWith3 placeOne [0 ..] glyphs preparedGlyphs
           case firstOverflow placed atlasW atlasH of
             Just msg -> pure (Left msg)
@@ -991,15 +1021,17 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
               case atlasResult of
                 Left err -> pure (Left err)
                 Right atlasTex0 -> do
-                  let entries = [(g, r, mtr) | (g, _, r, mtr, _) <- placed]
+                  uvInsetRaw <- readNonNegativeDoubleEnvDefault "MASDIFF_SDL_UV_INSET" 0.25
+                  let uvInset = min 0.5 uvInsetRaw
+                  let entries = [(g, r, mtr) | (g, _, r, mtr, _, _) <- placed]
                   pure $ do
-                    runMap <- runsByEntries atlasW atlasH entries
+                    runMap <- runsByEntries uvInset atlasW atlasH entries
                     atoms <- lineAtoms runMap
                     layoutLineGpu atlasTex0 atoms
 
-    firstOverflow :: [(GlyphCode, PreparedGlyph, AtlasRect, Metrics, [PreparedLineSeg])] -> Int -> Int -> Maybe String
+    firstOverflow :: [(GlyphCode, PreparedGlyph, AtlasRect, Metrics, [PreparedLineSeg], [PreparedLineSeg])] -> Int -> Int -> Maybe String
     firstOverflow placed atlasW atlasH =
-      case [rect0 | (_, _, rect0, _, _) <- placed, rect0.x + rect0.w > atlasW || rect0.y + rect0.h > atlasH] of
+      case [rect0 | (_, _, rect0, _, _, _) <- placed, rect0.x + rect0.w > atlasW || rect0.y + rect0.h > atlasH] of
         [] -> Nothing
         _ -> Just ("line atlas overflow: increase atlas size for text \"" <> spec.txt <> "\"")
 
@@ -1064,9 +1096,13 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
           else fallback
   case (metrics.scale, metrics.translate) of
     (Just scale0, Just (tx0, ty0)) -> do
-      let segs = preparedLineSegs cfg prepared
-          segCount = length segs
-          segBytes = gpuRasterBytesForSegments segCount
+      let selectorSegs0 = preparedLineSegs cfg prepared
+          windingCfg = cfg {ovlp = False}
+          windingSegs0 = preparedLineSegs windingCfg prepared
+          selectorSegCount = length selectorSegs0
+          windingSegCount = length windingSegs0
+          selectorSegBytes = gpuRasterBytesForSegments selectorSegCount
+          windingSegBytes = gpuRasterBytesForSegments windingSegCount
           cacheKey =
             GpuRasterCacheKey
               { dim = unDim cfg.dim,
@@ -1074,9 +1110,22 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
                 sc = scale0,
                 tx = tx0,
                 ty = ty0,
-                segs = segs
+                selectorSegs = selectorSegs0,
+                windingSegs = windingSegs0
               }
-      logDbg debugLog ("gpuRaster: segs=" <> show segCount <> " bytes=" <> show segBytes <> " dim=" <> show (unDim cfg.dim))
+      logDbg
+        debugLog
+        ( "gpuRaster: selector-segs="
+            <> show selectorSegCount
+            <> " winding-segs="
+            <> show windingSegCount
+            <> " selector-bytes="
+            <> show selectorSegBytes
+            <> " winding-bytes="
+            <> show windingSegBytes
+            <> " dim="
+            <> show (unDim cfg.dim)
+        )
       cache <- readIORef cacheRef
       case find (\(k, _) -> k == cacheKey) cache of
         Just (_, cachedOut) -> do
@@ -1084,14 +1133,23 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
           modifyIORef' statsRef (\stats -> stats {cacheHit = stats.cacheHit + 1})
           pure (Right cachedOut)
         Nothing ->
-          if null segs || segCount > limits.maxSegs || segBytes > limits.maxPushBytes
+          if null selectorSegs0
+            || null windingSegs0
+            || selectorSegCount > limits.maxSegs
+            || windingSegCount > limits.maxSegs
+            || selectorSegBytes > limits.maxPushBytes
+            || windingSegBytes > limits.maxPushBytes
         then
           failOrFallback
             ( ExecFailed
-                ( "GPU raster segment budget exceeded (segments="
-                    <> show segCount
-                    <> ", bytes="
-                    <> show segBytes
+                ( "GPU raster segment budget exceeded (selector-segments="
+                    <> show selectorSegCount
+                    <> ", winding-segments="
+                    <> show windingSegCount
+                    <> ", selector-bytes="
+                    <> show selectorSegBytes
+                    <> ", winding-bytes="
+                    <> show windingSegBytes
                     <> ", max-segments="
                     <> show limits.maxSegs
                     <> ", max-bytes="
@@ -1101,7 +1159,7 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
             )
             (\stats -> stats {segOverflow = stats.segOverflow + 1})
           else do
-            rendered <- try (rasterPreparedGpuImage dev genPipe (unDim cfg.dim) scale0 tx0 ty0 (unPxRange cfg.pxr) segs) :: IO (Either SomeException (Either String ImgRGBA8))
+            rendered <- try (rasterPreparedGpuImage dev genPipe (unDim cfg.dim) scale0 tx0 ty0 (unPxRange cfg.pxr) selectorSegs0 windingSegs0) :: IO (Either SomeException (Either String ImgRGBA8))
             case rendered of
               Left ex ->
                 failOrFallback
@@ -1136,7 +1194,7 @@ gpuRasterDefaultMaxPushBytes :: Int
 gpuRasterDefaultMaxPushBytes = gpuRasterBytesForSegments gpuRasterShaderMaxSegs
 
 gpuRasterHeaderBytes :: Int
-gpuRasterHeaderBytes = 32
+gpuRasterHeaderBytes = 48
 
 gpuRasterSegStrideBytes :: Int
 gpuRasterSegStrideBytes = 32
@@ -1153,25 +1211,27 @@ rasterPreparedGpuImage ::
   Double ->
   Double ->
   [PreparedLineSeg] ->
+  [PreparedLineSeg] ->
   IO (Either String ImgRGBA8)
-rasterPreparedGpuImage dev genPipe dim scale0 tx0 ty0 pxr0 segs0 = do
+rasterPreparedGpuImage dev genPipe dim scale0 tx0 ty0 pxr0 selectorSegs0 windingSegs0 = do
   let usage = sdlGpuTextureUsageSampler .|. sdlGpuTextureUsageColorTarget
       clear = FColor 0 0 0 0
-      segs = segs0
   bracket
     (withTextureCreateInfoUsage sdlGpuTextureFormatRgba8Unorm usage dim dim (\ci -> requirePtr "SDL_CreateGPUTexture(gen)" (c_sdlCreateGPUTexture dev ci)))
     (c_sdlReleaseGPUTexture dev)
     (\tex -> do
        cmd <- requirePtr "SDL_AcquireGPUCommandBuffer(gen)" (c_sdlAcquireGPUCommandBuffer dev)
-       withUploadedSegBuffer dev cmd segs $ \segBuf -> do
-         withColorTargetInfo tex clear $ \ctInfo -> do
-           rp <- requirePtr "SDL_BeginGPURenderPass(gen)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
-           c_sdlBindGPUGraphicsPipeline rp genPipe
-           with segBuf $ \bufPtr -> c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 1
-           withGpuRasterUniform dim dim scale0 tx0 ty0 pxr0 segs $ \uPtr uSize ->
-             c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
-           c_sdlDrawGPUPrimitives rp 6 1 0 0
-           c_sdlEndGPURenderPass rp
+       withUploadedSegBuffer dev cmd selectorSegs0 $ \selectorSegBuf ->
+         withUploadedSegBuffer dev cmd windingSegs0 $ \windingSegBuf -> do
+           withColorTargetInfo tex clear $ \ctInfo -> do
+             rp <- requirePtr "SDL_BeginGPURenderPass(gen)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
+             c_sdlBindGPUGraphicsPipeline rp genPipe
+             withArray [selectorSegBuf, windingSegBuf] $ \bufPtr ->
+               c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 2
+             withGpuRasterUniform dim dim scale0 tx0 ty0 pxr0 (length selectorSegs0) (length windingSegs0) (requiresNonZeroWinding windingSegs0) $ \uPtr uSize ->
+               c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
+             c_sdlDrawGPUPrimitives rp 6 1 0 0
+             c_sdlEndGPURenderPass rp
        bytes <- downloadSwapTexture dev cmd tex dim dim
        pure (mkImgRGBA8 dim dim bytes)
     )
@@ -1181,7 +1241,7 @@ rasterPreparedGpuAtlasTexture ::
   GenCfg ->
   Int ->
   Int ->
-  [(GlyphCode, PreparedGlyph, AtlasRect, Metrics, [PreparedLineSeg])] ->
+  [(GlyphCode, PreparedGlyph, AtlasRect, Metrics, [PreparedLineSeg], [PreparedLineSeg])] ->
   IO (Either String (Ptr SDLGPUTexture))
 rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
   let usage = sdlGpuTextureUsageSampler .|. sdlGpuTextureUsageColorTarget
@@ -1201,11 +1261,13 @@ rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
           forM_ draws $ \d -> do
             with d.viewport $ \vpPtr -> c_sdlSetGPUViewport rp vpPtr
             with d.scissor $ \scPtr -> c_sdlSetGPUScissor rp scPtr
-            withUploadedSegBuffer gpuCtx.dev cmd d.segs $ \segBuf -> do
-              with segBuf $ \bufPtr -> c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 1
-              withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) d.segs $ \uPtr uSize ->
-                c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
-              c_sdlDrawGPUPrimitives rp 6 1 0 0
+            withUploadedSegBuffer gpuCtx.dev cmd d.selectorSegs $ \selectorSegBuf ->
+              withUploadedSegBuffer gpuCtx.dev cmd d.windingSegs $ \windingSegBuf -> do
+                withArray [selectorSegBuf, windingSegBuf] $ \bufPtr ->
+                  c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 2
+                withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) (length d.selectorSegs) (length d.windingSegs) (requiresNonZeroWinding d.windingSegs) $ \uPtr uSize ->
+                  c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
+                c_sdlDrawGPUPrimitives rp 6 1 0 0
           c_sdlEndGPURenderPass rp
         requireTrue "SDL_SubmitGPUCommandBuffer(gen-atlas)" (c_sdlSubmitGPUCommandBuffer cmd)
       case res of
@@ -1219,13 +1281,31 @@ rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
   where
     dimI = unDim cfg.dim
 
-    mkDraw (_, _, rect0, metrics0, segs) =
+    mkDraw (_, _, rect0, metrics0, selectorSegs0, windingSegs0) =
       case (metrics0.scale, metrics0.translate) of
         (Just scale0, Just (tx0, ty0)) ->
-          let segCount = length segs
-              segBytes = gpuRasterBytesForSegments segCount
-           in if null segs || segCount > gpuCtx.limits.maxSegs || segBytes > gpuCtx.limits.maxPushBytes
-                then Left ("GPU atlas raster segment budget exceeded (segments=" <> show segCount <> ", bytes=" <> show segBytes <> ").")
+          let selectorSegCount = length selectorSegs0
+              windingSegCount = length windingSegs0
+              selectorSegBytes = gpuRasterBytesForSegments selectorSegCount
+              windingSegBytes = gpuRasterBytesForSegments windingSegCount
+           in if null selectorSegs0
+                || null windingSegs0
+                || selectorSegCount > gpuCtx.limits.maxSegs
+                || windingSegCount > gpuCtx.limits.maxSegs
+                || selectorSegBytes > gpuCtx.limits.maxPushBytes
+                || windingSegBytes > gpuCtx.limits.maxPushBytes
+                then
+                  Left
+                    ( "GPU atlas raster segment budget exceeded (selector-segments="
+                        <> show selectorSegCount
+                        <> ", winding-segments="
+                        <> show windingSegCount
+                        <> ", selector-bytes="
+                        <> show selectorSegBytes
+                        <> ", winding-bytes="
+                        <> show windingSegBytes
+                        <> ")."
+                    )
                 else
                   Right
                     GpuAtlasDraw
@@ -1250,7 +1330,8 @@ rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
                         scale = scale0,
                         tx = tx0,
                         ty = ty0,
-                        segs = segs
+                        selectorSegs = selectorSegs0,
+                        windingSegs = windingSegs0
                       }
         _ -> Left "GPU atlas raster requires autoframe metrics (scale + translate)."
 
@@ -1262,10 +1343,12 @@ withGpuRasterUniform ::
   Double ->
   Double ->
   Double ->
-  [PreparedLineSeg] ->
+  Int ->
+  Int ->
+  Bool ->
   (Ptr () -> Int -> IO a) ->
   IO a
-withGpuRasterUniform dimX dimY scale0 tx0 ty0 pxRange segs action =
+withGpuRasterUniform dimX dimY scale0 tx0 ty0 pxRange selectorSegCount windingSegCount useNonZeroWinding action =
   allocaBytes totalBytes $ \ptr -> do
     let pokeF off v = pokeByteOff ptr off (realToFrac v :: CFloat)
     fillBytes ptr 0 totalBytes
@@ -1275,7 +1358,9 @@ withGpuRasterUniform dimX dimY scale0 tx0 ty0 pxRange segs action =
     pokeF 12 tx0
     pokeF 16 ty0
     pokeF 20 pxRange
-    pokeF 24 (fromIntegral (length segs))
+    pokeF 24 (fromIntegral selectorSegCount)
+    pokeF 28 (fromIntegral windingSegCount)
+    pokeF 32 (if useNonZeroWinding then (1 :: Double) else 0)
     action (castPtr ptr) totalBytes
   where
     totalBytes = gpuRasterHeaderBytes
@@ -1314,6 +1399,7 @@ writeSegBytes base segs =
     pokeF 8 seg.x1
     pokeF 12 seg.y1
     pokeF 16 (fromIntegral seg.col :: Float)
+    pokeF 20 (fromIntegral seg.caps :: Float)
 
 uniqueGlyphCodes :: String -> [(Char, Either String GlyphCode)]
 uniqueGlyphCodes txt =
@@ -2139,6 +2225,17 @@ readPositiveDoubleEnvDefault key defVal = do
         [(x, "")] | isFiniteD x && x > 0 -> pure x
         _ -> die ("invalid " <> key <> " value: " <> txt <> " (expected finite > 0)")
 
+readNonNegativeDoubleEnvDefault :: String -> Double -> IO Double
+readNonNegativeDoubleEnvDefault key defVal = do
+  raw <- lookupEnv key
+  case raw of
+    Nothing -> pure defVal
+    Just "" -> pure defVal
+    Just txt ->
+      case reads txt of
+        [(x, "")] | isFiniteD x && x >= 0 -> pure x
+        _ -> die ("invalid " <> key <> " value: " <> txt <> " (expected finite >= 0)")
+
 readPositiveIntEnvDefault :: String -> Int -> IO Int
 readPositiveIntEnvDefault key defVal = do
   raw <- lookupEnv key
@@ -2149,6 +2246,27 @@ readPositiveIntEnvDefault key defVal = do
       case reads txt of
         [(x, "")] | x > 0 -> pure x
         _ -> die ("invalid " <> key <> " value: " <> txt <> " (expected integer > 0)")
+
+data FontPreset
+  = FontPresetInter
+  | FontPresetRoboto
+  deriving stock (Eq, Show)
+
+readFontPresetEnv :: IO FontPreset
+readFontPresetEnv = do
+  raw <- lookupEnv "MASDIFF_SDL_FONT"
+  case fmap (fmap toLower) raw of
+    Nothing -> pure FontPresetRoboto
+    Just "" -> pure FontPresetRoboto
+    Just "roboto" -> pure FontPresetRoboto
+    Just "roboto-flex" -> pure FontPresetRoboto
+    Just "inter" -> pure FontPresetInter
+    Just bad ->
+      die
+        ( "invalid MASDIFF_SDL_FONT value: "
+            <> bad
+            <> " (expected: roboto|roboto-flex|inter)"
+        )
 
 logDbg :: Bool -> String -> IO ()
 logDbg enabled msg =
@@ -2235,12 +2353,13 @@ genFragmentShaderFlat =
     [weslShader|
 struct FsU {
   meta0: vec4<f32>, // dimX, dimY, scale, tx
-  meta1: vec4<f32>, // ty, pxRange, segCount, pad
+  meta1: vec4<f32>, // ty, pxRange, selectorSegCount, windingSegCount
+  meta2: vec4<f32>, // useNonZeroWinding, pad, pad, pad
 };
 
 struct Seg {
   p0p1: vec4<f32>,
-  meta: vec4<f32>, // meta.x stores edge color mask in [0..7].
+  meta: vec4<f32>, // meta.x=color mask [0..7], meta.y=endpoint cap bits (1=start, 2=end).
 };
 
 struct SegBuf {
@@ -2248,32 +2367,65 @@ struct SegBuf {
 };
 
 @group(3) @binding(0) var<uniform> u: FsU;
-@group(2) @binding(0) var<storage, read> segBuf: SegBuf;
+@group(2) @binding(0) var<storage, read> segBufSelector: SegBuf;
+@group(2) @binding(1) var<storage, read> segBufWinding: SegBuf;
 
-fn segDistance(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> f32 {
+const EPS: f32 = 1.0e-5;
+const EPS_SQ: f32 = EPS * EPS;
+
+fn segDistancePseudo(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>, capBits: u32) -> f32 {
   let v = p1 - p0;
-  let vv = max(dot(v, v), 1.0e-8);
-  let t = clamp(dot(p - p0, v) / vv, 0.0, 1.0);
-  let q = p0 + (t * v);
+  let vv = max(dot(v, v), EPS_SQ);
+  let t = dot(p - p0, v) / vv;
+  let cross = abs((v.x * (p.y - p0.y)) - (v.y * (p.x - p0.x)));
+  let lineDist = cross / sqrt(vv);
+  if (t < 0.0 && (capBits & 1u) == 0u) {
+    return lineDist;
+  }
+  if (t > 1.0 && (capBits & 2u) == 0u) {
+    return lineDist;
+  }
+  let tc = clamp(t, 0.0, 1.0);
+  let q = p0 + (tc * v);
   return length(p - q);
 }
 
-fn windingStep(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
-  let up = p0.y <= p.y && p1.y > p.y;
-  let down = p1.y <= p.y && p0.y > p.y;
-  if (!(up || down)) {
-    return 0;
+fn segDistanceClamped(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> f32 {
+  let v = p1 - p0;
+  let vv = max(dot(v, v), EPS_SQ);
+  let tc = clamp(dot(p - p0, v) / vv, 0.0, 1.0);
+  let q = p0 + (tc * v);
+  return length(p - q);
+}
+
+fn windingStepParity(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> u32 {
+  let crosses = (p0.y > p.y) != (p1.y > p.y);
+  if (!crosses) {
+    return 0u;
   }
   let dy = p1.y - p0.y;
-  if (abs(dy) <= 1.0e-8) {
-    return 0;
+  if (abs(dy) <= EPS) {
+    return 0u;
   }
-  let t = (p.y - p0.y) / dy;
-  let xInt = p0.x + (t * (p1.x - p0.x));
-  if (p.x >= xInt) {
-    return 0;
+  let xInt = p0.x + ((p.y - p0.y) * (p1.x - p0.x) / dy);
+  if (xInt > p.x) {
+    return 1u;
   }
-  return select(-1, 1, p1.y > p0.y);
+  return 0u;
+}
+
+fn windingStepNonZero(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
+  let isLeft = ((p1.x - p0.x) * (p.y - p0.y)) - ((p.x - p0.x) * (p1.y - p0.y));
+  if (p0.y <= p.y) {
+    if (p1.y > p.y && isLeft > EPS) {
+      return 1;
+    }
+  } else {
+    if (p1.y <= p.y && isLeft < -EPS) {
+      return -1;
+    }
+  }
+  return 0;
 }
 
 @fragment
@@ -2284,7 +2436,9 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let tx = u.meta0.w;
   let ty = u.meta1.x;
   let pxRange = max(1.0, u.meta1.y);
-  let segCount = u32(u.meta1.z + 0.5);
+  let selectorSegCount = u32(u.meta1.z + 0.5);
+  let windingSegCount = u32(u.meta1.w + 0.5);
+  let useNonZero = u.meta2.x > 0.5;
 
   let px = vec2<f32>(uv.x * dimX, uv.y * dimY);
   let glyph = vec2<f32>(
@@ -2296,26 +2450,38 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   var dR = 1.0e12;
   var dG = 1.0e12;
   var dB = 1.0e12;
-  var winding = 0;
+  var windingParity: u32 = 0u;
+  var windingNonZero: i32 = 0;
 
-  for (var i: u32 = 0u; i < segCount; i = i + 1u) {
-    let seg = segBuf.data[i];
+  for (var i: u32 = 0u; i < selectorSegCount; i = i + 1u) {
+    let seg = segBufSelector.data[i];
     let p = seg.p0p1;
     let p0 = p.xy;
     let p1 = p.zw;
-    let d = segDistance(glyph, p0, p1);
     let col = u32(seg.meta.x + 0.5);
-    dA = min(dA, d);
+    let caps = u32(seg.meta.y + 0.5);
+    let dAEdge = segDistanceClamped(glyph, p0, p1);
+    let dRgbEdge = max(segDistancePseudo(glyph, p0, p1, caps), dAEdge);
+    if (dAEdge < dA) {
+      dA = dAEdge;
+    }
     if ((col & 1u) != 0u) {
-      dR = min(dR, d);
+      dR = min(dR, dRgbEdge);
     }
     if ((col & 2u) != 0u) {
-      dG = min(dG, d);
+      dG = min(dG, dRgbEdge);
     }
     if ((col & 4u) != 0u) {
-      dB = min(dB, d);
+      dB = min(dB, dRgbEdge);
     }
-    winding = winding + windingStep(glyph, p0, p1);
+  }
+
+  for (var i: u32 = 0u; i < windingSegCount; i = i + 1u) {
+    let seg = segBufWinding.data[i];
+    let p0 = seg.p0p1.xy;
+    let p1 = seg.p0p1.zw;
+    windingParity = windingParity ^ windingStepParity(glyph, p0, p1);
+    windingNonZero = windingNonZero + windingStepNonZero(glyph, p0, p1);
   }
 
   if (dR > 1.0e11) {
@@ -2328,7 +2494,10 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     dB = dA;
   }
 
-  let sign = select(-1.0, 1.0, winding != 0);
+  let insideParity = windingParity != 0u;
+  let insideNonZero = windingNonZero != 0;
+  let inside = select(insideParity, insideNonZero, useNonZero);
+  let sign = select(-1.0, 1.0, inside);
   let r = clamp(0.5 + ((scale * sign * dR) / pxRange), 0.0, 1.0);
   let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
   let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
@@ -2345,7 +2514,7 @@ const MAX_SEGS: u32 = 120u;
 
 struct Seg {
   p0p1: vec4<f32>,
-  meta: vec4<f32>, // meta.x stores edge color mask in [0..7].
+  meta: vec4<f32>, // meta.x=color mask [0..7], meta.y=endpoint cap bits (1=start, 2=end).
 };
 
 struct FsU {
@@ -2356,30 +2525,62 @@ struct FsU {
 
 @group(3) @binding(0) var<uniform> u: FsU;
 
-fn segDistance(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> f32 {
+const EPS: f32 = 1.0e-5;
+const EPS_SQ: f32 = EPS * EPS;
+
+fn segDistancePseudo(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>, capBits: u32) -> f32 {
   let v = p1 - p0;
-  let vv = max(dot(v, v), 1.0e-8);
-  let t = clamp(dot(p - p0, v) / vv, 0.0, 1.0);
-  let q = p0 + (t * v);
+  let vv = max(dot(v, v), EPS_SQ);
+  let t = dot(p - p0, v) / vv;
+  let cross = abs((v.x * (p.y - p0.y)) - (v.y * (p.x - p0.x)));
+  let lineDist = cross / sqrt(vv);
+  if (t < 0.0 && (capBits & 1u) == 0u) {
+    return lineDist;
+  }
+  if (t > 1.0 && (capBits & 2u) == 0u) {
+    return lineDist;
+  }
+  let tc = clamp(t, 0.0, 1.0);
+  let q = p0 + (tc * v);
   return length(p - q);
 }
 
-fn windingStep(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
-  let up = p0.y <= p.y && p1.y > p.y;
-  let down = p1.y <= p.y && p0.y > p.y;
-  if (!(up || down)) {
-    return 0;
+fn segDistanceClamped(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> f32 {
+  let v = p1 - p0;
+  let vv = max(dot(v, v), EPS_SQ);
+  let tc = clamp(dot(p - p0, v) / vv, 0.0, 1.0);
+  let q = p0 + (tc * v);
+  return length(p - q);
+}
+
+fn windingStepParity(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> u32 {
+  let crosses = (p0.y > p.y) != (p1.y > p.y);
+  if (!crosses) {
+    return 0u;
   }
   let dy = p1.y - p0.y;
-  if (abs(dy) <= 1.0e-8) {
-    return 0;
+  if (abs(dy) <= EPS) {
+    return 0u;
   }
-  let t = (p.y - p0.y) / dy;
-  let xInt = p0.x + (t * (p1.x - p0.x));
-  if (p.x >= xInt) {
-    return 0;
+  let xInt = p0.x + ((p.y - p0.y) * (p1.x - p0.x) / dy);
+  if (xInt > p.x) {
+    return 1u;
   }
-  return select(-1, 1, p1.y > p0.y);
+  return 0u;
+}
+
+fn windingStepNonZero(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
+  let isLeft = ((p1.x - p0.x) * (p.y - p0.y)) - ((p.x - p0.x) * (p1.y - p0.y));
+  if (p0.y <= p.y) {
+    if (p1.y > p.y && isLeft > EPS) {
+      return 1;
+    }
+  } else {
+    if (p1.y <= p.y && isLeft < -EPS) {
+      return -1;
+    }
+  }
+  return 0;
 }
 
 @fragment
@@ -2402,25 +2603,31 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   var dR = 1.0e12;
   var dG = 1.0e12;
   var dB = 1.0e12;
-  var winding = 0;
+  var windingParity: u32 = 0u;
+  var windingNonZero: i32 = 0;
 
   for (var i: u32 = 0u; i < segCount; i = i + 1u) {
     let seg = u.segs[i];
     let p0 = seg.p0p1.xy;
     let p1 = seg.p0p1.zw;
-    let d = segDistance(glyph, p0, p1);
     let col = u32(seg.meta.x + 0.5);
-    dA = min(dA, d);
+    let caps = u32(seg.meta.y + 0.5);
+    let dAEdge = segDistanceClamped(glyph, p0, p1);
+    let dRgbEdge = max(segDistancePseudo(glyph, p0, p1, caps), dAEdge);
+    if (dAEdge < dA) {
+      dA = dAEdge;
+    }
     if ((col & 1u) != 0u) {
-      dR = min(dR, d);
+      dR = min(dR, dRgbEdge);
     }
     if ((col & 2u) != 0u) {
-      dG = min(dG, d);
+      dG = min(dG, dRgbEdge);
     }
     if ((col & 4u) != 0u) {
-      dB = min(dB, d);
+      dB = min(dB, dRgbEdge);
     }
-    winding = winding + windingStep(glyph, p0, p1);
+    windingParity = windingParity ^ windingStepParity(glyph, p0, p1);
+    windingNonZero = windingNonZero + windingStepNonZero(glyph, p0, p1);
   }
 
   if (dR > 1.0e11) {
@@ -2433,7 +2640,11 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     dB = dA;
   }
 
-  let sign = select(-1.0, 1.0, winding != 0);
+  let useNonZero = u.meta1.w > 0.5;
+  let insideParity = windingParity != 0u;
+  let insideNonZero = windingNonZero != 0;
+  let inside = select(insideParity, insideNonZero, useNonZero);
+  let sign = select(-1.0, 1.0, inside);
   let r = clamp(0.5 + ((scale * sign * dR) / pxRange), 0.0, 1.0);
   let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
   let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
@@ -2518,95 +2729,6 @@ fn screenPxRange(uv: vec2<f32>, pxRange: f32) -> f32 {
   return max(0.5 * dot(unitRange, screenTexSize), 1.0);
 }
 
-fn coverageFromMtsdf(s: vec4<f32>, range: f32) -> f32 {
-  let msdfSd = median3(s.r, s.g, s.b) - 0.5;
-  let sdfSd = s.a - 0.5;
-  let msdfCov = clamp((range * msdfSd) + 0.5, 0.0, 1.0);
-  let sdfCov = clamp((range * sdfSd) + 0.5, 0.0, 1.0);
-  if (abs(msdfSd - sdfSd) > 0.0) {
-    return max(msdfCov, sdfCov);
-  }
-  return msdfCov;
-}
-
-fn sampleCoverage(uv: vec2<f32>, uvLo: vec2<f32>, uvHi: vec2<f32>, halfTexel: vec2<f32>, range: f32) -> f32 {
-  let uvSafe = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
-  let s = textureSample(tx, smp, uvSafe);
-  return coverageFromMtsdf(s, range);
-}
-
-fn healCoverage(c: f32, l: f32, r: f32, u: f32, d: f32, lu: f32, ru: f32, ld: f32, rd: f32) -> f32 {
-  let nMin = min(min(min(l, r), min(u, d)), min(min(lu, ru), min(ld, rd)));
-  let nMax = max(max(max(l, r), max(u, d)), max(max(lu, ru), max(ld, rd)));
-  let orthMin = min(min(l, r), min(u, d));
-  let orthAvg = 0.25 * (l + r + u + d);
-  let diagMin = min(min(lu, ru), min(ld, rd));
-  let orthHighCount =
-    select(0u, 1u, l > 0.82)
-    + select(0u, 1u, r > 0.82)
-    + select(0u, 1u, u > 0.82)
-    + select(0u, 1u, d > 0.82);
-  let diagHighCount =
-    select(0u, 1u, lu > 0.78)
-    + select(0u, 1u, ru > 0.78)
-    + select(0u, 1u, ld > 0.78)
-    + select(0u, 1u, rd > 0.78);
-  let orthLowCount =
-    select(0u, 1u, l < 0.70)
-    + select(0u, 1u, r < 0.70)
-    + select(0u, 1u, u < 0.70)
-    + select(0u, 1u, d < 0.70);
-  let highCount =
-    select(0u, 1u, l > 0.80)
-    + select(0u, 1u, r > 0.80)
-    + select(0u, 1u, u > 0.80)
-    + select(0u, 1u, d > 0.80)
-    + select(0u, 1u, lu > 0.80)
-    + select(0u, 1u, ru > 0.80)
-    + select(0u, 1u, ld > 0.80)
-    + select(0u, 1u, rd > 0.80);
-  let stable = (nMax - nMin) < 0.30;
-  let isolatedHole = c < 0.60 && orthMin > 0.84 && diagMin > 0.72;
-  let hardSpeck = c < 0.95 && highCount >= 7u && orthMin > 0.82 && (nMax - c) > 0.05;
-  let microPit = c < 0.90 && orthMin > 0.82 && highCount >= 7u && (orthAvg - c) > 0.035;
-  let pinhole =
-    c < 0.72
-    && stable
-    && (nMax - c) > 0.14
-    && highCount >= 5u
-    && orthHighCount >= 2u
-    && diagHighCount >= 1u
-    && orthLowCount <= 1u;
-  let cuspPair =
-    (l > 0.82 && r > 0.82)
-    || (l > 0.82 && u > 0.82)
-    || (l > 0.82 && d > 0.82)
-    || (r > 0.82 && u > 0.82)
-    || (r > 0.82 && d > 0.82)
-    || (u > 0.82 && d > 0.82);
-  let cusp =
-    c < 0.68
-    && stable
-    && (nMax - c) > 0.12
-    && highCount >= 5u
-    && orthHighCount >= 2u
-    && diagHighCount >= 1u
-    && orthLowCount <= 1u
-    && cuspPair;
-  let microSpeck =
-    c < 0.985
-    && orthMin > 0.965
-    && diagMin > 0.94
-    && (orthAvg - c) > 0.01;
-  if (hardSpeck) {
-    return nMax;
-  }
-  if (isolatedHole || microPit || pinhole || cusp || microSpeck) {
-    return max(c, orthAvg);
-  }
-  return c;
-}
-
 @fragment
 fn main(
   @location(0) uv: vec2<f32>,
@@ -2619,25 +2741,10 @@ fn main(
   let texel = vec2<f32>(1.0, 1.0) / dims;
   let halfTexel = 0.5 * texel;
   let uvCenter = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
-  let range = screenPxRange(uvCenter, pxRange);
-  let du = 0.25 * dpdx(uvCenter);
-  let dv = 0.25 * dpdy(uvCenter);
-  let c0 = sampleCoverage(uvCenter - du - dv, uvLo, uvHi, halfTexel, range);
-  let c1 = sampleCoverage(uvCenter + du - dv, uvLo, uvHi, halfTexel, range);
-  let c2 = sampleCoverage(uvCenter - du + dv, uvLo, uvHi, halfTexel, range);
-  let c3 = sampleCoverage(uvCenter + du + dv, uvLo, uvHi, halfTexel, range);
-  let baseOpacity = clamp(0.25 * (c0 + c1 + c2 + c3), 0.0, 1.0);
-  let pxU = dpdx(uvCenter);
-  let pxV = dpdy(uvCenter);
-  let l = sampleCoverage(uvCenter - pxU, uvLo, uvHi, halfTexel, range);
-  let r = sampleCoverage(uvCenter + pxU, uvLo, uvHi, halfTexel, range);
-  let u = sampleCoverage(uvCenter - pxV, uvLo, uvHi, halfTexel, range);
-  let d = sampleCoverage(uvCenter + pxV, uvLo, uvHi, halfTexel, range);
-  let lu = sampleCoverage(uvCenter - pxU - pxV, uvLo, uvHi, halfTexel, range);
-  let ru = sampleCoverage(uvCenter + pxU - pxV, uvLo, uvHi, halfTexel, range);
-  let ld = sampleCoverage(uvCenter - pxU + pxV, uvLo, uvHi, halfTexel, range);
-  let rd = sampleCoverage(uvCenter + pxU + pxV, uvLo, uvHi, halfTexel, range);
-  let opacity = clamp(healCoverage(baseOpacity, l, r, u, d, lu, ru, ld, rd), 0.0, 1.0);
+  let sample = textureSample(tx, smp, uvCenter);
+  let sd = median3(sample.r, sample.g, sample.b);
+  let screenPxDistance = screenPxRange(uvCenter, pxRange) * (sd - 0.5);
+  let opacity = clamp(screenPxDistance + 0.5, 0.0, 1.0);
   let fg = vec3<f32>(0.92, 0.94, 0.98);
   return vec4<f32>(fg, opacity);
 }
@@ -2645,60 +2752,4 @@ fn main(
 
 fragmentShaderNoHeal :: GpuShader
 fragmentShaderNoHeal =
-  mkGpuShader
-    [weslShader|
-@group(2) @binding(0) var tx: texture_2d<f32>;
-@group(2) @binding(1) var smp: sampler;
-
-fn median3(a: f32, b: f32, c: f32) -> f32 {
-  return max(min(a, b), min(max(a, b), c));
-}
-
-fn screenPxRange(uv: vec2<f32>, pxRange: f32) -> f32 {
-  let dims = max(vec2<f32>(textureDimensions(tx)), vec2<f32>(1.0, 1.0));
-  let unitRange = vec2<f32>(pxRange, pxRange) / dims;
-  let screenTexSize = vec2<f32>(1.0, 1.0) / max(fwidth(uv), vec2<f32>(1.0e-6, 1.0e-6));
-  return max(0.5 * dot(unitRange, screenTexSize), 1.0);
-}
-
-fn coverageFromMtsdf(s: vec4<f32>, range: f32) -> f32 {
-  let msdfSd = median3(s.r, s.g, s.b) - 0.5;
-  let sdfSd = s.a - 0.5;
-  let msdfCov = clamp((range * msdfSd) + 0.5, 0.0, 1.0);
-  let sdfCov = clamp((range * sdfSd) + 0.5, 0.0, 1.0);
-  if (abs(msdfSd - sdfSd) > 0.0) {
-    return max(msdfCov, sdfCov);
-  }
-  return msdfCov;
-}
-
-fn sampleCoverage(uv: vec2<f32>, uvLo: vec2<f32>, uvHi: vec2<f32>, halfTexel: vec2<f32>, range: f32) -> f32 {
-  let uvSafe = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
-  let s = textureSample(tx, smp, uvSafe);
-  return coverageFromMtsdf(s, range);
-}
-
-@fragment
-fn main(
-  @location(0) uv: vec2<f32>,
-  @location(1) sprIn: f32,
-  @location(2) uvLo: vec2<f32>,
-  @location(3) uvHi: vec2<f32>
-) -> @location(0) vec4<f32> {
-  let pxRange = max(1.0, sprIn);
-  let dims = max(vec2<f32>(textureDimensions(tx)), vec2<f32>(1.0, 1.0));
-  let texel = vec2<f32>(1.0, 1.0) / dims;
-  let halfTexel = 0.5 * texel;
-  let uvCenter = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
-  let range = screenPxRange(uvCenter, pxRange);
-  let du = 0.25 * dpdx(uvCenter);
-  let dv = 0.25 * dpdy(uvCenter);
-  let c0 = sampleCoverage(uvCenter - du - dv, uvLo, uvHi, halfTexel, range);
-  let c1 = sampleCoverage(uvCenter + du - dv, uvLo, uvHi, halfTexel, range);
-  let c2 = sampleCoverage(uvCenter - du + dv, uvLo, uvHi, halfTexel, range);
-  let c3 = sampleCoverage(uvCenter + du + dv, uvLo, uvHi, halfTexel, range);
-  let opacity = clamp(0.25 * (c0 + c1 + c2 + c3), 0.0, 1.0);
-  let fg = vec3<f32>(0.92, 0.94, 0.98);
-  return vec4<f32>(fg, opacity);
-}
-|]
+  fragmentShader
