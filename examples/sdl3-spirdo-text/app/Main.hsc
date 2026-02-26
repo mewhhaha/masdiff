@@ -38,7 +38,6 @@ import MSDF.Native
     metricsPrepared,
     prepareGlyphBatchNativeIO,
     preparedLineSegs,
-    requiresNonZeroWinding,
     rasterPreparedCpu,
   )
 import MSDF.Types
@@ -1228,7 +1227,7 @@ rasterPreparedGpuImage dev genPipe dim scale0 tx0 ty0 pxr0 selectorSegs0 winding
              c_sdlBindGPUGraphicsPipeline rp genPipe
              withArray [selectorSegBuf, windingSegBuf] $ \bufPtr ->
                c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 2
-             withGpuRasterUniform dim dim scale0 tx0 ty0 pxr0 (length selectorSegs0) (length windingSegs0) (requiresNonZeroWinding windingSegs0) $ \uPtr uSize ->
+             withGpuRasterUniform dim dim scale0 tx0 ty0 pxr0 (length selectorSegs0) (length windingSegs0) True $ \uPtr uSize ->
                c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
              c_sdlDrawGPUPrimitives rp 6 1 0 0
              c_sdlEndGPURenderPass rp
@@ -1265,7 +1264,7 @@ rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
               withUploadedSegBuffer gpuCtx.dev cmd d.windingSegs $ \windingSegBuf -> do
                 withArray [selectorSegBuf, windingSegBuf] $ \bufPtr ->
                   c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 2
-                withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) (length d.selectorSegs) (length d.windingSegs) (requiresNonZeroWinding d.windingSegs) $ \uPtr uSize ->
+                withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) (length d.selectorSegs) (length d.windingSegs) True $ \uPtr uSize ->
                   c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
                 c_sdlDrawGPUPrimitives rp 6 1 0 0
           c_sdlEndGPURenderPass rp
@@ -1400,6 +1399,8 @@ writeSegBytes base segs =
     pokeF 12 seg.y1
     pokeF 16 (fromIntegral seg.col :: Float)
     pokeF 20 (fromIntegral seg.caps :: Float)
+    pokeF 24 (fromIntegral seg.cid :: Float)
+    pokeF 28 (fromIntegral seg.cw :: Float)
 
 uniqueGlyphCodes :: String -> [(Char, Either String GlyphCode)]
 uniqueGlyphCodes txt =
@@ -2156,13 +2157,13 @@ parseScenePreset raw =
   where
     parseSingle ctor whole rest =
       case rest of
-        [ch] | ch `elem` ['a', 'm', 'p', 'r', 'y'] -> Right (ctor (toUpper ch))
+        [ch] | ch `elem` ['a', 'm', 'p', 'r', 'y', '4'] -> Right (ctor (toUpper ch))
         _ -> badScene whole
     badScene other =
       Left
         ( "Unknown MASDIFF_SDL_SCENE value: "
             <> other
-            <> " (expected: default, single-a|m|p|r|y, single-var-light-a|m|p|r|y, single-var-bold-a|m|p|r|y)"
+            <> " (expected: default, single-a|m|p|r|y|4, single-var-light-a|m|p|r|y|4, single-var-bold-a|m|p|r|y|4)"
         )
 
 parseRasterMode :: Maybe String -> Either String RasterMode
@@ -2359,7 +2360,7 @@ struct FsU {
 
 struct Seg {
   p0p1: vec4<f32>,
-  meta: vec4<f32>, // meta.x=color mask [0..7], meta.y=endpoint cap bits (1=start, 2=end).
+  meta: vec4<f32>, // meta.x=color mask [0..7], meta.y=endpoint cap bits, meta.z=contour id, meta.w=contour winding sign.
 };
 
 struct SegBuf {
@@ -2428,6 +2429,10 @@ fn windingStepNonZero(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
   return 0;
 }
 
+fn median3(a: f32, b: f32, c: f32) -> f32 {
+  return max(min(a, b), min(max(a, b), c));
+}
+
 @fragment
 fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let dimX = max(1.0, u.meta0.x);
@@ -2476,6 +2481,16 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     }
   }
 
+  if (dR > 1.0e11) {
+    dR = dA;
+  }
+  if (dG > 1.0e11) {
+    dG = dA;
+  }
+  if (dB > 1.0e11) {
+    dB = dA;
+  }
+
   for (var i: u32 = 0u; i < windingSegCount; i = i + 1u) {
     let seg = segBufWinding.data[i];
     let p0 = seg.p0p1.xy;
@@ -2502,7 +2517,20 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
   let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
   let a = clamp(0.5 + ((scale * sign * dA) / pxRange), 0.0, 1.0);
-  return vec4<f32>(r, g, b, a);
+  let med = median3(r, g, b);
+  var rOut = r;
+  var gOut = g;
+  var bOut = b;
+  var aOut = a;
+  if (abs(med - 0.5) > 1.0e-6 && ((med > 0.5) != inside)) {
+    rOut = 1.0 - rOut;
+    gOut = 1.0 - gOut;
+    bOut = 1.0 - bOut;
+  }
+  if ((aOut > 0.5) != inside) {
+    aOut = 1.0 - aOut;
+  }
+  return vec4<f32>(rOut, gOut, bOut, aOut);
 }
 |]
 
@@ -2583,6 +2611,10 @@ fn windingStepNonZero(p: vec2<f32>, p0: vec2<f32>, p1: vec2<f32>) -> i32 {
   return 0;
 }
 
+fn median3(a: f32, b: f32, c: f32) -> f32 {
+  return max(min(a, b), min(max(a, b), c));
+}
+
 @fragment
 fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let dimX = max(1.0, u.meta0.x);
@@ -2649,7 +2681,20 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
   let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
   let a = clamp(0.5 + ((scale * sign * dA) / pxRange), 0.0, 1.0);
-  return vec4<f32>(r, g, b, a);
+  let med = median3(r, g, b);
+  var rOut = r;
+  var gOut = g;
+  var bOut = b;
+  var aOut = a;
+  if (abs(med - 0.5) > 1.0e-6 && ((med > 0.5) != inside)) {
+    rOut = 1.0 - rOut;
+    gOut = 1.0 - gOut;
+    bOut = 1.0 - bOut;
+  }
+  if ((aOut > 0.5) != inside) {
+    aOut = 1.0 - aOut;
+  }
+  return vec4<f32>(rOut, gOut, bOut, aOut);
 }
 |]
 
@@ -2742,7 +2787,11 @@ fn main(
   let halfTexel = 0.5 * texel;
   let uvCenter = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
   let sample = textureSample(tx, smp, uvCenter);
-  let sd = median3(sample.r, sample.g, sample.b);
+  let msdf = median3(sample.r, sample.g, sample.b);
+  let sdf = sample.a;
+  let divergence = abs(msdf - sdf);
+  let cornerMix = smoothstep(0.02, 0.14, divergence);
+  let sd = mix(msdf, sdf, cornerMix);
   let screenPxDistance = screenPxRange(uvCenter, pxRange) * (sd - 0.5);
   let opacity = clamp(screenPxDistance + 0.5, 0.0, 1.0);
   let fg = vec3<f32>(0.92, 0.94, 0.98);
@@ -2752,4 +2801,39 @@ fn main(
 
 fragmentShaderNoHeal :: GpuShader
 fragmentShaderNoHeal =
-  fragmentShader
+  mkGpuShader
+    [weslShader|
+@group(2) @binding(0) var tx: texture_2d<f32>;
+@group(2) @binding(1) var smp: sampler;
+
+fn median3(a: f32, b: f32, c: f32) -> f32 {
+  return max(min(a, b), min(max(a, b), c));
+}
+
+fn screenPxRange(uv: vec2<f32>, pxRange: f32) -> f32 {
+  let dims = max(vec2<f32>(textureDimensions(tx)), vec2<f32>(1.0, 1.0));
+  let unitRange = vec2<f32>(pxRange, pxRange) / dims;
+  let screenTexSize = vec2<f32>(1.0, 1.0) / max(fwidth(uv), vec2<f32>(1.0e-6, 1.0e-6));
+  return max(0.5 * dot(unitRange, screenTexSize), 1.0);
+}
+
+@fragment
+fn main(
+  @location(0) uv: vec2<f32>,
+  @location(1) sprIn: f32,
+  @location(2) uvLo: vec2<f32>,
+  @location(3) uvHi: vec2<f32>
+) -> @location(0) vec4<f32> {
+  let pxRange = max(1.0, sprIn);
+  let dims = max(vec2<f32>(textureDimensions(tx)), vec2<f32>(1.0, 1.0));
+  let texel = vec2<f32>(1.0, 1.0) / dims;
+  let halfTexel = 0.5 * texel;
+  let uvCenter = clamp(uv, uvLo + halfTexel, uvHi - halfTexel);
+  let sample = textureSample(tx, smp, uvCenter);
+  let sd = median3(sample.r, sample.g, sample.b);
+  let screenPxDistance = screenPxRange(uvCenter, pxRange) * (sd - 0.5);
+  let opacity = clamp(screenPxDistance + 0.5, 0.0, 1.0);
+  let fg = vec3<f32>(0.92, 0.94, 0.98);
+  return vec4<f32>(fg, opacity);
+}
+|]
