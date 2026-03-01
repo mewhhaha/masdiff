@@ -9,7 +9,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.List (isInfixOf, nub, tails)
+import Data.List (isInfixOf, isPrefixOf, nub, tails)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Word (Word8)
@@ -28,7 +28,16 @@ import MSDF.Atlas (Atlas (..), AtlasEntry (..), AtlasRect (..), generateAtlasIO,
 import MSDF.Encode (decodeMsdfgenRgba, encodeMsdfgenRgba)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphBatchIO, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestMeta (..), ManifestRow (..), loadManifest)
-import MSDF.Native (generateGlyphBatchNativeWithIO, rasterPreparedCpu)
+import MSDF.Native
+  ( generateGlyphBatchNativeWithIO,
+    hasProperSelfIntersection,
+    PreparedLineSeg (..),
+    prepareGlyphNativeIO,
+    preparedNeedsOverlap,
+    preparedLineSegs,
+    requiresNonZeroWinding,
+    rasterPreparedCpu,
+  )
 import MSDF.TextRender
   ( ScreenPxRange (..),
     ShaderCfg (..),
@@ -102,6 +111,7 @@ main = do
   fontBehaviorOk <- runFontBehaviorChecks
   atlasChecksOk <- runAtlasChecks
   batchGenerateOk <- runBatchGenerateChecks
+  preparedSegIntersectionOk <- runPreparedSegIntersectionChecks
   variableAxisNativeOk <- runVariableAxisNativeRegression
   backendParityOk <- runBackendParitySmoke
   thinItalicStrictParityOk <- runThinItalicStrictParityRegression
@@ -111,6 +121,8 @@ main = do
   textRenderOk <- runTextRenderChecks
   decodeChecksOk <- runDecodeChecks
   manifestChecksOk <- runManifestChecks
+  sdlShaderSourceChecksOk <- runSdlShaderSourceChecks
+  parityWorkflowSourceChecksOk <- runParityWorkflowSourceChecks
   let allOk =
         and
           [ staticCountOk,
@@ -123,6 +135,7 @@ main = do
             fontBehaviorOk,
             atlasChecksOk,
             batchGenerateOk,
+            preparedSegIntersectionOk,
             variableAxisNativeOk,
             backendParityOk,
             thinItalicStrictParityOk,
@@ -132,7 +145,9 @@ main = do
             compareBehaviorOk,
             textRenderOk,
             decodeChecksOk,
-            manifestChecksOk
+            manifestChecksOk,
+            sdlShaderSourceChecksOk,
+            parityWorkflowSourceChecksOk
           ]
   propertiesOk <- runQuickCheckProperties
   if allOk && propertiesOk
@@ -749,6 +764,171 @@ runBatchGenerateChecks =
         Left (MissingInput _) -> True
         _ -> False
 
+runPreparedSegIntersectionChecks :: IO Bool
+runPreparedSegIntersectionChecks = do
+  let crossSegs =
+        [ mkSeg 0 0 10 10,
+          mkSeg 0 10 10 0
+        ]
+      endpointTouchSegs =
+        [ mkSeg 0 0 10 0,
+          mkSeg 10 0 10 10
+        ]
+      doubledSquareSegs =
+        let square =
+              [ mkSeg 0 0 10 0,
+                mkSeg 10 0 10 10,
+                mkSeg 10 10 0 10,
+                mkSeg 0 10 0 0
+              ]
+         in square <> square
+  syntheticOverlapGuardOk <-
+    check
+      "requiresNonZeroWinding stays off when coincident overlap has no proper intersections"
+      (not (requiresNonZeroWinding doubledSquareSegs) && not (hasProperSelfIntersection doubledSquareSegs))
+  syntheticCrossOk <-
+    check
+      "hasProperSelfIntersection detects interior crossing on synthetic segments"
+      (hasProperSelfIntersection crossSegs)
+  syntheticTouchOk <-
+    check
+      "hasProperSelfIntersection ignores endpoint-only touches on synthetic segments"
+      (not (hasProperSelfIntersection endpointTouchSegs))
+  syntheticSimpleOk <-
+    check
+      "requiresNonZeroWinding stays off for simple non-overlapping contour"
+      (not (requiresNonZeroWinding
+              [ mkSeg 0 0 10 0,
+                mkSeg 10 0 10 10,
+                mkSeg 10 10 0 10,
+                mkSeg 0 10 0 0
+              ]))
+  case (mkDim 256, mkPxRange 8.0, mkGlyphCode (ord '4'), mkGlyphCode (ord '9'), mkGlyphCode (ord 'A'), mkGlyphCode (ord 'R'), mkGlyphCode (ord '1')) of
+    (Right dim, Right pxr, Right glyph4, Right glyph9, Right glyphA, Right glyphR, Right glyph1) -> do
+      let cfg =
+            GenCfg
+              { mode = Mtsdf,
+                dim = dim,
+                pxr = pxr,
+                seed = 1,
+                autoframe = True,
+                ovlp = False
+              }
+          src =
+            VarFontFile
+              { path = "assets/Inter/Inter-VariableFont_opsz,wght.ttf",
+                axes =
+                  Map.fromList
+                    [ (AxisTag (T.pack "opsz"), AxisVal 32.0),
+                      (AxisTag (T.pack "wght"), AxisVal 900.0)
+                    ]
+              }
+      prep4 <- prepareGlyphNativeIO src glyph4
+      prep9 <- prepareGlyphNativeIO src glyph9
+      prepA <- prepareGlyphNativeIO src glyphA
+      prepR <- prepareGlyphNativeIO src glyphR
+      prep1 <- prepareGlyphNativeIO src glyph1
+      case (prep4, prep9, prepA, prepR, prep1) of
+        (Right prepared4, Right prepared9, Right preparedA, Right preparedR, Right prepared1) -> do
+          let segs4 = preparedLineSegs cfg prepared4
+              segs9 = preparedLineSegs cfg prepared9
+              segsA = preparedLineSegs cfg preparedA
+              segsR = preparedLineSegs cfg preparedR
+              cfgOvlp = cfg {ovlp = True}
+              needsOverlap4 = preparedNeedsOverlap cfgOvlp prepared4
+              needsOverlap9 = preparedNeedsOverlap cfgOvlp prepared9
+              needsOverlapA = preparedNeedsOverlap cfgOvlp preparedA
+              needsOverlapR = preparedNeedsOverlap cfgOvlp preparedR
+              needsOverlap1 = preparedNeedsOverlap cfgOvlp prepared1
+              segsROvlp = preparedLineSegs cfgOvlp preparedR
+          glyph4CrossOk <-
+            check
+              "hasProperSelfIntersection detects Inter variable bold glyph '4' overlap"
+              (hasProperSelfIntersection segs4)
+          glyph4NonZeroOk <-
+            check
+              "requiresNonZeroWinding enables non-zero mode for Inter variable bold glyph '4'"
+              (requiresNonZeroWinding segs4)
+          glyphANonZeroOffOk <-
+            check
+              "requiresNonZeroWinding stays off for Inter variable bold glyph 'A'"
+              (not (requiresNonZeroWinding segsA))
+          glyphRNonZeroOffOk <-
+            check
+              "requiresNonZeroWinding stays off for Inter variable bold glyph 'R'"
+              (not (requiresNonZeroWinding segsR))
+          glyphAStableOk <-
+            check
+              "preparedLineSegs builds non-empty segment set for Inter variable bold glyph 'A'"
+              (not (null segsA))
+          glyph4NeedsOverlapOk <-
+            check
+              "preparedNeedsOverlap is enabled for Inter variable bold glyph '4' (compound contour)"
+              needsOverlap4
+          glyph9NeedsOverlapOk <-
+            check
+              "preparedNeedsOverlap is enabled for Inter variable bold glyph '9' (compound contour)"
+              needsOverlap9
+          glyphANeedsOverlapOk <-
+            check
+              "preparedNeedsOverlap is enabled for Inter variable bold glyph 'A' (compound contour)"
+              needsOverlapA
+          glyphRNeedsOverlapOk <-
+            check
+              "preparedNeedsOverlap is enabled for Inter variable bold glyph 'R' (compound contour)"
+              needsOverlapR
+          glyph1NeedsOverlapOffOk <-
+            check
+              "preparedNeedsOverlap stays off for Inter variable bold glyph '1' (single contour)"
+              (not needsOverlap1)
+          glyph9StableOk <-
+            check
+              "preparedLineSegs builds non-empty segment set for Inter variable bold glyph '9'"
+              (not (null segs9))
+          glyphROvlpColorDiversityOk <-
+            check
+              "preparedLineSegs overlap merge preserves edge color diversity for Inter variable bold glyph 'R'"
+              (length (nub (fmap (\seg -> seg.col) segsROvlp)) >= 2)
+          pure (syntheticOverlapGuardOk && syntheticCrossOk && syntheticTouchOk && syntheticSimpleOk && glyph4CrossOk && glyph4NonZeroOk && glyphANonZeroOffOk && glyphRNonZeroOffOk && glyphAStableOk && glyph4NeedsOverlapOk && glyph9NeedsOverlapOk && glyphANeedsOverlapOk && glyphRNeedsOverlapOk && glyph1NeedsOverlapOffOk && glyph9StableOk && glyphROvlpColorDiversityOk)
+        (Left err4, Left err9, Left errA, Left errR, Left err1) ->
+          check
+            ("prepared-segment setup failed for glyphs '4', '9', 'A', 'R', and '1': " <> show err4 <> " | " <> show err9 <> " | " <> show errA <> " | " <> show errR <> " | " <> show err1)
+            False
+        (Left err4, _, _, _, _) ->
+          check
+            ("prepared-segment setup failed for glyph '4': " <> show err4)
+            False
+        (_, Left err9, _, _, _) ->
+          check
+            ("prepared-segment setup failed for glyph '9': " <> show err9)
+            False
+        (_, _, Left errA, _, _) ->
+          check
+            ("prepared-segment setup failed for glyph 'A': " <> show errA)
+            False
+        (_, _, _, Left errR, _) ->
+          check
+            ("prepared-segment setup failed for glyph 'R': " <> show errR)
+            False
+        (_, _, _, _, Left err1) ->
+          check
+            ("prepared-segment setup failed for glyph '1': " <> show err1)
+            False
+    _ ->
+      check "prepared-segment setup failed: invalid dim/pxrange/glyph code" False
+  where
+    mkSeg x0 y0 x1 y1 =
+      PreparedLineSeg
+        { x0 = x0,
+          y0 = y0,
+          x1 = x1,
+          y1 = y1,
+          col = 0,
+          caps = 0,
+          cid = 0,
+          cw = 0
+        }
+
 runVariableAxisNativeRegression :: IO Bool
 runVariableAxisNativeRegression =
   case mkParityCfg of
@@ -1290,6 +1470,347 @@ runManifestChecks = do
   parseOk <- checkLoadManifestParsesValidFixture
   missingHeaderOk <- checkLoadManifestRejectsMissingPxRange
   pure (parseOk && missingHeaderOk)
+
+runSdlShaderSourceChecks :: IO Bool
+runSdlShaderSourceChecks = do
+  src <- readFile "examples/sdl3-spirdo-text/app/Main.hsc"
+  justSrc <- readFile "justfile"
+  harnessSrc <- readFile "tools/run_sdl3_artifact_harness.sh"
+  abSrc <- readFile "tools/sdl3_ab_compare.sh"
+  oracleSrc <- readFile "tools/run_msdfgen_oracle_gate.sh"
+  harnessPy <- readFile "tools/sdl3_artifact_harness.py"
+  routeHealOk <-
+    check
+      "SDL presentation heal routes to dedicated shader variant"
+      ("fragmentShader = fragmentShaderMtsdfHeal" `isInfixOf` src)
+  routeNoHealOk <-
+    check
+      "SDL presentation no-heal routes to canonical shader variant"
+      ("fragmentShaderNoHeal = fragmentShaderCanonical" `isInfixOf` src)
+  modeParseOk <-
+    check
+      "SDL presentation heal mode parser is present"
+      ("parsePresentHealMode :: Maybe String -> Either String PresentHealMode" `isInfixOf` src)
+  fontRegularEnvOk <-
+    check
+      "SDL font regular override env is present"
+      ("MASDIFF_SDL_FONT_REGULAR" `isInfixOf` src)
+  fontVarEnvOk <-
+    check
+      "SDL font variable override env is present"
+      ("MASDIFF_SDL_FONT_VAR" `isInfixOf` src)
+  fontAxisEnvOk <-
+    check
+      "SDL variable axis override envs are present"
+      ( all
+          (`isInfixOf` src)
+          [ "MASDIFF_SDL_VAR_LIGHT_WGHT",
+            "MASDIFF_SDL_VAR_LIGHT_OPSZ",
+            "MASDIFF_SDL_VAR_BOLD_WGHT",
+            "MASDIFF_SDL_VAR_BOLD_OPSZ"
+          ]
+      )
+  pxRangeDefaultOk <-
+    check
+      "SDL default scene px range is set to 8.0"
+      ("readPositiveDoubleEnvDefault \"MASDIFF_SDL_PXRANGE\" 8.0" `isInfixOf` src)
+  dimDefaultOk <-
+    check
+      "SDL default scene dim is set to 256 and overrideable"
+      ("readPositiveIntEnvDefault \"MASDIFF_SDL_DIM\" 256" `isInfixOf` src)
+  justDefaultRuntimeTuningOk <-
+    check
+      "just sdl3 defaults include present-heal mode and tuned px range"
+      ( all
+          (`isInfixOf` justSrc)
+          [ "MASDIFF_SDL_PRESENT_HEAL=\"${MASDIFF_SDL_PRESENT_HEAL:-1}\"",
+            "MASDIFF_SDL_PRESENT_HEAL_MODE=\"${MASDIFF_SDL_PRESENT_HEAL_MODE:-1}\"",
+            "MASDIFF_SDL_PXRANGE=\"${MASDIFF_SDL_PXRANGE:-7}\""
+          ]
+      )
+  justVideoDriverDefaultOk <-
+    check
+      "just sdl3 defaults set SDL_VIDEODRIVER for deterministic CI runs"
+      ("SDL_VIDEODRIVER=\"${SDL_VIDEODRIVER:-x11}\"" `isInfixOf` justSrc)
+  justBackendDefaultOk <-
+    check
+      "just sdl3 defaults to GPU generation path"
+      ("MASDIFF_SDL_GEN_BACKEND=\"${MASDIFF_SDL_GEN_BACKEND:-gpu}\"" `isInfixOf` justSrc)
+  harnessRuntimeDefaultsOk <-
+    check
+      "SDL harness defaults include present-heal tuning and video driver"
+      ( all
+          (`isInfixOf` harnessSrc)
+          [ "SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-x11}",
+            "MASDIFF_SDL_PRESENT_HEAL=${MASDIFF_SDL_PRESENT_HEAL:-1}",
+            "MASDIFF_SDL_PRESENT_HEAL_MODE=${MASDIFF_SDL_PRESENT_HEAL_MODE:-1}",
+            "MASDIFF_SDL_PXRANGE=${MASDIFF_SDL_PXRANGE:-7}"
+          ]
+      )
+  abRuntimeDefaultsOk <-
+    check
+      "SDL A/B script defaults include present-heal tuning and video driver"
+      ( all
+          (`isInfixOf` abSrc)
+          [ "SDL_VIDEODRIVER=\"${SDL_VIDEODRIVER:-x11}\"",
+            "MASDIFF_SDL_PRESENT_HEAL_MODE=\"${MASDIFF_SDL_PRESENT_HEAL_MODE:-1}\"",
+            "MASDIFF_SDL_PXRANGE=\"${MASDIFF_SDL_PXRANGE:-7}\""
+          ]
+      )
+  harnessDimAbOk <-
+    check
+      "SDL harness includes MASDIFF_SDL_DIM A/B sweep"
+      ( all
+          (`isInfixOf` harnessSrc)
+          [ "MASDIFF_SDL_HARNESS_DIM_AB",
+            "MASDIFF_SDL_HARNESS_DIM_BASE",
+            "MASDIFF_SDL_HARNESS_DIM_CANDIDATE",
+            "run_dim_ab_case",
+            "MASDIFF_SDL_DIM=\"$base_dim\"",
+            "MASDIFF_SDL_DIM=\"$cand_dim\""
+          ]
+      )
+  harnessCounterApexStrictOk <-
+    check
+      "SDL harness keeps single-glyph A counter apex checks strict"
+      ( all
+          (`isInfixOf` harnessPy)
+          [ "def counter_core_bad_limit(ch: str, scene: str):",
+            "def counter_apex_core_bad_limit(ch: str, scene: str):",
+            "scene.startswith(\"single-\") and ch == \"A\"",
+            "apex_core_bad_pixels",
+            "max_apex_core_bad_pixels"
+          ]
+      )
+  harnessOracleGateOk <-
+    check
+      "SDL harness runs msdfgen oracle gate by default"
+      ( all
+          (`isInfixOf` harnessSrc)
+          [ "MASDIFF_SDL_REQUIRE_ORACLE",
+            "MASDIFF_SDL_ORACLE_ENFORCE",
+            "run_msdfgen_oracle_gate.sh"
+          ]
+      )
+  abOracleGateOk <-
+    check
+      "SDL A/B script runs msdfgen oracle gate by default"
+      ( all
+          (`isInfixOf` abSrc)
+          [ "MASDIFF_SDL_REQUIRE_ORACLE",
+            "MASDIFF_SDL_ORACLE_ENFORCE",
+            "run_msdfgen_oracle_gate.sh"
+          ]
+      )
+  oracleScriptStrictParityOk <-
+    check
+      "msdfgen oracle gate enforces strict corpus parity command"
+      ("masdiff-parity -- --require-exact" `isInfixOf` oracleSrc)
+  oracleScriptStressCasesOk <-
+    check
+      "msdfgen oracle gate includes Inter/Roboto stress cases"
+      ( all
+          (`isInfixOf` oracleSrc)
+          [ "var-inter-old-bold-A",
+            "var-inter-v41-bold-A",
+            "var-inter-v41-bold-R",
+            "var-roboto-flex-bold-A"
+          ]
+      )
+  oracleScriptVarInstancingOk <-
+    check
+      "msdfgen oracle gate instantiates varfont cases for process oracle"
+      ( all
+          (`isInfixOf` oracleSrc)
+          [ "MASDIFF_ORACLE_INSTANCE_VAR",
+            "instantiateVariableFont",
+            "compare_mode=\"varfont\""
+          ]
+      )
+  aggressiveShaderOk <-
+    check
+      "SDL aggressive heal shader variant is present"
+      ("fragmentShaderMtsdfHealAggressive :: GpuShader" `isInfixOf` src)
+  gpuNoPerGlyphOverrideOk <-
+    check
+      "SDL GPU generation avoids glyph-specific sign overrides"
+      ( not ("preferEdgeSignForGlyphCode" `isInfixOf` src)
+          && not ("code == 65" `isInfixOf` src)
+          && not ("let useEdgeSign = u.meta1.w >= 0.5;" `isInfixOf` src)
+      )
+  gpuWindingModeSwitchOk <-
+    check
+      "SDL GPU generation shader supports parity and non-zero winding mode switch"
+      ( countSubstring "let useNonZero = u.meta1.w > 0.5;" src >= 2
+          && countSubstring "let inside = select(insideParity, insideNonZero, useNonZero);" src >= 2
+          && countSubstring "fn windingStepParity(" src >= 2
+          && countSubstring "fn windingStepNonZero(" src >= 2
+      )
+  gpuWindingDefaultNonZeroOk <-
+    check
+      "SDL GPU generation defaults to non-zero winding to match native fill semantics"
+      ("let useNonZeroWinding = True" `isInfixOf` src)
+  cornerMixPresentOk <-
+    check
+      "SDL heal shader includes mtsdf corner-mix fallback"
+      (countSubstring "let cornerMix = smoothstep(" src >= 1 && countSubstring "channelSpread" src >= 2)
+  mixDistPresentOk <-
+    check
+      "SDL heal shader mixes msdf and sdf distances"
+      ( countSubstring "let dist = mix(msdf, sdf, cornerMix);" src >= 2
+          || countSubstring "let dist = mix(msdf, sdf, max(cornerMix, signMismatch));" src >= 2
+      )
+  canonicalMedianOnlyOk <-
+    check
+      "SDL canonical shader keeps median-only distance"
+      (countSubstring "let sd = msdf - 0.5;" src == 1)
+  screenRangeScaleInvariantOk <-
+    check
+      "SDL fit scaling keeps glyph px range invariant"
+      ("spr = d.spr" `isInfixOf` src && not ("spr = d.spr * k" `isInfixOf` src))
+  healDistUsedOk <-
+    check
+      "SDL heal shader uses mixed distance for signed distance"
+      (countSubstring "let sd = dist - 0.5;" src >= 2)
+  gpuAtlasLoadOpBatchOk <-
+    check
+      "SDL GPU atlas batch uses per-draw load-op pass sequencing"
+      ( all
+          (`isInfixOf` src)
+          [ "sdlGpuLoadOpLoad",
+            "withColorTargetInfoLoadOp tex clear loadOp",
+            "forM_ (zip [0 :: Int ..] draws)"
+          ]
+      )
+  gpuCommandLifetimeOk <-
+    check
+      "SDL GPU atlas path submits/waits before releasing per-draw segment buffers"
+      ( all
+          (`isInfixOf` src)
+          [ "submitGpuCommandBufferAndWait gpuCtx.dev \"SDL_SubmitGPUCommandBuffer(gen-atlas)\" cmd",
+            "imgResult <- withUploadedSegBuffer dev cmd segs"
+          ]
+          && not ("requireTrue \"SDL_SubmitGPUCommandBuffer(gen-atlas)\"" `isInfixOf` src)
+      )
+  batchOverlapFallbackGuardOk <-
+    check
+      "SDL gpu batch path falls back when overlap support is enabled"
+      ( all
+          (`isInfixOf` src)
+          [ "gpu batch disabled for overlap-support scene; using per-glyph raster path",
+            "if cfg.ovlp"
+          ]
+      )
+  pure
+    ( and
+        [ routeHealOk,
+          routeNoHealOk,
+          modeParseOk,
+          fontRegularEnvOk,
+          fontVarEnvOk,
+          fontAxisEnvOk,
+          pxRangeDefaultOk,
+          dimDefaultOk,
+          justDefaultRuntimeTuningOk,
+          justVideoDriverDefaultOk,
+          justBackendDefaultOk,
+          harnessRuntimeDefaultsOk,
+          abRuntimeDefaultsOk,
+          harnessDimAbOk,
+          harnessCounterApexStrictOk,
+          harnessOracleGateOk,
+          abOracleGateOk,
+          oracleScriptStrictParityOk,
+          oracleScriptStressCasesOk,
+          oracleScriptVarInstancingOk,
+          aggressiveShaderOk,
+          gpuNoPerGlyphOverrideOk,
+          gpuWindingModeSwitchOk,
+          gpuWindingDefaultNonZeroOk,
+          cornerMixPresentOk,
+          mixDistPresentOk,
+          canonicalMedianOnlyOk,
+          screenRangeScaleInvariantOk,
+          healDistUsedOk,
+          gpuAtlasLoadOpBatchOk,
+          gpuCommandLifetimeOk,
+          batchOverlapFallbackGuardOk
+        ]
+    )
+
+runParityWorkflowSourceChecks :: IO Bool
+runParityWorkflowSourceChecks = do
+  paritySrc <- readFile "app/ParityMain.hs"
+  justSrc <- readFile "justfile"
+  msdfglGateSrc <- readFile "tools/run_msdfgl_oracle_gate.sh"
+  parityProfileFlagsOk <-
+    check
+      "masdiff-parity supports profile/oracle/manifest/json options"
+      ( all
+          (`isInfixOf` paritySrc)
+          [ "--profile",
+            "--oracle",
+            "--manifest",
+            "--json-out",
+            "--allow-missing-oracle",
+            "--require-oracle"
+          ]
+      )
+  parityProfileParserOk <-
+    check
+      "masdiff-parity profile parser supports pr/nightly/full"
+      ( all
+          (`isInfixOf` paritySrc)
+          [ "\"pr\" -> Right ProfilePr",
+            "\"nightly\" -> Right ProfileNightly",
+            "\"full\" -> Right ProfileFull"
+          ]
+      )
+  parityOracleParserOk <-
+    check
+      "masdiff-parity oracle parser supports process/msdfgl/both"
+      ( all
+          (`isInfixOf` paritySrc)
+          [ "\"process\" -> Right OracleProcess",
+            "\"msdfgl\" -> Right OracleMsdfgl",
+            "\"both\" -> Right OracleBoth"
+          ]
+      )
+  justOracleTargetsOk <-
+    check
+      "justfile exposes oracle-pr, oracle-nightly, and oracle-msdfgl targets"
+      ( all
+          (`isInfixOf` justSrc)
+          [ "oracle-pr:",
+            "oracle-nightly:",
+            "oracle-msdfgl:"
+          ]
+      )
+  msdfglGateUsesParityCliOk <-
+    check
+      "msdfgl oracle gate invokes masdiff-parity with msdfgl oracle mode"
+      ( all
+          (`isInfixOf` msdfglGateSrc)
+          [ "masdiff-parity --",
+            "--oracle msdfgl",
+            "--manifest",
+            "--profile"
+          ]
+      )
+  pure
+    ( and
+        [ parityProfileFlagsOk,
+          parityProfileParserOk,
+          parityOracleParserOk,
+          justOracleTargetsOk,
+          msdfglGateUsesParityCliOk
+        ]
+    )
+
+countSubstring :: String -> String -> Int
+countSubstring needle haystack
+  | null needle = 0
+  | otherwise = length (filter (isPrefixOf needle) (tails haystack))
 
 checkLoadManifestParsesValidFixture :: IO Bool
 checkLoadManifestParsesValidFixture =

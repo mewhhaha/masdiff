@@ -98,8 +98,10 @@ executable masdiff-parity
     main-is:          ParityMain.hs
     build-depends:
         base ^>=4.21.0.0,
+        bytestring,
         containers,
         directory,
+        filepath,
         masdiff,
         text
 

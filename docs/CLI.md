@@ -73,7 +73,7 @@ Options:
 
 ## `masdiff-parity`
 
-Compares native backend vs process backend across the built-in Inter oracle subset.
+Compares native output against selected oracle sources with profile-based parity gates.
 
 ```bash
 cabal run masdiff-parity -- [options]
@@ -82,13 +82,30 @@ cabal run masdiff-parity -- [options]
 Options:
 
 - `--max-cases <n>`
+- `--profile pr|nightly|full`
+- `--oracle process|msdfgl|both`
+- `--manifest <path>`
+- `--json-out <path>`
+- `--allow-missing-oracle`
+- `--require-oracle`
 - `--require-exact`
 - `--verbose`
 
+Examples:
+
+```bash
+cabal run masdiff-parity -- --profile pr --manifest out/reference/inter-mtsdf-oracle/manifest.tsv --verbose
+cabal run masdiff-parity -- --profile nightly --oracle both --manifest out/reference/inter-mtsdf-oracle/manifest.tsv --json-out out/parity-nightly.json --allow-missing-oracle --verbose
+```
+
 Notes:
 
-- This command exercises both backends internally and expects `msdfgen` to be available on `PATH` for process runs.
-- Oracle parity is intentionally limited to static fonts and the baseline variable setting (`wght=400`, `opsz=14`) because some `msdfgen` builds ignore variable-axis changes.
+- `--profile pr` is the strict default for the stable corpus and keeps exact parity requirements.
+- `--profile nightly` and `--profile full` expand coverage and use shape/metrics thresholds for broader cases.
+- `--oracle process` uses `msdfgen` via `MSDFGEN_BIN`/`PATH`; `--oracle msdfgl` reads oracle artifacts from `--manifest`; `--oracle both` enables both sources.
+- `--require-exact` remains available for explicit full-pixel exact checks.
+- Use `--manifest` for oracle input when using `--oracle msdfgl` or `--oracle both`.
+- `--allow-missing-oracle` permits sparse oracle coverage; `--require-oracle` enforces complete oracle availability.
 
 ## `masdiff-text-render`
 

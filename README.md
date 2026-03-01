@@ -353,54 +353,53 @@ cabal run masdiff -- \
   -printmetrics
 ```
 
-## Development Process (Using `msdfgen` as Oracle)
+## Development Process (Profiled Parity)
 
 This is the workflow used during development to tune and verify native output.
-`msdfgen` is treated as an external oracle only and is not a runtime dependency
-of the shipped native library path.
 
-Reference project: [Chlumsky/msdfgen](https://github.com/Chlumsky/msdfgen)
+`msdfgen` (`process`) is still supported as an oracle, and optional `msdfgl`
+artifacts can be compared through a manifest path.
 
-### 1) Generate oracle fixtures with external `msdfgen`
+`masdiff-parity` runs coverage-first and expands scope by profile.
 
-```bash
-MSDFGEN_BIN=msdfgen \
-MASDIFF_BACKEND=process \
-MTSDF_OUT=out/reference/inter-mtsdf-oracle \
-cabal run generate-inter-mtsdf-fixtures
-```
-
-### 2) Generate native fixtures with the same corpus settings
+### 1) Validate PR profile (stable corpus, exact)
 
 ```bash
-MASDIFF_BACKEND=native \
-MTSDF_OUT=out/reference/inter-mtsdf-native \
-cabal run generate-inter-mtsdf-fixtures
-```
-
-### 3) Validate native generation against oracle manifest
-
-This re-generates each manifest row with native code and diffs against oracle PNGs.
-
-```bash
-MASDIFF_BACKEND=native \
-cabal run masdiff-validate -- \
+cabal run masdiff-parity -- \
+  --profile pr \
   --manifest out/reference/inter-mtsdf-oracle/manifest.tsv \
+  --require-oracle \
   --verbose
 ```
 
-### 4) Run parity smoke checks
+### 2) Extend coverage with nightly profile
 
 ```bash
-cabal run masdiff-parity -- --verbose
+cabal run masdiff-parity -- \
+  --profile nightly \
+  --oracle both \
+  --manifest out/reference/inter-mtsdf-oracle/manifest.tsv \
+  --json-out out/parity-nightly.json \
+  --allow-missing-oracle
+```
+
+### 3) Optional full-coverage pass
+
+```bash
+cabal run masdiff-parity -- \
+  --profile full \
+  --max-cases 1000 \
+  --oracle msdfgl \
+  --manifest out/reference/inter-mtsdf-oracle/manifest.tsv \
+  --json-out out/parity-full.json
 ```
 
 Notes:
 
-- `masdiff-parity` requires an external `msdfgen` on `PATH` (or configured via `MSDFGEN_BIN`).
-- oracle comparison is a development gate only.
+- `--profile pr` remains strict exact on the stable corpus.
+- `--profile nightly` and `--profile full` expand coverage and use shape/metrics thresholds for broader cases.
 - production/runtime usage should use `native` generation and the WGSL shader path above.
-- some `msdfgen` builds do not apply variable-font axes in `-varfont` mode; when that is detected, strict SDL process-oracle checks are automatically downgraded to smoke checks.
+- `--oracle process` needs `MSDFGEN_BIN`/`PATH` for `msdfgen` access; `--oracle msdfgl` reads from the manifest artifacts.
 
 ## Docs
 
