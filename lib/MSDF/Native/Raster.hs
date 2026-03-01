@@ -4,6 +4,9 @@
 
 module MSDF.Native.Raster
   ( outlineMetrics,
+    filterBoundaryEdges,
+    mergeBoundaryEdgeContours,
+    postCorrectRenderedImage,
     rasterizeOutline,
   )
 where
@@ -14,6 +17,7 @@ import Data.Array ((!),
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (sortBy)
+import Data.Maybe (catMaybes, mapMaybe)
 import Data.Ord (comparing)
 import qualified Data.IntMap.Strict as IM
 import Data.Word (Word8)
@@ -28,7 +32,7 @@ import MSDF.Types
   ( GenCfg (..),
     GenErr (..),
     GenOut (..),
-    ImgRGBA8,
+    ImgRGBA8 (..),
     Metrics (..),
     mkImgRGBA8,
     unDim,
@@ -52,7 +56,7 @@ rasterizeOutline cfg outline = do
   let useBoundaryPrepass = cfg.ovlp
   let edgeContoursSelector =
         if useBoundaryPrepass
-          then filterBoundaryEdges edgeContours
+          then mergeBoundaryEdgeContours cfg.seed edgeContours
           else edgeContours
   let edges = concat edgeContours
   img <-
@@ -79,6 +83,65 @@ outlineMetrics cfg outline =
           range = Just (frame.rangeLo, frame.rangeHi)
         }
 
+postCorrectRenderedImage :: GenCfg -> Outline -> ImgRGBA8 -> Either GenErr ImgRGBA8
+postCorrectRenderedImage cfg outline img0
+  | img0.w /= dim || img0.h /= dim =
+      Left
+        (ExecFailed ("GPU raster image dimensions do not match cfg.dim: expected=" <> show dim <> "x" <> show dim <> " actual=" <> show img0.w <> "x" <> show img0.h))
+  | otherwise =
+      let frame = computeFrame cfg outline
+          edgeContours = buildEdgeContours cfg.seed outline.contours
+          edgeContoursSelector =
+            if cfg.ovlp
+              then mergeBoundaryEdgeContours cfg.seed edgeContours
+              else edgeContours
+          allEdges = concat edgeContours
+          fillRows =
+            [ scanlineRowFill dim frame allEdges y
+              | y <- [0 .. dim - 1]
+            ]
+          fills = concat fillRows
+          rawPixels = decodePixels img0.px
+          rawSamples =
+            [ mkSample px fill
+              | (px, fill) <- zip rawPixels fills
+            ]
+          signCorrectedPixels = applyAmbiguousSignFix dim dim rawSamples
+          correctionInputPixels = fmap floatLikePixel signCorrectedPixels
+          correctedPixels =
+            applyModernErrorCorrection dim dim frame (unPxRange cfg.pxr) edgeContoursSelector correctionInputPixels
+          correctedBytes =
+            BS.pack
+              [ channel
+                | px <- correctedPixels,
+                  channel <- encodePixel px
+              ]
+       in mkImage dim dim correctedBytes
+  where
+    dim = unDim cfg.dim
+
+    decodePixels :: ByteString -> [Pixel]
+    decodePixels bytes = go 0
+      where
+        n = BS.length bytes
+        go idx
+          | idx + 3 >= n = []
+          | otherwise =
+              let r = fromIntegral (BS.index bytes idx) / 255.0
+                  g = fromIntegral (BS.index bytes (idx + 1)) / 255.0
+                  b = fromIntegral (BS.index bytes (idx + 2)) / 255.0
+                  a = fromIntegral (BS.index bytes (idx + 3)) / 255.0
+               in Pixel {r = r, g = g, b = b, a = a} : go (idx + 4)
+
+    mkSample :: Pixel -> Bool -> PixelSample
+    mkSample px fill =
+      let med = corrMedian3 px.r px.g px.b
+          matchVal
+            | med == 0.5 = 0
+            | (med > 0.5) /= fill = -1
+            | otherwise = 1
+       in PixelSample {px = px, match = matchVal}
+
 filterBoundaryEdges :: [[Edge]] -> [[Edge]]
 filterBoundaryEdges edgeContours =
   fmap (filter isBoundaryEdge) edgeContours
@@ -99,6 +162,291 @@ filterBoundaryEdges edgeContours =
              in leftInside /= rightInside
           insideCount = length (filter id (map isBoundarySample sampleParams))
        in insideCount > div (length sampleParams) 2
+
+mergeBoundaryEdgeContours :: Int -> [[Edge]] -> [[Edge]]
+mergeBoundaryEdgeContours seed edgeContours
+  | null edgeContours = []
+  | null boundaryEdges = filterBoundaryEdges edgeContours
+  | null loops = filterBoundaryEdges edgeContours
+  | otherwise = fmap (loopToEdges boundaryEdges) loops
+  where
+    _ = seed
+    flatContours = fmap (concatMap flattenBoundaryEdge) edgeContours
+    allFlatEdges = concat flatContours
+    globalSpan = max 1.0e-6 (edgeSpan allFlatEdges)
+    boundaryEdges = mapMaybe (markBoundaryEdge allFlatEdges globalSpan) allFlatEdges
+    joinTol = max 1.0e-6 (globalSpan * 5.0e-4)
+    loops = stitchBoundaryLoops joinTol boundaryEdges
+
+    loopToEdges sourceEdges points =
+      case points of
+        [] -> []
+        [_] -> []
+        _ ->
+          let nexts = drop 1 points <> take 1 points
+           in zipWith (mkEdge sourceEdges) points nexts
+
+    mkEdge sourceEdges p0 p1 =
+      Edge
+        { a = p0,
+          b = p1,
+          c = Nothing,
+          col = nearestBoundaryColor sourceEdges p0 p1
+        }
+
+nearestBoundaryColor :: [Edge] -> Pt -> Pt -> Word8
+nearestBoundaryColor sourceEdges p0 p1 =
+  case sourceEdges of
+    [] -> 7
+    firstEdge : rest ->
+      snd (foldl' step (distanceSqPointToSegment mid firstEdge.a firstEdge.b, firstEdge.col) rest)
+  where
+    mid = midpointPt p0 p1
+
+    step (bestDist, bestCol) edge =
+      let dist = distanceSqPointToSegment mid edge.a edge.b
+       in if dist < bestDist
+            then (dist, edge.col)
+            else (bestDist, bestCol)
+
+midpointPt :: Pt -> Pt -> Pt
+midpointPt p0 p1 =
+  Pt
+    { x = (p0.x + p1.x) * 0.5,
+      y = (p0.y + p1.y) * 0.5
+    }
+
+distanceSqPointToSegment :: Pt -> Pt -> Pt -> Double
+distanceSqPointToSegment p a b =
+  let vx = b.x - a.x
+      vy = b.y - a.y
+      wx = p.x - a.x
+      wy = p.y - a.y
+      vv = (vx * vx) + (vy * vy)
+      tRaw =
+        if vv <= 1.0e-18
+          then 0.0
+          else ((wx * vx) + (wy * vy)) / vv
+      t
+        | tRaw < 0.0 = 0.0
+        | tRaw > 1.0 = 1.0
+        | otherwise = tRaw
+      qx = a.x + (t * vx)
+      qy = a.y + (t * vy)
+      dx = p.x - qx
+      dy = p.y - qy
+   in (dx * dx) + (dy * dy)
+
+markBoundaryEdge :: [Edge] -> Double -> Edge -> Maybe Edge
+markBoundaryEdge allEdges globalSpan edge =
+  if boundaryVotes >= 2
+    then Just edge
+    else Nothing
+  where
+    ts = [0.25, 0.5, 0.75]
+    boundaryVotes = length (filter id (fmap isBoundarySample ts))
+
+    isBoundarySample t =
+      let samplePt = edgePoint edge t
+          tangent = edgeTangent edge t
+          normal = orthonormalFalse tangent
+          offset = overlapSampleOffsetBoundary globalSpan edge
+          leftSample = samplePt `addPt` scalePt offset normal
+          rightSample = samplePt `addPt` scalePt (-offset) normal
+          leftInside = pointWindingInside allEdges leftSample
+          rightInside = pointWindingInside allEdges rightSample
+       in leftInside /= rightInside
+
+overlapSampleOffsetBoundary :: Double -> Edge -> Double
+overlapSampleOffsetBoundary globalSpan edge =
+  max globalOff localOff
+  where
+    segLen = distancePt edge.a edge.b
+    globalOff = max 2.5e-6 (globalSpan * 2.5e-5)
+    localOff = min (globalSpan * 2.0e-3) (segLen * 0.25)
+
+flattenBoundaryEdge :: Edge -> [Edge]
+flattenBoundaryEdge edge =
+  case edge.c of
+    Nothing -> [edge]
+    Just _ ->
+      [ Edge
+          { a = edgePoint edge t0,
+            b = edgePoint edge t1,
+            c = Nothing,
+            col = edge.col
+          }
+        | i <- [0 .. boundaryQuadSteps - 1],
+          let t0 = fromIntegral i / fromIntegral boundaryQuadSteps,
+          let t1 = fromIntegral (i + 1) / fromIntegral boundaryQuadSteps
+      ]
+
+boundaryQuadSteps :: Int
+boundaryQuadSteps = 24
+
+edgeSpan :: [Edge] -> Double
+edgeSpan edges =
+  case edges of
+    [] -> 0.0
+    e0 : rest ->
+      let initMinX = min e0.a.x e0.b.x
+          initMinY = min e0.a.y e0.b.y
+          initMaxX = max e0.a.x e0.b.x
+          initMaxY = max e0.a.y e0.b.y
+          (minX, minY, maxX, maxY) = foldl' step (initMinX, initMinY, initMaxX, initMaxY) rest
+       in max (maxX - minX) (maxY - minY)
+  where
+    step (minX, minY, maxX, maxY) edge =
+      ( min minX (min edge.a.x edge.b.x),
+        min minY (min edge.a.y edge.b.y),
+        max maxX (max edge.a.x edge.b.x),
+        max maxY (max edge.a.y edge.b.y)
+      )
+
+stitchBoundaryLoops :: Double -> [Edge] -> [[Pt]]
+stitchBoundaryLoops tol boundaryEdges =
+  catMaybes (fmap closeLoop (mergeAll [] boundaryEdges))
+  where
+    mergeAll polys edges =
+      case edges of
+        [] -> mergePolylinesFixpoint polys
+        edge : rest ->
+          let polys' = addSegmentToPolylines tol edge polys
+           in mergeAll polys' rest
+
+    closeLoop points =
+      case firstLast points of
+        Nothing -> Nothing
+        Just (startPt, endPt)
+          | pointsCloseTol tol startPt endPt ->
+              let closed = dropLast points
+                  normalized = dropDuplicateCloseTol tol (dropAdjacentDuplicateCloseTol tol closed)
+               in if length normalized >= 3 then Just normalized else Nothing
+        _ -> Nothing
+
+mergePolylinesFixpoint :: [[Pt]] -> [[Pt]]
+mergePolylinesFixpoint polys =
+  case mergePolylinesOnce tol polys of
+    Nothing -> polys
+    Just polys' -> mergePolylinesFixpoint polys'
+  where
+    tol = 1.0e-4
+
+mergePolylinesOnce :: Double -> [[Pt]] -> Maybe [[Pt]]
+mergePolylinesOnce tol polys =
+  go [] polys
+  where
+    go _ [] = Nothing
+    go done (p : rest) =
+      case extractMergeCandidate p [] rest of
+        Nothing -> go (p : done) rest
+        Just (merged, remaining) -> Just (reverse done <> (merged : remaining))
+
+    extractMergeCandidate _ _ [] = Nothing
+    extractMergeCandidate p checked (q : qs) =
+      case tryMergePolylines tol p q of
+        Nothing -> extractMergeCandidate p (q : checked) qs
+        Just merged -> Just (merged, reverse checked <> qs)
+
+tryMergePolylines :: Double -> [Pt] -> [Pt] -> Maybe [Pt]
+tryMergePolylines tol p q
+  | null p || null q = Nothing
+  | otherwise =
+      case (p, q, firstLast p, firstLast q) of
+        (pHead : pTail, qHead : qTail, Just (_pFirst, pLast), Just (_qFirst, qLast))
+          | pointsCloseTol tol pLast qHead -> Just (p <> qTail)
+          | pointsCloseTol tol pLast qLast -> Just (p <> drop 1 (reverse q))
+          | pointsCloseTol tol pHead qLast -> Just (q <> pTail)
+          | pointsCloseTol tol pHead qHead -> Just (reverse q <> pTail)
+          | otherwise -> Nothing
+        _ -> Nothing
+
+addSegmentToPolylines :: Double -> Edge -> [[Pt]] -> [[Pt]]
+addSegmentToPolylines tol edge polys =
+  case attachAny [] polys of
+    Nothing -> [edge.a, edge.b] : polys
+    Just polys' -> polys'
+  where
+    attachAny _ [] = Nothing
+    attachAny checked (poly : rest) =
+      case attachToPolyline tol edge poly of
+        Nothing -> attachAny (poly : checked) rest
+        Just poly' -> Just (reverse checked <> (poly' : rest))
+
+attachToPolyline :: Double -> Edge -> [Pt] -> Maybe [Pt]
+attachToPolyline tol edge points =
+  case points of
+    [] -> Just [edge.a, edge.b]
+    _ ->
+      case firstLast points of
+        Nothing -> Just [edge.a, edge.b]
+        Just (startPt, endPt) ->
+          if pointsCloseTol tol edge.a endPt
+            then Just (points <> [edge.b])
+            else
+              if pointsCloseTol tol edge.b endPt
+                then Just (points <> [edge.a])
+                else
+                  if pointsCloseTol tol edge.b startPt
+                    then Just (edge.a : points)
+                    else
+                      if pointsCloseTol tol edge.a startPt
+                        then Just (edge.b : points)
+                        else Nothing
+
+firstLast :: [a] -> Maybe (a, a)
+firstLast values =
+  case values of
+    [] -> Nothing
+    firstPt : rest -> Just (firstPt, go firstPt rest)
+  where
+    go acc remaining =
+      case remaining of
+        [] -> acc
+        x : xs -> go x xs
+
+dropLast :: [a] -> [a]
+dropLast values =
+  case values of
+    [] -> []
+    [_] -> []
+    x : xs -> x : dropLast xs
+
+pointsCloseTol :: Double -> Pt -> Pt -> Bool
+pointsCloseTol tol a b =
+  let dx = a.x - b.x
+      dy = a.y - b.y
+   in (dx * dx) + (dy * dy) <= tol * tol
+
+distancePt :: Pt -> Pt -> Double
+distancePt p q =
+  let dx = p.x - q.x
+      dy = p.y - q.y
+   in sqrt ((dx * dx) + (dy * dy))
+
+dropAdjacentDuplicateCloseTol :: Double -> [Pt] -> [Pt]
+dropAdjacentDuplicateCloseTol tol points =
+  case points of
+    [] -> []
+    firstPt : rest -> reverse (foldl' step [firstPt] rest)
+  where
+    step acc point =
+      case acc of
+        [] -> [point]
+        prev : _
+          | pointsCloseTol tol prev point -> acc
+        _ -> point : acc
+
+dropDuplicateCloseTol :: Double -> [Pt] -> [Pt]
+dropDuplicateCloseTol tol points =
+  case reverse points of
+    [] -> []
+    lastPt : _ ->
+      case points of
+        [] -> []
+        firstPt : _
+          | pointsCloseTol tol firstPt lastPt -> init points
+        _ -> points
 
 edgeTangent :: Edge -> Double -> Pt
 edgeTangent edge t =

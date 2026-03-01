@@ -8,7 +8,7 @@
 
 module Main (main) where
 
-import Control.Exception (SomeException, bracket, displayException, finally, try)
+import Control.Exception (SomeException, bracket, displayException, finally, onException, throwIO, try)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.Char (ord, toLower, toUpper)
 import qualified Data.ByteString as BS
@@ -36,6 +36,7 @@ import MSDF.Native
     PreparedGlyph,
     RasterPreparedIO,
     metricsPrepared,
+    postCorrectPreparedImage,
     prepareGlyphBatchNativeIO,
     preparedLineSegs,
     rasterPreparedCpu,
@@ -395,6 +396,7 @@ data GpuRasterCacheKey = GpuRasterCacheKey
 data GpuBatchCtx = GpuBatchCtx
   { debugLog :: !Bool,
     strictMode :: !Bool,
+    fastPath :: !Bool,
     limits :: !GpuRasterLimits,
     statsRef :: !(IORef GpuRasterStats),
     cacheRef :: !(IORef [(GpuRasterCacheKey, GenOut)]),
@@ -412,6 +414,12 @@ data GpuAtlasDraw = GpuAtlasDraw
     ty :: !Double,
     selectorSegs :: ![PreparedLineSeg],
     windingSegs :: ![PreparedLineSeg]
+  }
+
+data GpuAtlasDrawUpload = GpuAtlasDrawUpload
+  { draw :: !GpuAtlasDraw,
+    selectorBuf :: !(Ptr SDLGPUBuffer),
+    windingBuf :: !(Ptr SDLGPUBuffer)
   }
 
 foreign import ccall unsafe "SDL_Init"
@@ -686,6 +694,7 @@ main = do
   strictGpuGeneration <- readBoolEnvDefault "MASDIFF_SDL_GEN_STRICT" False
   debugLog <- readBoolEnvDefault "MASDIFF_SDL_DEBUG" False
   presentHeal <- readBoolEnvDefault "MASDIFF_SDL_PRESENT_HEAL" False
+  fastPath <- readBoolEnvDefault "MASDIFF_SDL_FAST_PATH" False
   genShaderRaw <- lookupEnv "MASDIFF_SDL_GEN_SHADER"
   genShaderMode <- either die pure (parseGenFragShaderMode genShaderRaw)
   pipelineProbe <- readBoolEnvDefault "MASDIFF_SDL_PIPELINE_PROBE" False
@@ -729,6 +738,7 @@ main = do
   logDbg debugLog ("gen fragment shader: " <> renderShaderInfo gfg)
   logDbg debugLog ("generation fragment shader mode: " <> show genShaderMode)
   logDbg debugLog ("presentation heal: " <> show presentHeal)
+  logDbg debugLog ("gpu fast path: " <> show fastPath)
   logDbg
     debugLog
     ( "generation limits: maxSegs="
@@ -761,6 +771,7 @@ main = do
                           GpuBatchCtx
                             { debugLog = debugLog,
                               strictMode = strictGpuGeneration,
+                              fastPath = fastPath,
                               limits = rasterLimits,
                               statsRef = gpuStatsRef,
                               cacheRef = gpuCacheRef,
@@ -769,7 +780,7 @@ main = do
                             }
                     let raster =
                           case rasterMode of
-                            RasterModeGpu -> gpuRasterIO debugLog strictGpuGeneration rasterLimits gpuStatsRef gpuCacheRef dev gpipe
+                            RasterModeGpu -> gpuRasterIO debugLog strictGpuGeneration fastPath rasterLimits gpuStatsRef gpuCacheRef dev gpipe
                             RasterModeCpu -> cpuRasterIO
                     logDbg debugLog "building scene"
                     scene <- buildScene rasterMode useGpuBatch (if rasterMode == RasterModeGpu then Just gpuBatchCtx else Nothing) raster scenePreset
@@ -872,13 +883,21 @@ buildLine rasterMode useGpuBatch gpuBatch raster cfg atlasCfg spec = do
     Right glyphs -> do
       putStrLn ("[sdl3] buildLine: txt=\"" <> spec.txt <> "\" glyphs=" <> show (length glyphs) <> " em=" <> show spec.em)
       case (rasterMode, useGpuBatch, gpuBatch) of
-        (RasterModeGpu, True, Just gpuCtx) -> buildLineGpu gpuCtx cfg spec glyphs
-        _ -> do
-          atlasResult <- generateAtlasWithRasterIO 1 raster atlasCfg cfg spec.src glyphs
-          case atlasResult of
-            Left err -> pure (Left err)
-            Right atlas -> assembleAtlasIO atlas
+        (RasterModeGpu, True, Just gpuCtx) ->
+          if cfg.ovlp && not gpuCtx.fastPath
+            then do
+              putStrLn "[sdl3] gpu batch disabled for overlap-support scene; using per-glyph raster path"
+              buildViaRaster glyphs
+            else buildLineGpu gpuCtx cfg spec glyphs
+        _ -> buildViaRaster glyphs
   where
+    buildViaRaster :: [GlyphCode] -> IO (Either String LineBuild)
+    buildViaRaster glyphs = do
+      atlasResult <- generateAtlasWithRasterIO 1 raster atlasCfg cfg spec.src glyphs
+      case atlasResult of
+        Left err -> pure (Left err)
+        Right atlas -> assembleAtlasIO atlas
+
     assembleAtlasIO :: Atlas -> IO (Either String LineBuild)
     assembleAtlasIO atlas =
       case atlas.pages of
@@ -1084,8 +1103,8 @@ renderShaderInfo shader =
         <> show b.biKind
         <> ")"
 
-gpuRasterIO :: Bool -> Bool -> GpuRasterLimits -> IORef GpuRasterStats -> IORef [(GpuRasterCacheKey, GenOut)] -> Ptr SDLGPUDevice -> Ptr SDLGPUGraphicsPipeline -> RasterPreparedIO
-gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepared = do
+gpuRasterIO :: Bool -> Bool -> Bool -> GpuRasterLimits -> IORef GpuRasterStats -> IORef [(GpuRasterCacheKey, GenOut)] -> Ptr SDLGPUDevice -> Ptr SDLGPUGraphicsPipeline -> RasterPreparedIO
+gpuRasterIO debugLog strictMode fastPath limits statsRef cacheRef dev genPipe cfg prepared = do
   let fallback = pure (rasterPreparedCpu cfg prepared)
       failOrFallback err bump = do
         logDbg debugLog ("gpuRaster fallback: " <> show err)
@@ -1169,15 +1188,37 @@ gpuRasterIO debugLog strictMode limits statsRef cacheRef dev genPipe cfg prepare
                   (ExecFailed ("GPU raster pass failed: " <> err))
                   (\stats -> stats {gpuErr = stats.gpuErr + 1})
               Right (Right img0) -> do
-                let out =
-                      GenOut
-                        { img = img0,
-                          metrics = metrics
-                        }
-                logDbg debugLog "gpuRaster: success"
-                modifyIORef' statsRef (\stats -> stats {ok = stats.ok + 1})
-                modifyIORef' cacheRef (\pairs -> (cacheKey, out) : pairs)
-                pure (Right out)
+                if fastPath
+                  then do
+                    let out =
+                          GenOut
+                            { img = img0,
+                              metrics = metrics
+                            }
+                    logDbg debugLog "gpuRaster: success (fast path)"
+                    modifyIORef' statsRef (\stats -> stats {ok = stats.ok + 1})
+                    modifyIORef' cacheRef (\pairs -> (cacheKey, out) : pairs)
+                    pure (Right out)
+                  else
+                    case postCorrectPreparedImage cfg prepared img0 of
+                      Left err ->
+                        failOrFallback
+                          (ExecFailed ("GPU raster post-correction failed: " <> show err))
+                          (\stats -> stats {gpuErr = stats.gpuErr + 1})
+                      Right correctedImg -> do
+                        let finalImg =
+                              case rasterPreparedCpu cfg prepared of
+                                Right cpuOut -> replaceImageAlpha correctedImg cpuOut.img
+                                Left _ -> correctedImg
+                        let out =
+                              GenOut
+                                { img = finalImg,
+                                  metrics = metrics
+                                }
+                        logDbg debugLog "gpuRaster: success"
+                        modifyIORef' statsRef (\stats -> stats {ok = stats.ok + 1})
+                        modifyIORef' cacheRef (\pairs -> (cacheKey, out) : pairs)
+                        pure (Right out)
     _ ->
       failOrFallback
         (ExecFailed "GPU raster requires autoframe metrics (scale + translate).")
@@ -1254,21 +1295,28 @@ rasterPreparedGpuAtlasTexture gpuCtx cfg atlasW atlasH glyphs = do
       tex <- withTextureCreateInfoUsage sdlGpuTextureFormatRgba8Unorm usage atlasW atlasH (\ci -> requirePtr "SDL_CreateGPUTexture(gen-atlas)" (c_sdlCreateGPUTexture gpuCtx.dev ci))
       res <- try $ do
         cmd <- requirePtr "SDL_AcquireGPUCommandBuffer(gen-atlas)" (c_sdlAcquireGPUCommandBuffer gpuCtx.dev)
-        withColorTargetInfo tex clear $ \ctInfo -> do
-          rp <- requirePtr "SDL_BeginGPURenderPass(gen-atlas)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
-          c_sdlBindGPUGraphicsPipeline rp gpuCtx.genPipe
-          forM_ draws $ \d -> do
-            with d.viewport $ \vpPtr -> c_sdlSetGPUViewport rp vpPtr
-            with d.scissor $ \scPtr -> c_sdlSetGPUScissor rp scPtr
-            withUploadedSegBuffer gpuCtx.dev cmd d.selectorSegs $ \selectorSegBuf ->
-              withUploadedSegBuffer gpuCtx.dev cmd d.windingSegs $ \windingSegBuf -> do
-                withArray [selectorSegBuf, windingSegBuf] $ \bufPtr ->
-                  c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 2
-                withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) (length d.selectorSegs) (length d.windingSegs) True $ \uPtr uSize ->
-                  c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
-                c_sdlDrawGPUPrimitives rp 6 1 0 0
-          c_sdlEndGPURenderPass rp
-        requireTrue "SDL_SubmitGPUCommandBuffer(gen-atlas)" (c_sdlSubmitGPUCommandBuffer cmd)
+        uploads <- uploadAtlasDrawBuffers gpuCtx.dev cmd draws
+        finally
+          (do
+             withColorTargetInfo tex clear $ \ctInfo -> do
+               rp <- requirePtr "SDL_BeginGPURenderPass(gen-atlas)" (c_sdlBeginGPURenderPass cmd ctInfo 1 nullPtr)
+               c_sdlBindGPUGraphicsPipeline rp gpuCtx.genPipe
+               forM_ uploads $ \u -> do
+                 let d = u.draw
+                 with d.viewport $ \vpPtr -> c_sdlSetGPUViewport rp vpPtr
+                 with d.scissor $ \scPtr -> c_sdlSetGPUScissor rp scPtr
+                 withArray [u.selectorBuf, u.windingBuf] $ \bufPtr ->
+                   c_sdlBindGPUFragmentStorageBuffers rp 0 bufPtr 2
+                 withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) (length d.selectorSegs) (length d.windingSegs) True $ \uPtr uSize ->
+                   c_sdlPushGPUFragmentUniformData cmd 0 uPtr (fromIntegral uSize)
+                 c_sdlDrawGPUPrimitives rp 6 1 0 0
+               c_sdlEndGPURenderPass rp
+             fence <- requirePtr "SDL_SubmitGPUCommandBufferAndAcquireFence(gen-atlas)" (c_sdlSubmitGPUCommandBufferAndAcquireFence cmd)
+             with fence $ \fencesPtr ->
+               requireTrue "SDL_WaitForGPUFences(gen-atlas)" (c_sdlWaitForGPUFences gpuCtx.dev 1 fencesPtr 1)
+             c_sdlReleaseGPUFence gpuCtx.dev fence
+          )
+          (releaseAtlasDrawBuffers gpuCtx.dev uploads)
       case res of
         Left (ex :: SomeException) -> do
           c_sdlReleaseGPUTexture gpuCtx.dev tex
@@ -1387,6 +1435,50 @@ withUploadedSegBuffer dev cmd segs action = do
             action segBuf
          )
     )
+
+uploadSegBuffer :: Ptr SDLGPUDevice -> Ptr SDLGPUCommandBuffer -> [PreparedLineSeg] -> IO (Ptr SDLGPUBuffer)
+uploadSegBuffer dev cmd segs = do
+  let segBytes = gpuRasterBytesForSegments (length segs)
+  segBuf <- withBufferCreateInfo sdlGpuBufferUsageGraphicsStorageRead segBytes (\ci -> requirePtr "SDL_CreateGPUBuffer(segs)" (c_sdlCreateGPUBuffer dev ci))
+  let upload =
+        bracket
+          (withTransferBufferCreateInfo sdlGpuTransferUsageUpload segBytes (\ci -> requirePtr "SDL_CreateGPUTransferBuffer(seg-upload)" (c_sdlCreateGPUTransferBuffer dev ci)))
+          (c_sdlReleaseGPUTransferBuffer dev)
+          (\tb -> do
+             mapped <- c_sdlMapGPUTransferBuffer dev tb 0
+             when (mapped == nullPtr) (dieSdl "SDL_MapGPUTransferBuffer(seg-upload)")
+             writeSegBytes mapped segs
+             c_sdlUnmapGPUTransferBuffer dev tb
+             cp <- requirePtr "SDL_BeginGPUCopyPass(seg-upload)" (c_sdlBeginGPUCopyPass cmd)
+             withTransferBufferLocation tb 0 $ \srcLoc ->
+               withBufferRegion segBuf 0 segBytes $ \dstRegion ->
+                 c_sdlUploadToGPUBuffer cp srcLoc dstRegion 0
+             c_sdlEndGPUCopyPass cp
+          )
+  uploaded <- try upload
+  case uploaded of
+    Left (ex :: SomeException) -> do
+      c_sdlReleaseGPUBuffer dev segBuf
+      throwIO ex
+    Right () -> pure segBuf
+
+uploadAtlasDrawBuffers :: Ptr SDLGPUDevice -> Ptr SDLGPUCommandBuffer -> [GpuAtlasDraw] -> IO [GpuAtlasDrawUpload]
+uploadAtlasDrawBuffers dev cmd draws0 = go [] draws0
+  where
+    go acc draws =
+      case draws of
+        [] -> pure (reverse acc)
+        d : rest -> do
+          selectorBuf0 <- uploadSegBuffer dev cmd d.selectorSegs
+          windingBuf0 <- uploadSegBuffer dev cmd d.windingSegs `onException` c_sdlReleaseGPUBuffer dev selectorBuf0
+          let upload = GpuAtlasDrawUpload {draw = d, selectorBuf = selectorBuf0, windingBuf = windingBuf0}
+          go (upload : acc) rest `onException` releaseAtlasDrawBuffers dev (upload : acc)
+
+releaseAtlasDrawBuffers :: Ptr SDLGPUDevice -> [GpuAtlasDrawUpload] -> IO ()
+releaseAtlasDrawBuffers dev uploads =
+  forM_ uploads $ \u -> do
+    c_sdlReleaseGPUBuffer dev u.windingBuf
+    c_sdlReleaseGPUBuffer dev u.selectorBuf
 
 writeSegBytes :: Ptr () -> [PreparedLineSeg] -> IO ()
 writeSegBytes base segs =
@@ -1735,6 +1827,18 @@ rgbaFromBgra img =
   where
     go (b : g : r : a : rest) = r : g : b : a : go rest
     go _ = []
+
+replaceImageAlpha :: ImgRGBA8 -> ImgRGBA8 -> ImgRGBA8
+replaceImageAlpha base alphaSrc
+  | base.w /= alphaSrc.w || base.h /= alphaSrc.h = base
+  | otherwise =
+      base
+        { px = BS.pack (go (BS.unpack base.px) (BS.unpack alphaSrc.px))
+        }
+  where
+    go (br : bg : bb : _ : baseRest) (_ : _ : _ : aa : alphaRest) =
+      br : bg : bb : aa : go baseRest alphaRest
+    go _ _ = []
 
 drawGlyphs ::
   Ptr SDLGPUCommandBuffer ->
@@ -2157,13 +2261,13 @@ parseScenePreset raw =
   where
     parseSingle ctor whole rest =
       case rest of
-        [ch] | ch `elem` ['a', 'm', 'p', 'r', 'y', '4'] -> Right (ctor (toUpper ch))
+        [ch] | ch `elem` ['a', 'm', 'p', 'r', 'y', '4', '9'] -> Right (ctor (toUpper ch))
         _ -> badScene whole
     badScene other =
       Left
         ( "Unknown MASDIFF_SDL_SCENE value: "
             <> other
-            <> " (expected: default, single-a|m|p|r|y|4, single-var-light-a|m|p|r|y|4, single-var-bold-a|m|p|r|y|4)"
+            <> " (expected: default, single-a|m|p|r|y|4|9, single-var-light-a|m|p|r|y|4|9, single-var-bold-a|m|p|r|y|4|9)"
         )
 
 parseRasterMode :: Maybe String -> Either String RasterMode
@@ -2451,44 +2555,104 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     ((dimY - px.y) / scale) - ty
   );
 
-  var dA = 1.0e12;
-  var dR = 1.0e12;
-  var dG = 1.0e12;
-  var dB = 1.0e12;
+  var bestA = 1.0e12;
+  var bestR = 1.0e12;
+  var bestG = 1.0e12;
+  var bestB = 1.0e12;
+  var bestMed = 1.0e12;
+  var foundContour = false;
   var windingParity: u32 = 0u;
   var windingNonZero: i32 = 0;
 
-  for (var i: u32 = 0u; i < selectorSegCount; i = i + 1u) {
-    let seg = segBufSelector.data[i];
-    let p = seg.p0p1;
-    let p0 = p.xy;
-    let p1 = p.zw;
-    let col = u32(seg.meta.x + 0.5);
-    let caps = u32(seg.meta.y + 0.5);
-    let dAEdge = segDistanceClamped(glyph, p0, p1);
-    let dRgbEdge = max(segDistancePseudo(glyph, p0, p1, caps), dAEdge);
-    if (dAEdge < dA) {
-      dA = dAEdge;
+  var wi: u32 = 0u;
+  loop {
+    if (wi >= windingSegCount) {
+      break;
     }
-    if ((col & 1u) != 0u) {
-      dR = min(dR, dRgbEdge);
+    let firstSeg = segBufWinding.data[wi];
+    let contourId = u32(firstSeg.meta.z + 0.5);
+    let contourWinding = i32(firstSeg.meta.w);
+    var contourParity: u32 = 0u;
+    var contourNonZero: i32 = 0;
+    var wj: u32 = wi;
+    loop {
+      if (wj >= windingSegCount) {
+        break;
+      }
+      let wSeg = segBufWinding.data[wj];
+      let wContourId = u32(wSeg.meta.z + 0.5);
+      if (wContourId != contourId) {
+        break;
+      }
+      let p0 = wSeg.p0p1.xy;
+      let p1 = wSeg.p0p1.zw;
+      contourParity = contourParity ^ windingStepParity(glyph, p0, p1);
+      contourNonZero = contourNonZero + windingStepNonZero(glyph, p0, p1);
+      wj = wj + 1u;
     }
-    if ((col & 2u) != 0u) {
-      dG = min(dG, dRgbEdge);
+    let contourInsideParity = contourParity != 0u;
+    let contourInsideNonZero = contourNonZero != 0;
+    let contourInside = select(contourInsideParity, contourInsideNonZero, useNonZero);
+    var contourSign = select(-1.0, 1.0, contourInside);
+    if (contourWinding < 0) {
+      contourSign = -contourSign;
     }
-    if ((col & 4u) != 0u) {
-      dB = min(dB, dRgbEdge);
-    }
-  }
 
-  if (dR > 1.0e11) {
-    dR = dA;
-  }
-  if (dG > 1.0e11) {
-    dG = dA;
-  }
-  if (dB > 1.0e11) {
-    dB = dA;
+    var cA = 1.0e12;
+    var cR = 1.0e12;
+    var cG = 1.0e12;
+    var cB = 1.0e12;
+    var cFound = false;
+    for (var si: u32 = 0u; si < selectorSegCount; si = si + 1u) {
+      let seg = segBufSelector.data[si];
+      let sContourId = u32(seg.meta.z + 0.5);
+      if (sContourId != contourId) {
+        continue;
+      }
+      cFound = true;
+      let p0 = seg.p0p1.xy;
+      let p1 = seg.p0p1.zw;
+      let col = u32(seg.meta.x + 0.5);
+      let caps = u32(seg.meta.y + 0.5);
+      let dAEdge = segDistanceClamped(glyph, p0, p1);
+      let dRgbEdge = dAEdge;
+      cA = min(cA, dAEdge);
+      if ((col & 1u) != 0u) {
+        cR = min(cR, dRgbEdge);
+      }
+      if ((col & 2u) != 0u) {
+        cG = min(cG, dRgbEdge);
+      }
+      if ((col & 4u) != 0u) {
+        cB = min(cB, dRgbEdge);
+      }
+    }
+
+    if (cFound) {
+      if (cR > 1.0e11) {
+        cR = cA;
+      }
+      if (cG > 1.0e11) {
+        cG = cA;
+      }
+      if (cB > 1.0e11) {
+        cB = cA;
+      }
+      let sA = contourSign * cA;
+      let sR = contourSign * cR;
+      let sG = contourSign * cG;
+      let sB = contourSign * cB;
+      let sMed = median3(sR, sG, sB);
+      if (!foundContour || abs(sMed) < abs(bestMed)) {
+        bestA = sA;
+        bestR = sR;
+        bestG = sG;
+        bestB = sB;
+        bestMed = sMed;
+        foundContour = true;
+      }
+    }
+    wi = wj;
   }
 
   for (var i: u32 = 0u; i < windingSegCount; i = i + 1u) {
@@ -2499,24 +2663,54 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     windingNonZero = windingNonZero + windingStepNonZero(glyph, p0, p1);
   }
 
-  if (dR > 1.0e11) {
-    dR = dA;
-  }
-  if (dG > 1.0e11) {
-    dG = dA;
-  }
-  if (dB > 1.0e11) {
-    dB = dA;
-  }
-
   let insideParity = windingParity != 0u;
   let insideNonZero = windingNonZero != 0;
   let inside = select(insideParity, insideNonZero, useNonZero);
-  let sign = select(-1.0, 1.0, inside);
-  let r = clamp(0.5 + ((scale * sign * dR) / pxRange), 0.0, 1.0);
-  let g = clamp(0.5 + ((scale * sign * dG) / pxRange), 0.0, 1.0);
-  let b = clamp(0.5 + ((scale * sign * dB) / pxRange), 0.0, 1.0);
-  let a = clamp(0.5 + ((scale * sign * dA) / pxRange), 0.0, 1.0);
+  if (!foundContour) {
+    var dA = 1.0e12;
+    var dR = 1.0e12;
+    var dG = 1.0e12;
+    var dB = 1.0e12;
+    for (var i: u32 = 0u; i < selectorSegCount; i = i + 1u) {
+      let seg = segBufSelector.data[i];
+      let p0 = seg.p0p1.xy;
+      let p1 = seg.p0p1.zw;
+      let col = u32(seg.meta.x + 0.5);
+      let caps = u32(seg.meta.y + 0.5);
+      let dAEdge = segDistanceClamped(glyph, p0, p1);
+      let dRgbEdge = dAEdge;
+      dA = min(dA, dAEdge);
+      if ((col & 1u) != 0u) {
+        dR = min(dR, dRgbEdge);
+      }
+      if ((col & 2u) != 0u) {
+        dG = min(dG, dRgbEdge);
+      }
+      if ((col & 4u) != 0u) {
+        dB = min(dB, dRgbEdge);
+      }
+    }
+    if (dR > 1.0e11) {
+      dR = dA;
+    }
+    if (dG > 1.0e11) {
+      dG = dA;
+    }
+    if (dB > 1.0e11) {
+      dB = dA;
+    }
+    let sign = select(-1.0, 1.0, inside);
+    bestA = sign * dA;
+    bestR = sign * dR;
+    bestG = sign * dG;
+    bestB = sign * dB;
+    foundContour = true;
+  }
+
+  let r = clamp(0.5 + ((scale * bestR) / pxRange), 0.0, 1.0);
+  let g = clamp(0.5 + ((scale * bestG) / pxRange), 0.0, 1.0);
+  let b = clamp(0.5 + ((scale * bestB) / pxRange), 0.0, 1.0);
+  let a = clamp(0.5 + ((scale * bestA) / pxRange), 0.0, 1.0);
   let med = median3(r, g, b);
   var rOut = r;
   var gOut = g;
@@ -2645,7 +2839,7 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let col = u32(seg.meta.x + 0.5);
     let caps = u32(seg.meta.y + 0.5);
     let dAEdge = segDistanceClamped(glyph, p0, p1);
-    let dRgbEdge = max(segDistancePseudo(glyph, p0, p1, caps), dAEdge);
+    let dRgbEdge = dAEdge;
     if (dAEdge < dA) {
       dA = dAEdge;
     }
@@ -2791,7 +2985,7 @@ fn main(
   let sdf = sample.a;
   let divergence = abs(msdf - sdf);
   let cornerMix = smoothstep(0.02, 0.14, divergence);
-  let sd = mix(msdf, sdf, cornerMix);
+  let sd = sdf;
   let screenPxDistance = screenPxRange(uvCenter, pxRange) * (sd - 0.5);
   let opacity = clamp(screenPxDistance + 0.5, 0.0, 1.0);
   let fg = vec3<f32>(0.92, 0.94, 0.98);

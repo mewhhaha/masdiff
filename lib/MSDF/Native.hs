@@ -12,7 +12,9 @@ module MSDF.Native
     prepareGlyphNativeIO,
     prepareGlyphBatchNativeIO,
     metricsPrepared,
+    preparedNeedsOverlap,
     preparedLineSegs,
+    postCorrectPreparedImage,
     rasterPreparedCpu,
     generateGlyphNativeWithIO,
     generateGlyphBatchNativeWithIO,
@@ -30,7 +32,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Word (Word8)
 import GHC.Conc (numCapabilities)
-import MSDF.Native.Raster (filterBoundaryEdges, outlineMetrics, rasterizeOutline)
+import MSDF.Native.Raster (mergeBoundaryEdgeContours, outlineMetrics, postCorrectRenderedImage, rasterizeOutline)
 import MSDF.Native.TTF (VariationAxes (..), loadOutlineIO, loadOutlinesIO)
 import MSDF.Native.Types (Edge (..), Outline (..), Pt (..), buildEdgeContours)
 import MSDF.Types
@@ -42,6 +44,7 @@ import MSDF.Types
     GenErr (..),
     GenOut,
     GlyphCode,
+    ImgRGBA8,
     Metrics,
     Mode (..),
     unDim,
@@ -310,22 +313,52 @@ prepareGlyphBatchNativeIO src glyphs =
 metricsPrepared :: GenCfg -> PreparedGlyph -> Metrics
 metricsPrepared cfg prepared = outlineMetrics cfg prepared.ol
 
+preparedNeedsOverlap :: GenCfg -> PreparedGlyph -> Bool
+preparedNeedsOverlap cfg prepared =
+  cfg.ovlp && requiresBoundaryMerge prepared rawSegs
+  where
+    rawSegs = preparedRawLineSegs cfg prepared
+
 preparedLineSegs :: GenCfg -> PreparedGlyph -> [PreparedLineSeg]
 preparedLineSegs cfg prepared =
+  if useBoundaryMerge
+    then flattenEdgeContours cfg edgeContoursMerged
+    else rawSegs
+  where
+    edgeContoursRaw = buildEdgeContours cfg.seed prepared.ol.contours
+    rawSegs = flattenEdgeContours cfg edgeContoursRaw
+    useBoundaryMerge = cfg.ovlp && requiresBoundaryMerge prepared rawSegs
+    edgeContoursMerged = mergeBoundaryEdgeContours cfg.seed edgeContoursRaw
+
+preparedRawLineSegs :: GenCfg -> PreparedGlyph -> [PreparedLineSeg]
+preparedRawLineSegs cfg prepared =
+  flattenEdgeContours cfg edgeContoursRaw
+  where
+    edgeContoursRaw = buildEdgeContours cfg.seed prepared.ol.contours
+
+requiresBoundaryMerge :: PreparedGlyph -> [PreparedLineSeg] -> Bool
+requiresBoundaryMerge prepared rawSegs =
+  preparedHasMultipleContours prepared
+    || hasProperSelfIntersection rawSegs
+    || requiresNonZeroWinding rawSegs
+
+preparedHasMultipleContours :: PreparedGlyph -> Bool
+preparedHasMultipleContours prepared =
+  case prepared.ol.contours of
+    _ : _ : _ -> True
+    _ -> False
+
+flattenEdgeContours :: GenCfg -> [[Edge]] -> [PreparedLineSeg]
+flattenEdgeContours cfg edgeContours =
   concat
     [ flattenContour contourIx (contourWindingSign edges) edges
       | (contourIx, edges) <- zip [0 :: Int ..] edgeContours
     ]
   where
-    edgeContoursRaw = buildEdgeContours cfg.seed prepared.ol.contours
-    edgeContours =
-      if cfg.ovlp
-        then filterBoundaryEdges edgeContoursRaw
-        else edgeContoursRaw
     quadSteps =
       max
-        4
-        (min 24 (unDim cfg.dim `quot` 16))
+        12
+        (min 96 (unDim cfg.dim `quot` 4))
 
     flattenContour contourIx contourWinding0 edges =
       let contourId = fromIntegral (contourIx `mod` 256) :: Word8
@@ -421,7 +454,14 @@ rotateRight values =
     v : rest -> v : reverse rest
 
 rasterPreparedCpu :: GenCfg -> PreparedGlyph -> Either GenErr GenOut
-rasterPreparedCpu cfg prepared = rasterizeOutline cfg prepared.ol
+rasterPreparedCpu cfg prepared = rasterizeOutline cfgEff prepared.ol
+  where
+    cfgEff = cfg {ovlp = preparedNeedsOverlap cfg prepared}
+
+postCorrectPreparedImage :: GenCfg -> PreparedGlyph -> ImgRGBA8 -> Either GenErr ImgRGBA8
+postCorrectPreparedImage cfg prepared img0 = postCorrectRenderedImage cfgEff prepared.ol img0
+  where
+    cfgEff = cfg {ovlp = preparedNeedsOverlap cfg prepared}
 
 generateGlyphNativeWithIO :: RasterPreparedIO -> GenCfg -> FontSrc -> GlyphCode -> IO (Either GenErr GenOut)
 generateGlyphNativeWithIO raster cfg src glyph =
