@@ -288,6 +288,18 @@ loadManifest :: FilePath -> IO (Either String Manifest)
 manifestCfg :: ManifestMeta -> GenCfg
 ```
 
+## Module `MSDF.VarFont`
+
+Shared variable-font parsing helpers for CLI and manifest workflows.
+
+### Exported functions
+
+```haskell
+parseVarFontSpec :: String -> Either String FontSrc
+parseAxisQuery :: String -> Either String AxisMap
+parseAxisAssignments :: [(String, String)] -> Either String AxisMap
+```
+
 ## Module `MSDF.TextRender`
 
 CPU-side MTSDF shading and composition utilities for preview rendering.

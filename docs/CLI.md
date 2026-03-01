@@ -94,8 +94,8 @@ Options:
 Examples:
 
 ```bash
-cabal run masdiff-parity -- --profile pr --manifest out/reference/inter-mtsdf-oracle/manifest.tsv --verbose
-cabal run masdiff-parity -- --profile nightly --oracle both --manifest out/reference/inter-mtsdf-oracle/manifest.tsv --json-out out/parity-nightly.json --allow-missing-oracle --verbose
+cabal run masdiff-parity -- --profile pr --manifest out/reference/inter-mtsdf/manifest.tsv --verbose
+cabal run masdiff-parity -- --profile nightly --oracle both --manifest out/reference/inter-mtsdf/manifest.tsv --json-out out/parity-nightly.json --allow-missing-oracle --verbose
 ```
 
 Notes:

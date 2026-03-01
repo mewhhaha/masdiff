@@ -23,6 +23,7 @@ import qualified Data.ByteString.Char8 as C8
 import qualified Data.ByteString.Lazy as BL
 import MSDF.Types (ImgRGBA8 (..), mkImgRGBA8)
 import System.IO (IOMode (WriteMode), withBinaryFile)
+import System.IO.Error (catchIOError, ioeGetErrorString)
 
 encodePngRGBA8 :: ImgRGBA8 -> ByteString
 encodePngRGBA8 img =
@@ -45,7 +46,10 @@ decodePngRGBA8 pngBytes = do
   mkImgRGBA8 rgba8.imageWidth rgba8.imageHeight (imageToByteString rgba8)
 
 readPngRGBA8File :: FilePath -> IO (Either String ImgRGBA8)
-readPngRGBA8File path = decodePngRGBA8 <$> BS.readFile path
+readPngRGBA8File path =
+  catchIOError
+    (decodePngRGBA8 <$> BS.readFile path)
+    (\err -> pure (Left ("Failed to read PNG file " <> path <> ": " <> ioeGetErrorString err)))
 
 writePngRGBA8File :: FilePath -> ImgRGBA8 -> IO ()
 writePngRGBA8File path = BS.writeFile path . encodePngRGBA8

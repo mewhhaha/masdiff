@@ -17,6 +17,7 @@ import MSDF.Compare (DiffStats (..), diffRGBA8, passesGate, strictGate)
 import MSDF.Encode (readPngRGBA8File)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestRow (..), loadManifest, manifestCfg)
+import MSDF.VarFont (parseAxisAssignments)
 import MSDF.Types
   ( AxisTag (..),
     AxisVal (..),
@@ -340,27 +341,21 @@ fontCaseToFontSrc fontCase =
   case fontCase.fontCaseSource of
     StaticFont path ->
       Right FontFile {path = path}
-    VariableFont path axes -> do
-      axisPairs <- traverse parseAxis axes
-      pure
-        VarFontFile
-          { path = path,
-            axes = Map.fromList axisPairs
-          }
-  where
-    parseAxis (name, rawValue) =
-      case readMaybe rawValue of
-        Just value | isFinite value ->
-          Right (AxisTag (T.pack name), AxisVal value)
-        _ ->
+    VariableFont path axisAssignments ->
+      case parseAxisAssignments axisAssignments of
+        Left err ->
           Left
-            ( "Invalid variable axis value for case "
+            ( "Invalid variable axis assignment for case "
                 <> fontCase.fontCaseId
                 <> ": "
-                <> name
-                <> "="
-                <> rawValue
+                <> err
             )
+        Right axisMap ->
+          Right
+            VarFontFile
+              { path = path,
+                axes = axisMap
+              }
 
 runProviderPlan :: CliCfg -> RuntimeCfg -> RuntimeCfg -> RunCtx -> (OracleProvider, Either String [CaseRow]) -> IO Summary
 runProviderPlan cli nativeRuntime processRuntime runCtx (provider, plan) =
@@ -939,9 +934,6 @@ whenVerbose verbose action =
   if verbose
     then action
     else pure ()
-
-isFinite :: Double -> Bool
-isFinite x = not (isNaN x || isInfinite x)
 
 parseProfile :: String -> Either String Profile
 parseProfile raw =

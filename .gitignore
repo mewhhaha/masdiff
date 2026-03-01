@@ -33,3 +33,5 @@ examples/**/out/
 # Editor/system
 *~
 .DS_Store
+__pycache__/
+*.pyc

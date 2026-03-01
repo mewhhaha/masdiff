@@ -5,9 +5,7 @@
 module Main (main) where
 
 import Data.Char (ord)
-import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
-import qualified Data.Text as T
 import MSDF.Atlas
   ( Atlas (..),
     AtlasCfg,
@@ -22,10 +20,9 @@ import MSDF.Generate
     defaultRuntimeCfg,
     parseBackendModeEnv,
   )
+import MSDF.VarFont (parseVarFontSpec)
 import MSDF.Types
-  ( AxisTag (..),
-    AxisVal (..),
-    FontSrc (..),
+  ( FontSrc (..),
     GenCfg (..),
     GlyphCode,
     Mode (..),
@@ -256,31 +253,6 @@ ensureNoSource st =
     Nothing -> Right ()
     Just _ -> Left "Only one source is allowed: use either -font or -varfont."
 
-parseVarFontSpec :: String -> Either String FontSrc
-parseVarFontSpec spec =
-  case splitOnce "?" spec of
-    Nothing ->
-      Right
-        VarFontFile
-          { path = spec,
-            axes = Map.empty
-          }
-    Just (path, query) -> do
-      axes <- Map.fromList <$> traverse parseAxisPair (splitBy '&' query)
-      pure
-        VarFontFile
-          { path = path,
-            axes = axes
-          }
-
-parseAxisPair :: String -> Either String (AxisTag, AxisVal)
-parseAxisPair raw =
-  case splitOnce "=" raw of
-    Nothing -> Left ("Invalid axis entry in -varfont value: " <> raw)
-    Just (name, valueRaw) -> do
-      value <- parseDouble "axis value" valueRaw
-      pure (AxisTag (T.pack name), AxisVal value)
-
 firstInvalid :: String -> Either String a -> Either String a
 firstInvalid label result =
   case result of
@@ -298,28 +270,6 @@ parseDouble label raw =
   case reads raw of
     [(x, "")] -> Right x
     _ -> Left ("Invalid " <> label <> ": " <> raw)
-
-splitBy :: Char -> String -> [String]
-splitBy delim = foldr step [""]
-  where
-    step c acc
-      | c == delim = "" : acc
-      | otherwise =
-          case acc of
-            [] -> [[c]]
-            (x : xs) -> (c : x) : xs
-
-splitOnce :: String -> String -> Maybe (String, String)
-splitOnce token input = go [] input
-  where
-    go _ [] = Nothing
-    go acc rest@(x : xs)
-      | token `prefixOf` rest =
-          Just (reverse acc, drop (length token) rest)
-      | otherwise = go (x : acc) xs
-
-prefixOf :: String -> String -> Bool
-prefixOf prefix value = take (length prefix) value == prefix
 
 traverse_ :: Applicative f => (a -> f b) -> [a] -> f ()
 traverse_ f = foldr (\x acc -> f x *> acc) (pure ())

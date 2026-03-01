@@ -12,12 +12,9 @@ module MSDF.Manifest
 where
 
 import Data.Bifunctor (first)
-import qualified Data.Map.Strict as Map
-import qualified Data.Text as T
+import MSDF.VarFont (parseVarFontSpec)
 import MSDF.Types
-  ( AxisTag (..),
-    AxisVal (..),
-    Dim,
+  ( Dim,
     FontSrc (..),
     GenCfg (..),
     GlyphCode,
@@ -27,6 +24,7 @@ import MSDF.Types
     mkGlyphCode,
     mkPxRange,
   )
+import System.IO.Error (catchIOError, ioeGetErrorString)
 
 data ManifestMeta = ManifestMeta
   { dim :: Dim,
@@ -51,7 +49,10 @@ data Manifest = Manifest
   deriving stock (Eq, Show)
 
 loadManifest :: FilePath -> IO (Either String Manifest)
-loadManifest path = parseManifest <$> readFile path
+loadManifest path =
+  catchIOError
+    (parseManifest <$> readFile path)
+    (\err -> pure (Left ("Failed to read manifest " <> path <> ": " <> ioeGetErrorString err)))
 
 manifestCfg :: ManifestMeta -> GenCfg
 manifestCfg meta =
@@ -164,35 +165,6 @@ parseInputSpec raw =
           }
     Just ("varfont", spec) -> parseVarFontSpec spec
     _ -> Left ("Invalid input_spec: " <> raw)
-
-parseVarFontSpec :: String -> Either String FontSrc
-parseVarFontSpec spec =
-  case splitOnce "?" spec of
-    Nothing ->
-      Right $
-        VarFontFile
-          { path = spec,
-            axes = Map.empty
-          }
-    Just (path, query) -> do
-      axes <- parseAxisQuery query
-      pure
-        VarFontFile
-          { path = path,
-            axes = axes
-          }
-
-parseAxisQuery :: String -> Either String (Map.Map AxisTag AxisVal)
-parseAxisQuery query =
-  Map.fromList <$> traverse parseAxisPair (splitBy '&' query)
-
-parseAxisPair :: String -> Either String (AxisTag, AxisVal)
-parseAxisPair pair =
-  case splitOnce "=" pair of
-    Nothing -> Left ("Invalid varfont axis expression: " <> pair)
-    Just (name, rawVal) -> do
-      value <- parseDouble rawVal
-      pure (AxisTag (T.pack name), AxisVal value)
 
 parseInt :: String -> Either String Int
 parseInt raw =

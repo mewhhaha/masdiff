@@ -367,7 +367,7 @@ artifacts can be compared through a manifest path.
 ```bash
 cabal run masdiff-parity -- \
   --profile pr \
-  --manifest out/reference/inter-mtsdf-oracle/manifest.tsv \
+  --manifest out/reference/inter-mtsdf/manifest.tsv \
   --require-oracle \
   --verbose
 ```
@@ -378,7 +378,7 @@ cabal run masdiff-parity -- \
 cabal run masdiff-parity -- \
   --profile nightly \
   --oracle both \
-  --manifest out/reference/inter-mtsdf-oracle/manifest.tsv \
+  --manifest out/reference/inter-mtsdf/manifest.tsv \
   --json-out out/parity-nightly.json \
   --allow-missing-oracle
 ```
@@ -390,7 +390,7 @@ cabal run masdiff-parity -- \
   --profile full \
   --max-cases 1000 \
   --oracle msdfgl \
-  --manifest out/reference/inter-mtsdf-oracle/manifest.tsv \
+  --manifest out/reference/inter-mtsdf/manifest.tsv \
   --json-out out/parity-full.json
 ```
 

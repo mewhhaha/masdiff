@@ -32,6 +32,7 @@ library
         MSDF.Native
         MSDF.TextRender
         MSDF.Types
+        MSDF.VarFont
     other-modules:
         MSDF.Generate.Native
         MSDF.Native.Raster

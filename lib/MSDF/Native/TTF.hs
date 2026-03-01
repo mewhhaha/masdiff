@@ -26,6 +26,7 @@ import MSDF.Types
   ( GlyphCode,
     unGlyphCode,
   )
+import System.IO.Error (catchIOError, ioeGetErrorString)
 
 data VariationAxes = VariationAxes
   { wght :: Maybe Double,
@@ -151,13 +152,25 @@ data TupleRec = TupleRec
 
 loadOutlineIO :: FilePath -> VariationAxes -> GlyphCode -> IO (Either String Outline)
 loadOutlineIO fontPath axes glyph = do
-  raw <- BS.readFile fontPath
-  pure (decodeOutline raw axes glyph)
+  raw <- readFontBytes fontPath
+  pure $
+    case raw of
+      Left err -> Left err
+      Right bytes -> decodeOutline bytes axes glyph
 
 loadOutlinesIO :: FilePath -> VariationAxes -> [GlyphCode] -> IO [Either String Outline]
 loadOutlinesIO fontPath axes glyphs = do
-  raw <- BS.readFile fontPath
-  pure (decodeOutlines raw axes glyphs)
+  raw <- readFontBytes fontPath
+  pure $
+    case raw of
+      Left err -> fmap (const (Left err)) glyphs
+      Right bytes -> decodeOutlines bytes axes glyphs
+
+readFontBytes :: FilePath -> IO (Either String BS.ByteString)
+readFontBytes fontPath =
+  catchIOError
+    (Right <$> BS.readFile fontPath)
+    (\err -> pure (Left ("Failed to read font file " <> fontPath <> ": " <> ioeGetErrorString err)))
 
 decodeOutline :: BS.ByteString -> VariationAxes -> GlyphCode -> Either String Outline
 decodeOutline raw axes glyph = do

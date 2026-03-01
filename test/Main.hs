@@ -1469,7 +1469,9 @@ runManifestChecks :: IO Bool
 runManifestChecks = do
   parseOk <- checkLoadManifestParsesValidFixture
   missingHeaderOk <- checkLoadManifestRejectsMissingPxRange
-  pure (parseOk && missingHeaderOk)
+  duplicateAxisOk <- checkLoadManifestRejectsDuplicateVarfontAxis
+  nonFiniteAxisOk <- checkLoadManifestRejectsNonFiniteVarfontAxis
+  pure (parseOk && missingHeaderOk && duplicateAxisOk && nonFiniteAxisOk)
 
 runSdlShaderSourceChecks :: IO Bool
 runSdlShaderSourceChecks = do
@@ -1857,6 +1859,24 @@ checkLeftContains label expectedSubstr result =
       Left err -> expectedSubstr `isInfixOf` err
       Right _ -> False
 
+checkLoadManifestRejectsDuplicateVarfontAxis :: IO Bool
+checkLoadManifestRejectsDuplicateVarfontAxis =
+  withTempTextFile duplicateAxisManifestFixture $ \manifestPath -> do
+    parsed <- loadManifest manifestPath
+    checkLeftContains
+      "loadManifest rejects duplicate varfont axis tags"
+      "Duplicate axis tag in -varfont value"
+      parsed
+
+checkLoadManifestRejectsNonFiniteVarfontAxis :: IO Bool
+checkLoadManifestRejectsNonFiniteVarfontAxis =
+  withTempTextFile nonFiniteAxisManifestFixture $ \manifestPath -> do
+    parsed <- loadManifest manifestPath
+    checkLeftContains
+      "loadManifest rejects non-finite varfont axis values"
+      "Invalid axis value in -varfont value"
+      parsed
+
 withTempTextFile :: String -> (FilePath -> IO a) -> IO a
 withTempTextFile contents action = do
   tmpDir <- getTemporaryDirectory
@@ -1901,6 +1921,28 @@ missingPxRangeManifestFixture =
       "# seed=7",
       "font_case\tglyph\tglyph_hex\toutput_png\tinput_spec",
       "inter-static-regular\tA\tU+0041\tout/U+0041.png\tfont:assets/Inter-Regular.ttf"
+    ]
+
+duplicateAxisManifestFixture :: String
+duplicateAxisManifestFixture =
+  unlines
+    [ "# generator=generate-inter-mtsdf-fixtures",
+      "# dimensions=32",
+      "# pxrange=4.5",
+      "# seed=7",
+      "font_case\tglyph\tglyph_hex\toutput_png\tinput_spec",
+      "inter-var-dup\tg\tU+0067\tout/U+0067.png\tvarfont:assets/Inter-Variable.ttf?wght=700&WGHT=400"
+    ]
+
+nonFiniteAxisManifestFixture :: String
+nonFiniteAxisManifestFixture =
+  unlines
+    [ "# generator=generate-inter-mtsdf-fixtures",
+      "# dimensions=32",
+      "# pxrange=4.5",
+      "# seed=7",
+      "font_case\tglyph\tglyph_hex\toutput_png\tinput_spec",
+      "inter-var-nan\tg\tU+0067\tout/U+0067.png\tvarfont:assets/Inter-Variable.ttf?wght=NaN&opsz=14"
     ]
 
 expectedManifestFixture :: Either String Manifest
