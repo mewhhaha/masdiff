@@ -531,7 +531,8 @@ evaluateCase provider row nativeOut oracleImg oracleMetrics =
           reason = Just ("Diff failed: " <> err)
         }
     Right stats ->
-      let exactMatch = nativeOut.img == oracleImg
+      let exactMatchStrict = nativeOut.img == oracleImg
+          exactMatchCoverage = semanticCoverageExact nativeOut.img oracleImg
           metricsDelta = maybe 0.0 (metricsDeltaMax nativeOut.metrics) oracleMetrics
        in case row.gate of
             GateStrict ->
@@ -547,7 +548,7 @@ evaluateCase provider row nativeOut oracleImg oracleMetrics =
                       gate = row.gate,
                       status = if strictOk then CasePass else CaseFail,
                       sourceClass = row.sourceClass,
-                      exactMatch = Just exactMatch,
+                      exactMatch = Just exactMatchStrict,
                       maxAbs = Just stats.maxAbs,
                       shapeDiffRatio = Nothing,
                       metricsMaxDelta = Just metricsDelta,
@@ -564,7 +565,7 @@ evaluateCase provider row nativeOut oracleImg oracleMetrics =
                       gate = row.gate,
                       status = CaseFail,
                       sourceClass = row.sourceClass,
-                      exactMatch = Just exactMatch,
+                      exactMatch = Just exactMatchCoverage,
                       maxAbs = Just stats.maxAbs,
                       shapeDiffRatio = Nothing,
                       metricsMaxDelta = Just metricsDelta,
@@ -587,7 +588,7 @@ evaluateCase provider row nativeOut oracleImg oracleMetrics =
                           gate = row.gate,
                           status = if coverageOk then CasePass else CaseFail,
                           sourceClass = row.sourceClass,
-                          exactMatch = Just exactMatch,
+                          exactMatch = Just exactMatchCoverage,
                           maxAbs = Just stats.maxAbs,
                           shapeDiffRatio = Just cov.shapeDiffRatio,
                           metricsMaxDelta = Just metricsDelta,
@@ -1092,6 +1093,25 @@ coverageStats left right
                   then rightMismatch + 1
                   else rightMismatch
            in go (idx + 4) shapeDiff' leftMismatch' rightMismatch'
+
+semanticCoverageExact :: ImgRGBA8 -> ImgRGBA8 -> Bool
+semanticCoverageExact left right
+  | left.w /= right.w || left.h /= right.h = False
+  | BS.length left.px /= BS.length right.px = False
+  | otherwise = go 0
+  where
+    total = BS.length left.px
+    go idx
+      | idx >= total = True
+      | otherwise =
+          let lr = BS.index left.px idx
+              lg = BS.index left.px (idx + 1)
+              lb = BS.index left.px (idx + 2)
+              rr = BS.index right.px idx
+              rg = BS.index right.px (idx + 1)
+              rb = BS.index right.px (idx + 2)
+              sameMedian = medianWord8 lr lg lb == medianWord8 rr rg rb
+           in sameMedian && go (idx + 4)
 
 medianWord8 :: Word8 -> Word8 -> Word8 -> Word8
 medianWord8 x y z = max (min x y) (min (max x y) z)

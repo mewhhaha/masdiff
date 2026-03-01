@@ -402,6 +402,7 @@ Notes:
 - `--oracle process` needs `MSDFGEN_BIN`/`PATH` for `msdfgen` access; `--oracle msdfgl` reads from the manifest artifacts.
 - If process var-axis support is unavailable, parity instantiates variable fonts to static TTF via `python3` + `fontTools.varLib.instancer` for process/native comparison parity.
 - `just oracle-msdfgl` reads manifest path from `MASDIFF_MSDFGL_MANIFEST` (default: `out/reference/msdfgl-mtsdf/manifest.tsv`).
+- `exact_mismatch` reporting is byte-exact for `strict` rows and semantic-exact for `coverage` rows (median RGB), so channel-layout-only differences do not inflate nightly residue.
 
 Parity contract (locked):
 
