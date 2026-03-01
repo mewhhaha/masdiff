@@ -12,7 +12,7 @@ module MSDF.Manifest
 where
 
 import Data.Bifunctor (first)
-import MSDF.VarFont (parseVarFontSpec)
+import MSDF.VarFont (parseVarFontSpecTyped, renderVarFontParseErr)
 import MSDF.Types
   ( Dim,
     FontSrc (..),
@@ -163,7 +163,8 @@ parseInputSpec raw =
         FontFile
           { path = path
           }
-    Just ("varfont", spec) -> parseVarFontSpec spec
+    Just ("varfont", spec) ->
+      first renderVarFontParseErr (parseVarFontSpecTyped spec)
     _ -> Left ("Invalid input_spec: " <> raw)
 
 parseInt :: String -> Either String Int

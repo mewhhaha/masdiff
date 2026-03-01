@@ -5,6 +5,7 @@
 module Main (main) where
 
 import Data.Char (ord)
+import Data.Bifunctor (first)
 import Data.Maybe (fromMaybe)
 import MSDF.Atlas
   ( Atlas (..),
@@ -20,7 +21,7 @@ import MSDF.Generate
     defaultRuntimeCfg,
     parseBackendModeEnv,
   )
-import MSDF.VarFont (parseVarFontSpec)
+import MSDF.VarFont (parseVarFontSpecTyped, renderVarFontParseErr)
 import MSDF.Types
   ( FontSrc (..),
     GenCfg (..),
@@ -144,7 +145,7 @@ parseLoop st args =
       ensureNoSource st
       parseLoop st {psSrc = Just FontFile {path = path}} rest
     "-varfont" : spec : rest -> do
-      src <- parseVarFontSpec spec
+      src <- first (\err -> "Invalid -varfont value: " <> renderVarFontParseErr err) (parseVarFontSpecTyped spec)
       ensureNoSource st
       parseLoop st {psSrc = Just src} rest
     "--out-prefix" : prefix : rest ->

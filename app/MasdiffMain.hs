@@ -5,6 +5,7 @@
 module Main (main) where
 
 import Data.Char (ord)
+import Data.Bifunctor (first)
 import Data.Maybe (fromMaybe)
 import MSDF.Encode (writeMsdfgenRgbaFile, writePngRGBA8File)
 import MSDF.Generate
@@ -14,7 +15,7 @@ import MSDF.Generate
     parseBackendModeEnv,
     renderMetrics,
   )
-import MSDF.VarFont (parseVarFontSpec)
+import MSDF.VarFont (parseVarFontSpecTyped, renderVarFontParseErr)
 import MSDF.Types
   ( FontSrc (..),
     GenCfg (..),
@@ -115,7 +116,7 @@ parseLoop st args =
       ensureNoSource st
       parseLoop st {psSrc = Just FontFile {path = path}, psGlyph = Just glyph} rest
     "-varfont" : spec : glyphRaw : rest -> do
-      src <- parseVarFontSpec spec
+      src <- first (\err -> "Invalid -varfont value: " <> renderVarFontParseErr err) (parseVarFontSpecTyped spec)
       glyph <- parseGlyphCode glyphRaw
       ensureNoSource st
       parseLoop st {psSrc = Just src, psGlyph = Just glyph} rest
