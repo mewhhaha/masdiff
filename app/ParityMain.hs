@@ -7,6 +7,7 @@ module Main (main) where
 import Data.ByteString qualified as BS
 import Data.Char (ord)
 import Data.List (intercalate, nub)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import qualified Data.Text as T
@@ -37,6 +38,8 @@ import System.Environment (getArgs, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath (isRelative, takeDirectory, (</>))
 import System.IO (hPutStrLn, stderr)
+import System.IO.Temp (withSystemTempDirectory)
+import System.Process (readProcessWithExitCode)
 import Text.Printf (printf)
 import Text.Read (readMaybe)
 
@@ -138,6 +141,12 @@ data OracleFetch
   | OracleFailure String
   deriving stock (Eq, Show)
 
+data RunCtx = RunCtx
+  { processVarAxisSupported :: Bool,
+    processVarfontInstDir :: Maybe FilePath,
+    processVarfontInstCache :: IORef (Map.Map String FilePath)
+  }
+
 main :: IO ()
 main = do
   cli <- either failWith pure . parseArgs =<< getArgs
@@ -155,17 +164,18 @@ main = do
         putStrLn
           ( if supported
               then "INFO: process variable-axis support detected."
-              else "INFO: process variable-axis support not detected; variable coverage rows will be skipped."
+              else "INFO: process variable-axis support not detected; process oracle will use varfont instancing fallback."
           )
         pure supported
-  plans <- either failWith pure (buildProviderPlans cli manifestBundle)
-  summaries <- traverse (runProviderPlan cli nativeRuntime processRuntime processVarAxisSupported) plans
-  let summary = foldl' mergeSummary emptySummary summaries
-  maybe (pure ()) (\path -> writeFile path (renderSummaryJson summary)) cli.jsonOut
-  report summary
-  if shouldFail cli summary
-    then exitWith (ExitFailure 1)
-    else exitWith ExitSuccess
+  runWithContext processVarAxisSupported $ \runCtx -> do
+    plans <- either failWith pure (buildProviderPlans cli manifestBundle)
+    summaries <- traverse (runProviderPlan cli nativeRuntime processRuntime runCtx) plans
+    let summary = foldl' mergeSummary emptySummary summaries
+    maybe (pure ()) (\path -> writeFile path (renderSummaryJson summary)) cli.jsonOut
+    report summary
+    if shouldFail cli summary
+      then exitWith (ExitFailure 1)
+      else exitWith ExitSuccess
 
 shouldFail :: CliCfg -> Summary -> Bool
 shouldFail cli summary =
@@ -352,43 +362,23 @@ fontCaseToFontSrc fontCase =
                 <> rawValue
             )
 
-runProviderPlan :: CliCfg -> RuntimeCfg -> RuntimeCfg -> Bool -> (OracleProvider, Either String [CaseRow]) -> IO Summary
-runProviderPlan cli nativeRuntime processRuntime processVarAxisSupported (provider, plan) =
+runProviderPlan :: CliCfg -> RuntimeCfg -> RuntimeCfg -> RunCtx -> (OracleProvider, Either String [CaseRow]) -> IO Summary
+runProviderPlan cli nativeRuntime processRuntime runCtx (provider, plan) =
   case plan of
     Left skipReason ->
       pure (addCaseResult emptySummary (mkSkipResult provider skipReason))
     Right rows ->
       foldl'
-        (\ioSummary row -> ioSummary >>= runCase cli nativeRuntime processRuntime provider processVarAxisSupported row)
+        (\ioSummary row -> ioSummary >>= runCase cli nativeRuntime processRuntime provider runCtx row)
         (pure emptySummary)
         rows
 
-runCase :: CliCfg -> RuntimeCfg -> RuntimeCfg -> OracleProvider -> Bool -> CaseRow -> Summary -> IO Summary
-runCase cli nativeRuntime processRuntime provider processVarAxisSupported row summary = do
-  if shouldSkipVariableCoverage provider processVarAxisSupported row
-    then
-      pure $
-        addCaseResult
-          summary
-          CaseResult
-            { provider = provider,
-              caseId = row.caseId,
-              glyph = row.glyphHex,
-              gate = row.gate,
-              status = CaseSkip,
-              sourceClass = row.sourceClass,
-              exactMatch = Nothing,
-              maxAbs = Nothing,
-              shapeDiffRatio = Nothing,
-              metricsMaxDelta = Nothing,
-              alphaMedianDelta = Nothing,
-              reason = Just "Skipped variable coverage row because process var-axis behavior is unavailable."
-            }
-    else pure summary
-    >>= \summary0 -> runCaseInner cli nativeRuntime processRuntime provider row summary0
+runCase :: CliCfg -> RuntimeCfg -> RuntimeCfg -> OracleProvider -> RunCtx -> CaseRow -> Summary -> IO Summary
+runCase cli nativeRuntime processRuntime provider runCtx row summary =
+  runCaseInner cli nativeRuntime processRuntime provider runCtx row summary
 
-runCaseInner :: CliCfg -> RuntimeCfg -> RuntimeCfg -> OracleProvider -> CaseRow -> Summary -> IO Summary
-runCaseInner cli nativeRuntime processRuntime provider row summary = do
+runCaseInner :: CliCfg -> RuntimeCfg -> RuntimeCfg -> OracleProvider -> RunCtx -> CaseRow -> Summary -> IO Summary
+runCaseInner cli nativeRuntime processRuntime provider runCtx row summary = do
   whenVerbose cli.verbose $
     putStrLn
       ( "["
@@ -400,8 +390,8 @@ runCaseInner cli nativeRuntime processRuntime provider row summary = do
           <> " gate="
           <> gateTag row.gate
       )
-  nativeResult <- generateGlyphIO nativeRuntime row.cfg row.src row.glyph
-  case nativeResult of
+  preparedSrcResult <- resolveCaseSource provider runCtx row
+  case preparedSrcResult of
     Left err ->
       pure $
         addFailureResult
@@ -418,30 +408,12 @@ runCaseInner cli nativeRuntime processRuntime provider row summary = do
               shapeDiffRatio = Nothing,
               metricsMaxDelta = Nothing,
               alphaMedianDelta = Nothing,
-              reason = Just ("Native generation failed: " <> renderGenErr err)
+              reason = Just ("Source preparation failed: " <> err)
             }
-    Right nativeOut -> do
-      oracleFetch <- fetchOracle cli processRuntime provider row
-      case oracleFetch of
-        OracleSkip skipReason ->
-          pure $
-            addCaseResult
-              summary
-              CaseResult
-                { provider = provider,
-                  caseId = row.caseId,
-                  glyph = row.glyphHex,
-                  gate = row.gate,
-                  status = CaseSkip,
-                  sourceClass = row.sourceClass,
-                  exactMatch = Nothing,
-                  maxAbs = Nothing,
-                  shapeDiffRatio = Nothing,
-                  metricsMaxDelta = Nothing,
-                  alphaMedianDelta = Nothing,
-                  reason = Just skipReason
-                }
-        OracleFailure err ->
+    Right preparedSrc -> do
+      nativeResult <- generateGlyphIO nativeRuntime row.cfg preparedSrc row.glyph
+      case nativeResult of
+        Left err ->
           pure $
             addFailureResult
               summary
@@ -457,19 +429,64 @@ runCaseInner cli nativeRuntime processRuntime provider row summary = do
                   shapeDiffRatio = Nothing,
                   metricsMaxDelta = Nothing,
                   alphaMedianDelta = Nothing,
-                  reason = Just err
+                  reason = Just ("Native generation failed: " <> renderGenErr err)
                 }
-        OracleReady oracleImg oracleMetrics ->
-          pure $
-            addCaseResult
-              summary
-              (evaluateCase provider row nativeOut oracleImg oracleMetrics)
+        Right nativeOut -> do
+          oracleFetch <- fetchOracle cli processRuntime provider preparedSrc row
+          case oracleFetch of
+            OracleSkip skipReason ->
+              pure $
+                addCaseResult
+                  summary
+                  CaseResult
+                    { provider = provider,
+                      caseId = row.caseId,
+                      glyph = row.glyphHex,
+                      gate = row.gate,
+                      status = CaseSkip,
+                      sourceClass = row.sourceClass,
+                      exactMatch = Nothing,
+                      maxAbs = Nothing,
+                      shapeDiffRatio = Nothing,
+                      metricsMaxDelta = Nothing,
+                      alphaMedianDelta = Nothing,
+                      reason = Just skipReason
+                    }
+            OracleFailure err ->
+              pure $
+                addFailureResult
+                  summary
+                  CaseResult
+                    { provider = provider,
+                      caseId = row.caseId,
+                      glyph = row.glyphHex,
+                      gate = row.gate,
+                      status = CaseFail,
+                      sourceClass = row.sourceClass,
+                      exactMatch = Nothing,
+                      maxAbs = Nothing,
+                      shapeDiffRatio = Nothing,
+                      metricsMaxDelta = Nothing,
+                      alphaMedianDelta = Nothing,
+                      reason = Just err
+                    }
+            OracleReady oracleImg oracleMetrics ->
+              pure $
+                addCaseResult
+                  summary
+                  (evaluateCase provider row nativeOut oracleImg oracleMetrics)
 
-fetchOracle :: CliCfg -> RuntimeCfg -> OracleProvider -> CaseRow -> IO OracleFetch
-fetchOracle cli processRuntime provider row =
+resolveCaseSource :: OracleProvider -> RunCtx -> CaseRow -> IO (Either String FontSrc)
+resolveCaseSource provider runCtx row =
+  case provider of
+    ProviderProcess -> processOracleSource runCtx row
+    ProviderMsdfgl -> pure (Right row.src)
+
+fetchOracle :: CliCfg -> RuntimeCfg -> OracleProvider -> FontSrc -> CaseRow -> IO OracleFetch
+fetchOracle cli processRuntime provider preparedSrc row =
   case provider of
     ProviderProcess -> do
-      processResult <- generateGlyphIO processRuntime row.cfg row.src row.glyph
+      processResult <- generateGlyphIO processRuntime row.cfg preparedSrc row.glyph
       pure $
         case processResult of
           Left err ->
@@ -656,12 +673,100 @@ mkSkipResult provider reason =
       reason = Just reason
     }
 
-shouldSkipVariableCoverage :: OracleProvider -> Bool -> CaseRow -> Bool
-shouldSkipVariableCoverage provider processVarAxisSupported row =
-  provider == ProviderProcess
-    && row.sourceClass == SourceVariable
-    && row.gate == GateCoverage
-    && not processVarAxisSupported
+runWithContext :: Bool -> (RunCtx -> IO a) -> IO a
+runWithContext processVarAxisSupported action = do
+  cache <- newIORef Map.empty
+  if processVarAxisSupported
+    then
+      action
+        RunCtx
+          { processVarAxisSupported = processVarAxisSupported,
+            processVarfontInstDir = Nothing,
+            processVarfontInstCache = cache
+          }
+    else
+      withSystemTempDirectory "masdiff-parity-varfont" $ \dir ->
+        action
+          RunCtx
+            { processVarAxisSupported = processVarAxisSupported,
+              processVarfontInstDir = Just dir,
+              processVarfontInstCache = cache
+            }
+
+processOracleSource :: RunCtx -> CaseRow -> IO (Either String FontSrc)
+processOracleSource runCtx row
+  | runCtx.processVarAxisSupported = pure (Right row.src)
+  | otherwise =
+      case row.src of
+        FontFile _ -> pure (Right row.src)
+        VarFontFile {path = varPath, axes = axisMap} -> do
+          instanced <- instantiateVarFontCached runCtx varPath axisMap
+          pure
+            ( fmap
+                (\instPath -> FontFile {path = instPath})
+                instanced
+            )
+
+instantiateVarFontCached :: RunCtx -> FilePath -> Map.Map AxisTag AxisVal -> IO (Either String FilePath)
+instantiateVarFontCached runCtx srcPath axisMap =
+  case runCtx.processVarfontInstDir of
+    Nothing ->
+      pure (Left "Process varfont fallback directory is unavailable.")
+    Just outDir -> do
+      let key = srcPath <> "?" <> encodeAxisQuery axisMap
+      cache <- readIORef runCtx.processVarfontInstCache
+      case Map.lookup key cache of
+        Just existingPath ->
+          pure (Right existingPath)
+        Nothing -> do
+          let outPath = outDir </> ("inst-" <> show (Map.size cache) <> ".ttf")
+          instResult <- instantiateVarFontWithPython srcPath outPath axisMap
+          case instResult of
+            Left err ->
+              pure (Left err)
+            Right () -> do
+              atomicModifyIORef' runCtx.processVarfontInstCache (\m -> (Map.insert key outPath m, ()))
+              pure (Right outPath)
+
+instantiateVarFontWithPython :: FilePath -> FilePath -> Map.Map AxisTag AxisVal -> IO (Either String ())
+instantiateVarFontWithPython srcPath outPath axisMap = do
+  let script =
+        unlines
+          [ "import sys",
+            "from fontTools.ttLib import TTFont",
+            "from fontTools.varLib.instancer import instantiateVariableFont",
+            "src_path, out_path, query = sys.argv[1:4]",
+            "axes = {}",
+            "for pair in query.split('&'):",
+            "    if not pair:",
+            "        continue",
+            "    k, v = pair.split('=', 1)",
+            "    axes[k] = float(v)",
+            "tt = TTFont(src_path)",
+            "inst = instantiateVariableFont(tt, axes, inplace=False)",
+            "inst.save(out_path)"
+          ]
+  let query = encodeAxisQuery axisMap
+  (exitCode, _, stderrText) <- readProcessWithExitCode "python3" ["-c", script, srcPath, outPath, query] ""
+  pure $
+    case exitCode of
+      ExitSuccess -> Right ()
+      ExitFailure code ->
+        Left
+          ( "Varfont instancing failed (exit "
+              <> show code
+              <> "): "
+              <> stderrText
+          )
+
+encodeAxisQuery :: Map.Map AxisTag AxisVal -> String
+encodeAxisQuery axisMap =
+  intercalate
+    "&"
+    ( fmap
+        (\(AxisTag tag, AxisVal value) -> T.unpack tag <> "=" <> show value)
+        (Map.toAscList axisMap)
+    )
 
 emptySummary :: Summary
 emptySummary =
@@ -1074,6 +1179,7 @@ approxEq a b = abs (a - b) <= 1.0e-6
 strictMetricsDeltaLimit :: Double
 strictMetricsDeltaLimit = 1.0e-6
 
+-- Parity contract thresholds shared by nightly/full coverage gates.
 coverageShapeDiffLimit :: Double
 coverageShapeDiffLimit = 0.002
 

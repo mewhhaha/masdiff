@@ -400,6 +400,22 @@ Notes:
 - `--profile nightly` and `--profile full` expand coverage and use shape/metrics thresholds for broader cases.
 - production/runtime usage should use `native` generation and the WGSL shader path above.
 - `--oracle process` needs `MSDFGEN_BIN`/`PATH` for `msdfgen` access; `--oracle msdfgl` reads from the manifest artifacts.
+- If process var-axis support is unavailable, parity instantiates variable fonts to static TTF via `python3` + `fontTools.varLib.instancer` for process/native comparison parity.
+- `just oracle-msdfgl` reads manifest path from `MASDIFF_MSDFGL_MANIFEST` (default: `out/reference/msdfgl-mtsdf/manifest.tsv`).
+
+Parity contract (locked):
+
+- `strict` rows must satisfy:
+  - `MSDF.Compare.strictGate` image diff pass,
+  - `metrics_max_delta <= 1.0e-6`.
+- `coverage` rows must satisfy:
+  - `shape_diff_ratio <= 0.002`,
+  - `metrics_max_delta <= 2.0e-2`,
+  - `alpha_median_delta <= 0.005`.
+- Profile scope:
+  - `pr`: all rows are `strict`.
+  - `nightly` / `full`: `strict` only for stable static oracle subset (`interOracleFontCases`) at `dim=64`, `pxrange=8.0`; all other rows use `coverage`.
+- If process-oracle var-axis behavior is unavailable, variable rows are instantiated to static TTF and that same instantiated source is used for both native/process comparisons (no variable-row skip path).
 
 ## Docs
 

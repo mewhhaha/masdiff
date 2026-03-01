@@ -103,6 +103,8 @@ executable masdiff-parity
         directory,
         filepath,
         masdiff,
+        process,
+        temporary,
         text
 
 executable masdiff-text-render

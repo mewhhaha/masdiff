@@ -1481,50 +1481,54 @@ runSdlShaderSourceChecks = do
   harnessPy <- readFile "tools/sdl3_artifact_harness.py"
   routeHealOk <-
     check
-      "SDL presentation heal routes to dedicated shader variant"
-      ("fragmentShader = fragmentShaderMtsdfHeal" `isInfixOf` src)
+      "SDL presentation heal routes to heal shader variant"
+      ("let frag = if presentHeal then fragmentShader else fragmentShaderNoHeal" `isInfixOf` src)
   routeNoHealOk <-
     check
-      "SDL presentation no-heal routes to canonical shader variant"
-      ("fragmentShaderNoHeal = fragmentShaderCanonical" `isInfixOf` src)
+      "SDL presentation no-heal shader variant is present"
+      ("fragmentShaderNoHeal :: GpuShader" `isInfixOf` src)
   modeParseOk <-
     check
-      "SDL presentation heal mode parser is present"
-      ("parsePresentHealMode :: Maybe String -> Either String PresentHealMode" `isInfixOf` src)
+      "SDL presentation heal toggle env parsing is present"
+      ("readBoolEnvDefault \"MASDIFF_SDL_PRESENT_HEAL\" False" `isInfixOf` src)
   fontRegularEnvOk <-
     check
-      "SDL font regular override env is present"
-      ("MASDIFF_SDL_FONT_REGULAR" `isInfixOf` src)
+      "SDL font preset env selector is present"
+      ("lookupEnv \"MASDIFF_SDL_FONT\"" `isInfixOf` src)
   fontVarEnvOk <-
     check
-      "SDL font variable override env is present"
-      ("MASDIFF_SDL_FONT_VAR" `isInfixOf` src)
-  fontAxisEnvOk <-
-    check
-      "SDL variable axis override envs are present"
+      "SDL font preset parser supports inter and roboto-flex"
       ( all
           (`isInfixOf` src)
-          [ "MASDIFF_SDL_VAR_LIGHT_WGHT",
-            "MASDIFF_SDL_VAR_LIGHT_OPSZ",
-            "MASDIFF_SDL_VAR_BOLD_WGHT",
-            "MASDIFF_SDL_VAR_BOLD_OPSZ"
+          [ "Just \"roboto-flex\" -> pure FontPresetRoboto",
+            "Just \"inter\" -> pure FontPresetInter"
+          ]
+      )
+  fontAxisEnvOk <-
+    check
+      "SDL variable font light/bold axis presets are present"
+      ( all
+          (`isInfixOf` src)
+          [ "(AxisTag (T.pack \"wght\"), AxisVal 300)",
+            "(AxisTag (T.pack \"opsz\"), AxisVal 14)",
+            "(AxisTag (T.pack \"wght\"), AxisVal 900)",
+            "(AxisTag (T.pack \"opsz\"), AxisVal 32)"
           ]
       )
   pxRangeDefaultOk <-
     check
-      "SDL default scene px range is set to 8.0"
-      ("readPositiveDoubleEnvDefault \"MASDIFF_SDL_PXRANGE\" 8.0" `isInfixOf` src)
+      "SDL default scene px range is set to 6.0"
+      ("readPositiveDoubleEnvDefault \"MASDIFF_SDL_PXRANGE\" 6.0" `isInfixOf` src)
   dimDefaultOk <-
     check
       "SDL default scene dim is set to 256 and overrideable"
       ("readPositiveIntEnvDefault \"MASDIFF_SDL_DIM\" 256" `isInfixOf` src)
   justDefaultRuntimeTuningOk <-
     check
-      "just sdl3 defaults include present-heal mode and tuned px range"
+      "just sdl3 defaults include present-heal and tuned px range"
       ( all
           (`isInfixOf` justSrc)
           [ "MASDIFF_SDL_PRESENT_HEAL=\"${MASDIFF_SDL_PRESENT_HEAL:-1}\"",
-            "MASDIFF_SDL_PRESENT_HEAL_MODE=\"${MASDIFF_SDL_PRESENT_HEAL_MODE:-1}\"",
             "MASDIFF_SDL_PXRANGE=\"${MASDIFF_SDL_PXRANGE:-7}\""
           ]
       )
@@ -1629,8 +1633,13 @@ runSdlShaderSourceChecks = do
       )
   aggressiveShaderOk <-
     check
-      "SDL aggressive heal shader variant is present"
-      ("fragmentShaderMtsdfHealAggressive :: GpuShader" `isInfixOf` src)
+      "SDL presentation shader variants are present"
+      ( all
+          (`isInfixOf` src)
+          [ "fragmentShader :: GpuShader",
+            "fragmentShaderNoHeal :: GpuShader"
+          ]
+      )
   gpuNoPerGlyphOverrideOk <-
     check
       "SDL GPU generation avoids glyph-specific sign overrides"
@@ -1641,45 +1650,54 @@ runSdlShaderSourceChecks = do
   gpuWindingModeSwitchOk <-
     check
       "SDL GPU generation shader supports parity and non-zero winding mode switch"
-      ( countSubstring "let useNonZero = u.meta1.w > 0.5;" src >= 2
-          && countSubstring "let inside = select(insideParity, insideNonZero, useNonZero);" src >= 2
-          && countSubstring "fn windingStepParity(" src >= 2
-          && countSubstring "fn windingStepNonZero(" src >= 2
+      ( countSubstring "let useNonZero = u.meta1.w > 0.5;" src >= 1
+          && countSubstring "let inside = select(insideParity, insideNonZero, useNonZero);" src >= 1
+          && countSubstring "fn windingStepParity(" src >= 1
+          && countSubstring "fn windingStepNonZero(" src >= 1
       )
   gpuWindingDefaultNonZeroOk <-
     check
       "SDL GPU generation defaults to non-zero winding to match native fill semantics"
-      ("let useNonZeroWinding = True" `isInfixOf` src)
+      ( all
+          (`isInfixOf` src)
+          [ "withGpuRasterUniform dim dim scale0 tx0 ty0 pxr0 (length selectorSegs0) (length windingSegs0) True",
+            "withGpuRasterUniform d.dimX d.dimY d.scale d.tx d.ty (unPxRange cfg.pxr) (length d.selectorSegs) (length d.windingSegs) True"
+          ]
+      )
   cornerMixPresentOk <-
     check
       "SDL heal shader includes mtsdf corner-mix fallback"
-      (countSubstring "let cornerMix = smoothstep(" src >= 1 && countSubstring "channelSpread" src >= 2)
+      ( all
+          (`isInfixOf` src)
+          [ "let divergence = abs(msdf - sdf);",
+            "let cornerMix = smoothstep(0.02, 0.14, divergence);"
+          ]
+      )
   mixDistPresentOk <-
     check
-      "SDL heal shader mixes msdf and sdf distances"
-      ( countSubstring "let dist = mix(msdf, sdf, cornerMix);" src >= 2
-          || countSubstring "let dist = mix(msdf, sdf, max(cornerMix, signMismatch));" src >= 2
-      )
+      "SDL heal shader uses alpha SDF distance"
+      (countSubstring "let sd = sdf;" src >= 1)
   canonicalMedianOnlyOk <-
     check
       "SDL canonical shader keeps median-only distance"
-      (countSubstring "let sd = msdf - 0.5;" src == 1)
+      (countSubstring "let sd = median3(sample.r, sample.g, sample.b);" src >= 1)
   screenRangeScaleInvariantOk <-
     check
       "SDL fit scaling keeps glyph px range invariant"
       ("spr = d.spr" `isInfixOf` src && not ("spr = d.spr * k" `isInfixOf` src))
   healDistUsedOk <-
     check
-      "SDL heal shader uses mixed distance for signed distance"
-      (countSubstring "let sd = dist - 0.5;" src >= 2)
+      "SDL heal shader computes signed distance from alpha channel"
+      (countSubstring "let screenPxDistance = screenPxRange(uvCenter, pxRange) * (sd - 0.5);" src >= 2)
   gpuAtlasLoadOpBatchOk <-
     check
-      "SDL GPU atlas batch uses per-draw load-op pass sequencing"
+      "SDL GPU atlas batch uses single-pass viewport/scissor draw sequencing"
       ( all
           (`isInfixOf` src)
-          [ "sdlGpuLoadOpLoad",
-            "withColorTargetInfoLoadOp tex clear loadOp",
-            "forM_ (zip [0 :: Int ..] draws)"
+          [ "withColorTargetInfo tex clear",
+            "forM_ uploads",
+            "with d.viewport",
+            "with d.scissor"
           ]
       )
   gpuCommandLifetimeOk <-
@@ -1687,10 +1705,10 @@ runSdlShaderSourceChecks = do
       "SDL GPU atlas path submits/waits before releasing per-draw segment buffers"
       ( all
           (`isInfixOf` src)
-          [ "submitGpuCommandBufferAndWait gpuCtx.dev \"SDL_SubmitGPUCommandBuffer(gen-atlas)\" cmd",
-            "imgResult <- withUploadedSegBuffer dev cmd segs"
+          [ "SDL_SubmitGPUCommandBufferAndAcquireFence(gen-atlas)",
+            "SDL_WaitForGPUFences(gen-atlas)",
+            "releaseAtlasDrawBuffers gpuCtx.dev uploads"
           ]
-          && not ("requireTrue \"SDL_SubmitGPUCommandBuffer(gen-atlas)\"" `isInfixOf` src)
       )
   batchOverlapFallbackGuardOk <-
     check

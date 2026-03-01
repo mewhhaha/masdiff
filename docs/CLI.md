@@ -103,9 +103,26 @@ Notes:
 - `--profile pr` is the strict default for the stable corpus and keeps exact parity requirements.
 - `--profile nightly` and `--profile full` expand coverage and use shape/metrics thresholds for broader cases.
 - `--oracle process` uses `msdfgen` via `MSDFGEN_BIN`/`PATH`; `--oracle msdfgl` reads oracle artifacts from `--manifest`; `--oracle both` enables both sources.
+- When process var-axis support is unavailable, `masdiff-parity` instantiates variable fonts through `python3` + `fontTools.varLib.instancer` and compares native/process using that shared static instance.
 - `--require-exact` remains available for explicit full-pixel exact checks.
 - Use `--manifest` for oracle input when using `--oracle msdfgl` or `--oracle both`.
 - `--allow-missing-oracle` permits sparse oracle coverage; `--require-oracle` enforces complete oracle availability.
+- `just oracle-msdfgl` can override its manifest with `MASDIFF_MSDFGL_MANIFEST` (default: `out/reference/msdfgl-mtsdf/manifest.tsv`).
+
+Parity contract:
+
+- `strict` gate requires:
+  - `MSDF.Compare.strictGate` image diff pass (`maxCh/p99/mean`),
+  - `metrics_max_delta <= 1.0e-6`.
+- `coverage` gate requires:
+  - `shape_diff_ratio <= 0.002`,
+  - `metrics_max_delta <= 2.0e-2`,
+  - `alpha_median_delta <= 0.005`.
+- `pr` profile: all rows are `strict`.
+- `nightly` / `full` profiles:
+  - `strict` only on stable static oracle subset (`interOracleFontCases`) at `dim=64`, `pxrange=8.0`,
+  - all other rows use `coverage`.
+- If process oracle var-axis support is unavailable, variable rows are instantiated to static TTF and that shared instantiated source is used for both native/process comparisons (no variable-row skip path).
 
 ## `masdiff-text-render`
 
