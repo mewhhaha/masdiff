@@ -28,6 +28,7 @@ import MSDF.Atlas (Atlas (..), AtlasEntry (..), AtlasRect (..), generateAtlasIO,
 import MSDF.Encode (decodeMsdfgenRgba, encodeMsdfgenRgba)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphBatchIO, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestMeta (..), ManifestRow (..), loadManifest)
+import MSDF.VarFont (VarFontParseErr (..), parseAxisAssignmentsTyped, parseVarFontSpecTyped)
 import MSDF.Native
   ( generateGlyphBatchNativeWithIO,
     hasProperSelfIntersection,
@@ -121,6 +122,7 @@ main = do
   textRenderOk <- runTextRenderChecks
   decodeChecksOk <- runDecodeChecks
   manifestChecksOk <- runManifestChecks
+  varFontParserChecksOk <- runVarFontParserChecks
   sdlShaderSourceChecksOk <- runSdlShaderSourceChecks
   parityWorkflowSourceChecksOk <- runParityWorkflowSourceChecks
   let allOk =
@@ -146,6 +148,7 @@ main = do
             textRenderOk,
             decodeChecksOk,
             manifestChecksOk,
+            varFontParserChecksOk,
             sdlShaderSourceChecksOk,
             parityWorkflowSourceChecksOk
           ]
@@ -1472,6 +1475,38 @@ runManifestChecks = do
   duplicateAxisOk <- checkLoadManifestRejectsDuplicateVarfontAxis
   nonFiniteAxisOk <- checkLoadManifestRejectsNonFiniteVarfontAxis
   pure (parseOk && missingHeaderOk && duplicateAxisOk && nonFiniteAxisOk)
+
+runVarFontParserChecks :: IO Bool
+runVarFontParserChecks = do
+  duplicateAxisTypedOk <-
+    check
+      "parseAxisAssignmentsTyped rejects case-insensitive duplicate axis tags"
+      ( parseAxisAssignmentsTyped [("wght", "700"), ("WGHT", "400")]
+          == Left (VarFontAxisTagDuplicate "WGHT")
+      )
+  nonFiniteTypedOk <-
+    check
+      "parseAxisAssignmentsTyped rejects non-finite axis values"
+      (parseAxisAssignmentsTyped [("wght", "NaN")] == Left (VarFontAxisValueInvalid "NaN"))
+  emptyAxisTypedOk <-
+    check
+      "parseAxisAssignmentsTyped rejects empty axis names"
+      (parseAxisAssignmentsTyped [("", "700")] == Left VarFontAxisNameEmpty)
+  specTypedOk <-
+    check
+      "parseVarFontSpecTyped parses varfont path and axes"
+      ( case parseVarFontSpecTyped "assets/Inter-Variable.ttf?wght=700&opsz=14" of
+          Right
+            VarFontFile
+              { path = srcPath,
+                axes = axisMap
+              } ->
+                srcPath == "assets/Inter-Variable.ttf"
+                  && Map.lookup (AxisTag (T.pack "wght")) axisMap == Just (AxisVal 700.0)
+                  && Map.lookup (AxisTag (T.pack "opsz")) axisMap == Just (AxisVal 14.0)
+          _ -> False
+      )
+  pure (duplicateAxisTypedOk && nonFiniteTypedOk && emptyAxisTypedOk && specTypedOk)
 
 runSdlShaderSourceChecks :: IO Bool
 runSdlShaderSourceChecks = do

@@ -678,3 +678,52 @@ Post-pass safety hardening (same implementation family):
 - Smoke benchmark key points:
   - `-N1`: `generateGlyphBatchIO/static/jobs1 avg ms = 463.958428500000`, `jobs16 avg ms = 464.306697166667`
   - `-N`: `generateGlyphBatchIO/static/jobs1 avg ms = 580.250341999999`, `jobs16 avg ms = 107.031718500000`
+
+## Focused optimization pass #15 (2026-03-01, rejected)
+
+Baseline command (`-N1`):
+
+```bash
+BENCH_DIFF_ITERS=800 \
+BENCH_GEN_ITERS=24 \
+BENCH_BATCH_ITERS=12 \
+BENCH_WARMUP_ITERS=2 \
+cabal bench masdiff-bench --benchmark-options='+RTS -N1 -s -RTS'
+```
+
+Baseline snapshot:
+- `generateGlyphIO/static avg ms`: `12.614296250000`
+- `generateGlyphIO/variable avg ms`: `12.794172166667`
+- `generateGlyphBatchIO/static/jobs1 avg ms`: `521.669034666667`
+- `bytes allocated in the heap`: `51,083,393,800`
+- `MUT time`: `6.683s`
+- `GC time`: `1.242s`
+- `Total time`: `7.926s`
+
+Candidate A (`lib/MSDF/Native/Raster.hs`, rejected):
+- replaced stencil flag updates with `IntMap.insertWith (.|.)` and reused loaded stencil values in error scans.
+
+Candidate A snapshot:
+- `generateGlyphIO/static avg ms`: `13.062024375000`
+- `generateGlyphIO/variable avg ms`: `13.362410583333`
+- `generateGlyphBatchIO/static/jobs1 avg ms`: `535.400028666667`
+- `bytes allocated in the heap`: `51,117,116,744`
+- `MUT time`: `6.867s`
+- `GC time`: `1.238s`
+- `Total time`: `8.106s`
+
+Candidate B (`lib/MSDF/Native/Raster.hs`, rejected):
+- rewrote `protectEdgesModern` tuple-list folds into strict nested loops.
+
+Candidate B snapshot:
+- `generateGlyphIO/static avg ms`: `13.431717791667`
+- `generateGlyphIO/variable avg ms`: `13.259338125000`
+- `generateGlyphBatchIO/static/jobs1 avg ms`: `527.010034416667`
+- `bytes allocated in the heap`: `51,174,615,264`
+- `MUT time`: `6.788s`
+- `GC time`: `1.249s`
+- `Total time`: `8.038s`
+
+Result:
+- Both candidates regressed against baseline and were reverted.
+- No `Raster.hs` performance change was kept in this pass.

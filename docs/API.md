@@ -292,12 +292,29 @@ manifestCfg :: ManifestMeta -> GenCfg
 
 Shared variable-font parsing helpers for CLI and manifest workflows.
 
+### Exported types
+
+```haskell
+data VarFontParseErr
+  = VarFontAxisNameEmpty
+  | VarFontAxisEntryInvalid String
+  | VarFontAxisValueInvalid String
+  | VarFontAxisTagDuplicate String
+```
+
 ### Exported functions
 
 ```haskell
+renderVarFontParseErr :: VarFontParseErr -> String
+
 parseVarFontSpec :: String -> Either String FontSrc
+parseVarFontSpecTyped :: String -> Either VarFontParseErr FontSrc
+
 parseAxisQuery :: String -> Either String AxisMap
+parseAxisQueryTyped :: String -> Either VarFontParseErr AxisMap
+
 parseAxisAssignments :: [(String, String)] -> Either String AxisMap
+parseAxisAssignmentsTyped :: [(String, String)] -> Either VarFontParseErr AxisMap
 ```
 
 ## Module `MSDF.TextRender`

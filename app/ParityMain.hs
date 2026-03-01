@@ -17,7 +17,7 @@ import MSDF.Compare (DiffStats (..), diffRGBA8, passesGate, strictGate)
 import MSDF.Encode (readPngRGBA8File)
 import MSDF.Generate (BackendMode (..), RuntimeCfg (..), defaultRuntimeCfg, generateGlyphIO)
 import MSDF.Manifest (Manifest (..), ManifestRow (..), loadManifest, manifestCfg)
-import MSDF.VarFont (parseAxisAssignments)
+import MSDF.VarFont (parseAxisAssignmentsTyped, renderVarFontParseErr)
 import MSDF.Types
   ( AxisTag (..),
     AxisVal (..),
@@ -342,13 +342,13 @@ fontCaseToFontSrc fontCase =
     StaticFont path ->
       Right FontFile {path = path}
     VariableFont path axisAssignments ->
-      case parseAxisAssignments axisAssignments of
+      case parseAxisAssignmentsTyped axisAssignments of
         Left err ->
           Left
             ( "Invalid variable axis assignment for case "
                 <> fontCase.fontCaseId
                 <> ": "
-                <> err
+                <> renderVarFontParseErr err
             )
         Right axisMap ->
           Right

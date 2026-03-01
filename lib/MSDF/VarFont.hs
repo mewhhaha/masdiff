@@ -3,19 +3,47 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 
 module MSDF.VarFont
-  ( parseVarFontSpec,
+  ( VarFontParseErr (..),
+    renderVarFontParseErr,
+    parseVarFontSpec,
+    parseVarFontSpecTyped,
     parseAxisAssignments,
+    parseAxisAssignmentsTyped,
     parseAxisQuery,
+    parseAxisQueryTyped,
   )
 where
 
+import Data.Bifunctor (first)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import MSDF.Types (AxisMap, AxisTag (..), AxisVal (..), FontSrc (..))
 
+data VarFontParseErr
+  = VarFontAxisNameEmpty
+  | VarFontAxisEntryInvalid String
+  | VarFontAxisValueInvalid String
+  | VarFontAxisTagDuplicate String
+  deriving stock (Eq, Show)
+
+renderVarFontParseErr :: VarFontParseErr -> String
+renderVarFontParseErr err =
+  case err of
+    VarFontAxisNameEmpty ->
+      "Invalid empty axis name in -varfont value."
+    VarFontAxisEntryInvalid raw ->
+      "Invalid axis entry in -varfont value: " <> raw
+    VarFontAxisValueInvalid raw ->
+      "Invalid axis value in -varfont value: " <> raw
+    VarFontAxisTagDuplicate name ->
+      "Duplicate axis tag in -varfont value: " <> name
+
 parseVarFontSpec :: String -> Either String FontSrc
-parseVarFontSpec spec =
+parseVarFontSpec = first renderVarFontParseErr . parseVarFontSpecTyped
+
+parseVarFontSpecTyped :: String -> Either VarFontParseErr FontSrc
+parseVarFontSpecTyped spec =
   case splitOnce "?" spec of
     Nothing ->
       Right
@@ -24,7 +52,7 @@ parseVarFontSpec spec =
             axes = Map.empty
           }
     Just (path, query) -> do
-      parsedAxes <- parseAxisQuery query
+      parsedAxes <- parseAxisQueryTyped query
       pure
         VarFontFile
           { path = path,
@@ -32,40 +60,46 @@ parseVarFontSpec spec =
           }
 
 parseAxisQuery :: String -> Either String AxisMap
-parseAxisQuery query
+parseAxisQuery = first renderVarFontParseErr . parseAxisQueryTyped
+
+parseAxisQueryTyped :: String -> Either VarFontParseErr AxisMap
+parseAxisQueryTyped query
   | null query = Right Map.empty
-  | otherwise = parseAxisAssignments =<< traverse parseAxisEntry (splitBy '&' query)
+  | otherwise = parseAxisAssignmentsTyped =<< traverse parseAxisEntry (splitBy '&' query)
 
 parseAxisAssignments :: [(String, String)] -> Either String AxisMap
-parseAxisAssignments assignments = go Set.empty Map.empty assignments
+parseAxisAssignments = first renderVarFontParseErr . parseAxisAssignmentsTyped
+
+parseAxisAssignmentsTyped :: [(String, String)] -> Either VarFontParseErr AxisMap
+parseAxisAssignmentsTyped assignments = go Set.empty Map.empty assignments
   where
     go _ axisMap [] = Right axisMap
     go seen axisMap ((rawName, rawValue) : rest) = do
       let name = trim rawName
       if null name
-        then Left "Invalid empty axis name in -varfont value."
+        then Left VarFontAxisNameEmpty
         else do
           value <- parseFiniteDouble rawValue
           let foldTag = T.toCaseFold (T.pack name)
           if foldTag `Set.member` seen
-            then Left ("Duplicate axis tag in -varfont value: " <> name)
+            then Left (VarFontAxisTagDuplicate name)
             else
               go
                 (Set.insert foldTag seen)
                 (Map.insert (AxisTag (T.pack name)) (AxisVal value) axisMap)
                 rest
 
-parseAxisEntry :: String -> Either String (String, String)
+parseAxisEntry :: String -> Either VarFontParseErr (String, String)
 parseAxisEntry raw =
   case splitOnce "=" raw of
-    Nothing -> Left ("Invalid axis entry in -varfont value: " <> raw)
+    Nothing -> Left (VarFontAxisEntryInvalid raw)
     Just (name, valueRaw) -> Right (name, valueRaw)
 
-parseFiniteDouble :: String -> Either String Double
+parseFiniteDouble :: String -> Either VarFontParseErr Double
 parseFiniteDouble raw =
   case reads raw of
     [(x, "")] | isFinite x -> Right x
-    _ -> Left ("Invalid axis value in -varfont value: " <> raw)
+    _ -> Left (VarFontAxisValueInvalid raw)
 
 splitBy :: Char -> String -> [String]
 splitBy delim = foldr step [""]
