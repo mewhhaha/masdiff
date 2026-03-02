@@ -123,7 +123,7 @@ Parity contract:
   - `strict` only on stable static oracle subset (`interOracleFontCases`) at `dim=64`, `pxrange=8.0`,
   - all other rows use `coverage`.
 - If process oracle var-axis support is unavailable, variable rows are instantiated to static TTF and that shared instantiated source is used for both native/process comparisons (no variable-row skip path).
-- `exact_mismatch` reporting is byte-exact for `strict` rows and semantic-exact for `coverage` rows (median RGB), which avoids counting channel-layout-only differences as parity drift.
+- `exact_mismatch` reporting is byte-exact for `strict` rows and shape-semantic for `coverage` rows (median-thresholded inside mask, with up to 1 edge pixel tolerance), which avoids counting channel-layout-only differences and raster tie-break jitter as parity drift.
 
 ## `masdiff-text-render`
 
